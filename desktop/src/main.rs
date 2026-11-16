@@ -7,6 +7,7 @@ mod identity;
 mod net;
 mod state;
 mod store;
+mod sysstats;
 
 use eframe::egui;
 use std::sync::{Arc, Mutex};
@@ -32,6 +33,7 @@ fn main() -> eframe::Result<()> {
     if let Err(e) = discovery::start(me.clone(), shared.clone(), tcp_port) {
         problems.push(e);
     }
+    sysstats::start_sampler();
     net::start_status_checker(me.clone(), shared.clone(), dir.clone());
     state::lock(&shared).log(format!("Nexus started as {} (data in {})", me.name, dir.display()));
     let startup_error = (!problems.is_empty()).then(|| problems.join("\n"));

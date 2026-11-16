@@ -1,6 +1,6 @@
 //! State shared between the network threads and the window.
 
-use crate::store::PairedPeer;
+use crate::{store::PairedPeer, sysstats::Stats};
 use std::{
     collections::{HashMap, VecDeque},
     net::IpAddr,
@@ -42,7 +42,7 @@ impl Seen {
 
 #[derive(Clone, Debug)]
 pub enum Check {
-    Ok { rtt_ms: u128, at: Instant },
+    Ok { rtt_ms: u128, at: Instant, stats: Option<Stats> },
     Failed { reason: String, at: Instant },
 }
 
@@ -90,6 +90,7 @@ pub enum Status {
     /// Answered a signed challenge just now.
     Verified {
         rtt_ms: u128,
+        stats: Option<Stats>,
     },
     /// Announcing itself on the network; first check still running.
     Checking,
@@ -138,7 +139,9 @@ impl Shared {
             return Status::IdentityChanged;
         }
         match self.checks.get(&p.id) {
-            Some(Check::Ok { rtt_ms, at }) if at.elapsed() < CHECK_VALID => Status::Verified { rtt_ms: *rtt_ms },
+            Some(Check::Ok { rtt_ms, at, stats }) if at.elapsed() < CHECK_VALID => {
+                Status::Verified { rtt_ms: *rtt_ms, stats: stats.clone() }
+            }
             Some(Check::Failed { reason, at }) if at.elapsed() < CHECK_VALID && seen.is_some() => {
                 Status::NotAnswering(reason.clone())
             }

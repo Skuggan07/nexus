@@ -15,6 +15,7 @@ const protocolVersion = 2;
 final labelCommit = utf8.encode('nexus-commit-v2');
 final labelSas = utf8.encode('nexus-sas-v2');
 final labelPing = utf8.encode('nexus-ping-v2');
+final labelStats = utf8.encode('nexus-stats-v2');
 
 final _x25519 = X25519();
 final _sha256 = Sha256();
@@ -91,6 +92,9 @@ Future<String> pairingCode(List<int> pka, List<int> pkb, List<int> na, List<int>
 
 Future<List<int>> pingMac(List<int> sharedSecret, List<int> nonce, String responderId, String requesterId) =>
     hmac(sharedSecret, [labelPing, nonce, utf8.encode(responderId), utf8.encode(requesterId)]);
+
+Future<List<int>> statsMac(List<int> sharedSecret, List<int> nonce, String statsJson) =>
+    hmac(sharedSecret, [labelStats, nonce, utf8.encode(statsJson)]);
 
 Future<SimpleKeyPair> keyPairFromSeed(List<int> seed) => _x25519.newKeyPairFromSeed(seed);
 

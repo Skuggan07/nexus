@@ -21,6 +21,7 @@ use crate::{
     identity::{self, Identity},
     state::{lock, Check, PairWindow, Phase, Role, SharedState, PAIR_ATTEMPTS, PAIR_WINDOW},
     store::{self, PairedPeer},
+    sysstats::{self, Stats},
 };
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
@@ -41,19 +42,49 @@ const DECIDE_TIMEOUT: Duration = Duration::from_secs(120);
 pub const LABEL_COMMIT: &[u8] = b"nexus-commit-v2";
 pub const LABEL_SAS: &[u8] = b"nexus-sas-v2";
 pub const LABEL_PING: &[u8] = b"nexus-ping-v2";
+pub const LABEL_STATS: &[u8] = b"nexus-stats-v2";
 
 type HmacSha256 = Hmac<Sha256>;
 
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(tag = "t", rename_all = "snake_case")]
 enum Msg {
-    PairHello { v: u8, id: String, name: String, os: String, public_key: String },
-    PairHelloAck { v: u8, id: String, name: String, os: String, public_key: String, commit: String },
-    Nonce { nonce: String },
-    Decision { accept: bool },
-    Ping { id: String, nonce: String },
-    Pong { mac: String },
-    Error { reason: String },
+    PairHello {
+        v: u8,
+        id: String,
+        name: String,
+        os: String,
+        public_key: String,
+    },
+    PairHelloAck {
+        v: u8,
+        id: String,
+        name: String,
+        os: String,
+        public_key: String,
+        commit: String,
+    },
+    Nonce {
+        nonce: String,
+    },
+    Decision {
+        accept: bool,
+    },
+    Ping {
+        id: String,
+        nonce: String,
+    },
+    Pong {
+        mac: String,
+        /// Optional live stats as compact JSON, signed separately so older versions can ignore them.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stats: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stats_mac: Option<String>,
+    },
+    Error {
+        reason: String,
+    },
 }
 
 /* ------------------------------------------------------------- crypto */
@@ -175,7 +206,11 @@ fn handle(stream: TcpStream, me: &Identity, shared: &SharedState, dir: &Path) {
             let reply = match (key.as_deref().and_then(identity::decode_public), hex::decode(&nonce)) {
                 (Some(pk), Ok(n)) => {
                     let ss = me.secret.diffie_hellman(&pk);
-                    Msg::Pong { mac: hex::encode(ping_mac(ss.as_bytes(), &n, &me.id, &id)) }
+                    let stats = sysstats::latest_json();
+                    let stats_mac = stats
+                        .as_ref()
+                        .map(|j| hex::encode(mac(ss.as_bytes(), &[LABEL_STATS, n.as_slice(), j.as_bytes()])));
+                    Msg::Pong { mac: hex::encode(ping_mac(ss.as_bytes(), &n, &me.id, &id)), stats, stats_mac }
                 }
                 _ => Msg::Error { reason: format!("{} no longer trusts this device. Pair again.", me.name) },
             };
@@ -454,21 +489,29 @@ pub(crate) fn pair_client(
     })
 }
 
-/// Signed challenge to a paired device. Returns the round-trip time in ms.
-pub(crate) fn ping(me: &Identity, peer: &PairedPeer, addr: SocketAddr) -> Result<u128, String> {
+/// Signed challenge to a paired device. Returns the round-trip time in ms and its live stats, if it sent any.
+pub(crate) fn ping(me: &Identity, peer: &PairedPeer, addr: SocketAddr) -> Result<(u128, Option<Stats>), String> {
     let pk = identity::decode_public(&peer.public_key).ok_or("Stored key is damaged")?;
     let start = Instant::now();
     let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).map_err(|_| "Not reachable".to_string())?;
     let mut c = Conn::new(stream, Duration::from_secs(3))?;
     let nonce: [u8; 16] = rand::random();
     c.send(&Msg::Ping { id: me.id.clone(), nonce: hex::encode(nonce) })?;
-    let Msg::Pong { mac } = c.recv()? else { return Err(unexpected()) };
+    let Msg::Pong { mac, stats, stats_mac } = c.recv()? else { return Err(unexpected()) };
+    let rtt = start.elapsed().as_millis();
     let ss = me.secret.diffie_hellman(&pk);
     let parts: [&[u8]; 4] = [LABEL_PING, &nonce, peer.id.as_bytes(), me.id.as_bytes()];
     if !mac_ok(ss.as_bytes(), &parts, &mac) {
         return Err("Answered, but failed the identity check".into());
     }
-    Ok(start.elapsed().as_millis())
+    // Stats are only trusted when their own signature checks out.
+    let stats = match (stats, stats_mac) {
+        (Some(j), Some(m)) if mac_ok(ss.as_bytes(), &[LABEL_STATS, nonce.as_slice(), j.as_bytes()], &m) => {
+            serde_json::from_str::<Stats>(&j).ok()
+        }
+        _ => None,
+    };
+    Ok((rtt, stats))
 }
 
 /// Checks every paired device every few seconds.
@@ -495,11 +538,11 @@ pub fn start_status_checker(me: Arc<Identity>, shared: SharedState, dir: PathBuf
             let mut s = lock(&shared);
             let was_ok = matches!(s.checks.get(&p.id), Some(Check::Ok { .. }));
             match result {
-                Ok(rtt_ms) => {
+                Ok((rtt_ms, stats)) => {
                     if !was_ok {
                         s.log(format!("{} is online and verified ({rtt_ms} ms)", p.name));
                     }
-                    s.checks.insert(p.id.clone(), Check::Ok { rtt_ms, at: Instant::now() });
+                    s.checks.insert(p.id.clone(), Check::Ok { rtt_ms, at: Instant::now(), stats });
                     let a = addr.to_string();
                     let changed = s.paired.iter_mut().find(|x| x.id == p.id).is_some_and(|x| {
                         let c = x.last_addr.as_deref() != Some(a.as_str());
@@ -558,6 +601,14 @@ mod tests {
             hex::encode(ping_mac(dh.as_bytes(), &nonce, &id_b, &id_a)),
             "a0076a3d95367e6269cde514a4ad868319a11736f150dffccee35f1d4f2f0027"
         );
+        let stats = br#"{"cpu":12.5,"ram":40.0,"battery":null}"#;
+        assert_eq!(
+            hex::encode(mac(dh.as_bytes(), &[LABEL_STATS, nonce.as_slice(), stats.as_slice()])),
+            "c907b8868f50ad65d246b1ea19b8c3cbb77290a2c185394f93b4901741739935"
+        );
+        let parsed: Stats = serde_json::from_slice(stats).unwrap();
+        assert_eq!(parsed.cpu, Some(12.5));
+        assert_eq!(parsed.battery, None);
     }
 
     struct Node {

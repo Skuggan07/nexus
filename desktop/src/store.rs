@@ -44,3 +44,16 @@ pub fn save_peers(dir: &Path, peers: &[PairedPeer]) -> Result<(), String> {
 pub fn now_unix() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
+
+/// Remembers whether the window was last in Simple or Detailed mode.
+pub fn load_detailed(dir: &Path) -> bool {
+    fs::read_to_string(dir.join("prefs.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| v.get("detailed").and_then(|d| d.as_bool()))
+        .unwrap_or(false)
+}
+
+pub fn save_detailed(dir: &Path, detailed: bool) {
+    let _ = fs::write(dir.join("prefs.json"), serde_json::json!({ "detailed": detailed }).to_string());
+}

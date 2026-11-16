@@ -6,6 +6,7 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
+import 'package:battery_plus/battery_plus.dart';
 import 'package:cryptography/cryptography.dart';
 import 'package:flutter/foundation.dart';
 import 'package:path_provider/path_provider.dart';
@@ -59,14 +60,34 @@ class Seen {
   bool get fresh => DateTime.now().difference(lastSeen) < onlineWindow;
 }
 
+/// A device's CPU, RAM and battery in percent; null when that device can't tell.
+class Stats {
+  const Stats({this.cpu, this.ram, this.battery});
+  final double? cpu, ram, battery;
+
+  static double? _num(Object? v) => v is num ? v.toDouble() : null;
+
+  static Stats? tryParse(String json) {
+    try {
+      final m = jsonDecode(json);
+      if (m is! Map<String, dynamic>) return null;
+      return Stats(cpu: _num(m['cpu']), ram: _num(m['ram']), battery: _num(m['battery']));
+    } catch (_) {
+      return null;
+    }
+  }
+}
+
 class Check {
-  Check.ok(this.rttMs)
+  Check.ok(this.rttMs, [this.stats])
       : reason = null,
         at = DateTime.now();
   Check.failed(this.reason)
       : rttMs = null,
+        stats = null,
         at = DateTime.now();
   final int? rttMs;
+  final Stats? stats;
   final String? reason;
   final DateTime at;
   bool get ok => rttMs != null;
@@ -76,9 +97,10 @@ class Check {
 enum StatusKind { verified, checking, notAnswering, identityChanged, offline }
 
 class PeerStatus {
-  const PeerStatus(this.kind, {this.rttMs, this.reason});
+  const PeerStatus(this.kind, {this.rttMs, this.reason, this.stats});
   final StatusKind kind;
   final int? rttMs;
+  final Stats? stats;
   final String? reason;
 }
 
@@ -190,6 +212,9 @@ class NexusNode extends ChangeNotifier {
   PairSession? pair;
   int _nextSession = 1;
   bool _checking = false;
+  bool detailed = false;
+  String? _statsJson;
+  final _battery = Battery();
   final _timers = <Timer>[];
   ServerSocket? _server;
   RawDatagramSocket? _udp;
@@ -213,6 +238,9 @@ class NexusNode extends ChangeNotifier {
       } catch (e) {
         startupError = 'Discovery could not start: $e';
       }
+      await _loadPrefs();
+      await _sampleStats();
+      _timers.add(Timer.periodic(const Duration(seconds: 5), (_) => _sampleStats()));
       _timers.add(Timer.periodic(const Duration(seconds: 5), (_) => _checkAll()));
       _timers.add(Timer.periodic(const Duration(seconds: 1), (_) => notifyListeners()));
       addLog('Nexus started as $name');
@@ -287,6 +315,45 @@ class NexusNode extends ChangeNotifier {
     await tmp.rename('${_dir.path}/peers.json');
   }
 
+  Future<void> _loadPrefs() async {
+    try {
+      final f = File('${_dir.path}/prefs.json');
+      if (await f.exists()) {
+        detailed = (jsonDecode(await f.readAsString()) as Map<String, dynamic>)['detailed'] == true;
+      }
+    } catch (_) {}
+  }
+
+  Future<void> setDetailed(bool value) async {
+    detailed = value;
+    notifyListeners();
+    try {
+      await File('${_dir.path}/prefs.json').writeAsString(jsonEncode({'detailed': value}));
+    } catch (_) {}
+  }
+
+  /// This phone's RAM (from /proc/meminfo) and battery. Android does not let apps read CPU use.
+  Future<void> _sampleStats() async {
+    double? ram, battery;
+    try {
+      final lines = await File('/proc/meminfo').readAsLines();
+      int? total, avail;
+      for (final l in lines) {
+        final parts = l.split(RegExp(r'\s+'));
+        if (parts.length < 2) continue;
+        if (parts[0] == 'MemTotal:') total = int.tryParse(parts[1]);
+        if (parts[0] == 'MemAvailable:') avail = int.tryParse(parts[1]);
+      }
+      if (total != null && avail != null && total > 0) {
+        ram = ((total - avail) / total * 1000).round() / 10;
+      }
+    } catch (_) {}
+    try {
+      battery = (await _battery.batteryLevel).toDouble();
+    } catch (_) {}
+    _statsJson = jsonEncode({'cpu': null, 'ram': ram, 'battery': battery});
+  }
+
   void addLog(String text) {
     log.insert(0, LogLine(text));
     if (log.length > 200) log.removeLast();
@@ -310,7 +377,7 @@ class NexusNode extends ChangeNotifier {
     final fresh = s != null && s.fresh;
     if (fresh && s!.publicKey != p.publicKey) return const PeerStatus(StatusKind.identityChanged);
     final c = checks[p.id];
-    if (c != null && c.valid && c.ok) return PeerStatus(StatusKind.verified, rttMs: c.rttMs);
+    if (c != null && c.valid && c.ok) return PeerStatus(StatusKind.verified, rttMs: c.rttMs, stats: c.stats);
     if (c != null && c.valid && !c.ok && fresh) return PeerStatus(StatusKind.notAnswering, reason: c.reason);
     return fresh ? const PeerStatus(StatusKind.checking) : const PeerStatus(StatusKind.offline);
   }
@@ -489,7 +556,13 @@ class NexusNode extends ChangeNotifier {
       return;
     }
     final ss = await sharedSecret(_keyPair, fromHex(peer.publicKey, 32));
-    c.send({'t': 'pong', 'mac': toHex(await pingMac(ss, nonce, id, requester))});
+    final stats = _statsJson;
+    c.send({
+      't': 'pong',
+      'mac': toHex(await pingMac(ss, nonce, id, requester)),
+      if (stats != null) 'stats': stats,
+      if (stats != null) 'stats_mac': toHex(await statsMac(ss, nonce, stats)),
+    });
   }
 
   Future<void> _hostPair(Conn c, Map<String, dynamic> m) async {
@@ -653,7 +726,7 @@ class NexusNode extends ChangeNotifier {
 
   /* ------------------------------------------------------------ status */
 
-  Future<int> _ping(PairedPeer p, String host, int port) async {
+  Future<(int, Stats?)> _ping(PairedPeer p, String host, int port) async {
     final sw = Stopwatch()..start();
     Socket sock;
     try {
@@ -668,10 +741,19 @@ class NexusNode extends ChangeNotifier {
       final m = await c.recv(const Duration(seconds: 3));
       if (m['t'] != 'pong') throw NexusError(unexpectedMessage);
       final ss = await sharedSecret(_keyPair, fromHex(p.publicKey, 32));
+      final rtt = sw.elapsedMilliseconds;
       if (!sameBytes(await pingMac(ss, nonce, p.id, id), fromHex(_str(m, 'mac')))) {
         throw NexusError('Answered, but failed the identity check');
       }
-      return sw.elapsedMilliseconds;
+      // Stats are only trusted when their own signature checks out.
+      Stats? stats;
+      final sj = m['stats'], sm = m['stats_mac'];
+      if (sj is String && sm is String) {
+        try {
+          if (sameBytes(await statsMac(ss, nonce, sj), fromHex(sm))) stats = Stats.tryParse(sj);
+        } catch (_) {}
+      }
+      return (rtt, stats);
     } finally {
       c.close();
     }
@@ -698,9 +780,9 @@ class NexusNode extends ChangeNotifier {
         if (host == null || port == null) continue;
         final wasOk = checks[p.id]?.ok ?? false;
         try {
-          final rtt = await _ping(p, host, port);
+          final (rtt, stats) = await _ping(p, host, port);
           if (!wasOk) addLog('${p.name} is online and verified ($rtt ms)');
-          checks[p.id] = Check.ok(rtt);
+          checks[p.id] = Check.ok(rtt, stats);
           final addr = '$host:$port';
           if (p.lastAddr != addr) {
             p.lastAddr = addr;

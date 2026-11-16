@@ -18,6 +18,10 @@ hex = "0.4"
 socket2 = "0.5"                                              # UDP broadcast socket options
 if-addrs = "0.13"                                            # per-interface broadcast addresses
 directories = "5"                                            # %APPDATA% location
+sysinfo = { version = "0.30", default-features = false }   # CPU and RAM usage
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_System_Power", "Win32_Foundation"] }  # battery level
 
 [profile.release]
 opt-level = 3

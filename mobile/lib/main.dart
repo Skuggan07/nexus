@@ -1,13 +1,22 @@
+import 'dart:math' as math;
+
 import 'package:flutter/material.dart';
 
 import 'node.dart';
 import 'protocol.dart';
 
-const accent = Color(0xFF2A55E5);
-const good = Color(0xFF2EAA70);
-const warn = Color(0xFFD69828);
-const bad = Color(0xFFDE5246);
-const grey = Color(0xFF8C94A2);
+// The chosen look: black background, dark green boxes, teal buttons,
+// dark orange gauges, white text. Simple mode by default, Detailed on request.
+const bg = Color(0xFF000000);
+const box = Color(0xFF0E3A2A);
+const box2 = Color(0xFF145036);
+const line = Color(0xFF1E6649);
+const accent = Color(0xFF11A99A);
+const online = Color(0xFF5EEAD4);
+const ring = Color(0xFFC2410C);
+const off = Color(0xFF6B7F75);
+const bad = Color(0xFFF0736A);
+const white = Colors.white;
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -21,11 +30,20 @@ class NexusApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final scheme = ColorScheme.fromSeed(
+      seedColor: accent,
+      brightness: Brightness.dark,
+    ).copyWith(primary: accent, onPrimary: white, surface: box, onSurface: white);
     return MaterialApp(
       title: 'Nexus',
       debugShowCheckedModeBanner: false,
-      theme: ThemeData(colorSchemeSeed: accent, useMaterial3: true, brightness: Brightness.light),
-      darkTheme: ThemeData(colorSchemeSeed: accent, useMaterial3: true, brightness: Brightness.dark),
+      themeMode: ThemeMode.dark,
+      darkTheme: ThemeData(
+        useMaterial3: true,
+        colorScheme: scheme,
+        scaffoldBackgroundColor: bg,
+        textTheme: ThemeData.dark().textTheme.apply(bodyColor: white, displayColor: white),
+      ),
       home: HomePage(node: node),
     );
   }
@@ -41,7 +59,6 @@ class HomePage extends StatefulWidget {
 
 class _HomePageState extends State<HomePage> {
   final _ipField = TextEditingController();
-
   NexusNode get node => widget.node;
 
   @override
@@ -50,52 +67,34 @@ class _HomePageState extends State<HomePage> {
     super.dispose();
   }
 
+  List<PairedPeer> get _sorted =>
+      [...node.paired]..sort((a, b) => a.name.toLowerCase().compareTo(b.name.toLowerCase()));
+
+  int get _onlineCount => node.paired.where((p) {
+        final k = node.statusOf(p).kind;
+        return k == StatusKind.verified || k == StatusKind.checking;
+      }).length;
+
   @override
   Widget build(BuildContext context) {
     return ListenableBuilder(
       listenable: node,
       builder: (context, _) {
         if (!node.ready) {
-          return const Scaffold(body: Center(child: CircularProgressIndicator()));
+          return const Scaffold(body: Center(child: CircularProgressIndicator(color: accent)));
         }
         return Stack(children: [
           Scaffold(
-            appBar: AppBar(
-              title: const Text('Nexus', style: TextStyle(fontWeight: FontWeight.w700)),
-              centerTitle: false,
-            ),
             body: SafeArea(
               child: ListView(
-                padding: const EdgeInsets.fromLTRB(16, 4, 16, 32),
+                padding: const EdgeInsets.fromLTRB(16, 12, 16, 32),
                 children: [
                   if (node.startupError != null)
                     Padding(
                       padding: const EdgeInsets.only(bottom: 12),
                       child: Text(node.startupError!, style: const TextStyle(color: bad)),
                     ),
-                  _thisDevice(context),
-                  const SizedBox(height: 20),
-                  _heading(context, 'My devices', node.paired.length),
-                  if (node.paired.isEmpty)
-                    _hint(context, 'No paired devices yet. Tap “Allow pairing” on one device, then “Pair” on the other.'),
-                  for (final p in [...node.paired]..sort((a, b) => a.name.toLowerCase().compareTo(b.name.toLowerCase())))
-                    _pairedTile(context, p),
-                  const SizedBox(height: 20),
-                  _heading(context, 'Nearby', node.nearby.length),
-                  if (node.nearby.isEmpty)
-                    Padding(
-                      padding: const EdgeInsets.symmetric(vertical: 8),
-                      child: Row(children: [
-                        const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2)),
-                        const SizedBox(width: 12),
-                        Expanded(child: _hintText(context, 'Looking for devices running Nexus on this Wi-Fi…')),
-                      ]),
-                    ),
-                  for (final s in node.nearby) _nearbyTile(context, s),
-                  const SizedBox(height: 12),
-                  _pairByIp(context),
-                  const SizedBox(height: 20),
-                  _activity(context),
+                  ...(node.detailed ? _detailed(context) : _simple(context)),
                 ],
               ),
             ),
@@ -106,95 +105,224 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
-  Widget _thisDevice(BuildContext context) {
-    final t = Theme.of(context).textTheme;
-    final left = node.windowLeft.inSeconds;
-    return Card(
-      child: Padding(
-        padding: const EdgeInsets.all(16),
+  /* ------------------------------------------------------------ shared */
+
+  Widget _header(BuildContext context, {String? overline, required String title}) {
+    return Row(children: [
+      const _Logo(size: 28),
+      const SizedBox(width: 12),
+      Expanded(
         child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          Row(children: [
-            Expanded(child: Text(node.name, style: t.titleLarge?.copyWith(fontWeight: FontWeight.w600))),
-            IconButton(
-              tooltip: 'Rename this phone',
-              icon: const Icon(Icons.edit_outlined),
-              onPressed: () => _rename(context),
-            ),
-          ]),
-          Text('This phone · $osLabel · key ${node.fingerprintText}', style: t.bodySmall?.copyWith(color: grey)),
-          const SizedBox(height: 14),
-          if (node.windowOpen)
-            Row(children: [
-              const Icon(Icons.check_circle, color: good, size: 20),
-              const SizedBox(width: 8),
-              Expanded(
-                child: Text(
-                  'Pairing allowed · ${left ~/ 60}:${(left % 60).toString().padLeft(2, '0')} left\nTap Pair on the other device',
-                  style: t.bodyMedium,
-                ),
-              ),
-              TextButton(onPressed: node.stopPairing, child: const Text('Stop')),
-            ])
-          else
-            SizedBox(
-              width: double.infinity,
-              child: FilledButton.icon(
-                onPressed: node.allowPairing,
-                icon: const Icon(Icons.link),
-                label: const Text('Allow pairing'),
-              ),
-            ),
+          if (overline != null)
+            Text(overline, style: const TextStyle(fontSize: 11, letterSpacing: 2, fontWeight: FontWeight.w700)),
+          Text(title, style: const TextStyle(fontSize: 22, fontWeight: FontWeight.w800, letterSpacing: 1.2)),
         ]),
       ),
+      _ModeSwitch(detailed: node.detailed, onChanged: node.setDetailed),
+    ]);
+  }
+
+  Widget _pairButton(String label) {
+    if (node.windowOpen) {
+      final left = node.windowLeft.inSeconds;
+      return _Box(
+        child: Row(children: [
+          const Icon(Icons.wifi_tethering, color: online),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Text(
+              'Pairing on · ${left ~/ 60}:${(left % 60).toString().padLeft(2, '0')}\nTap Pair on the other device',
+              style: const TextStyle(fontWeight: FontWeight.w600),
+            ),
+          ),
+          _SecondaryButton(label: 'Stop', onPressed: node.stopPairing),
+        ]),
+      );
+    }
+    return SizedBox(
+      height: 52,
+      child: FilledButton.icon(
+        style: FilledButton.styleFrom(
+          backgroundColor: accent,
+          foregroundColor: white,
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+          textStyle: const TextStyle(fontWeight: FontWeight.w800, letterSpacing: 1.2, fontSize: 15),
+        ),
+        onPressed: node.allowPairing,
+        icon: const Icon(Icons.add),
+        label: Text(label),
+      ),
     );
   }
 
-  Widget _pairedTile(BuildContext context, PairedPeer p) {
+  (Color, String) _statusLine(PeerStatus st) => switch (st.kind) {
+        StatusKind.verified => (online, 'Online · ${st.rttMs} ms'),
+        StatusKind.checking => (online, 'Online · checking'),
+        StatusKind.notAnswering => (ring, 'Not answering'),
+        StatusKind.identityChanged => (bad, 'Key changed · not trusted'),
+        StatusKind.offline => (off, 'Offline'),
+      };
+
+  void _pair(Seen s) => node.pairWith(PairTarget(
+        host: s.addr.address,
+        port: s.tcpPort,
+        name: s.name,
+        expectedId: s.id,
+        expectedKey: s.publicKey,
+      ));
+
+  /* ------------------------------------------------------------ simple */
+
+  List<Widget> _simple(BuildContext context) {
+    final peers = _sorted;
+    return [
+      _header(context, title: 'NEXUS'),
+      const SizedBox(height: 18),
+      _pairButton('ADD DEVICE'),
+      const SizedBox(height: 18),
+      Text('$_onlineCount of ${peers.length} devices online', style: const TextStyle(fontSize: 15)),
+      const SizedBox(height: 10),
+      if (peers.isEmpty)
+        const _Box(
+          child: Text(
+            'No devices yet. Open Nexus on your PC, press “+ ADD DEVICE” on one of them, then tap “Pair” on the other.',
+          ),
+        ),
+      for (final p in peers) ...[
+        _Box(
+          padding: const EdgeInsets.fromLTRB(18, 12, 12, 12),
+          child: Row(children: [
+            _Dot(color: _statusLine(node.statusOf(p)).$1),
+            const SizedBox(width: 14),
+            Expanded(
+              child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                Text(p.name, style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w700)),
+                Text(_statusLine(node.statusOf(p)).$2),
+              ]),
+            ),
+            _SecondaryButton(label: 'Details', onPressed: () => _showDetails(context, p)),
+          ]),
+        ),
+        const SizedBox(height: 10),
+      ],
+      for (final s in node.nearby) ...[
+        const SizedBox(height: 6),
+        _NearbyBox(name: s.name, sub: '${s.os} · ${s.addr.address}', onPair: node.pair == null ? () => _pair(s) : null),
+      ],
+      const SizedBox(height: 24),
+      Center(
+        child: TextButton(
+          onPressed: () => _rename(context),
+          child: Text('This phone: ${node.name}', style: const TextStyle(color: white)),
+        ),
+      ),
+    ];
+  }
+
+  /* ---------------------------------------------------------- detailed */
+
+  List<Widget> _detailed(BuildContext context) {
+    final peers = _sorted;
+    return [
+      _header(context, overline: 'CONTROL CENTER', title: 'MY DEVICES'),
+      const SizedBox(height: 16),
+      _pairButton('ALLOW PAIRING'),
+      const SizedBox(height: 14),
+      Row(children: [
+        Expanded(child: _Tile(label: 'ONLINE', value: _onlineCount)),
+        const SizedBox(width: 8),
+        Expanded(child: _Tile(label: 'PAIRED', value: peers.length)),
+        const SizedBox(width: 8),
+        Expanded(child: _Tile(label: 'NEARBY', value: node.nearby.length)),
+      ]),
+      const SizedBox(height: 14),
+      if (peers.isEmpty)
+        const _Box(child: Text('No paired devices yet. Press “ALLOW PAIRING” on one device, then “Pair” on the other.')),
+      for (final p in peers) ...[_deviceCard(context, p), const SizedBox(height: 12)],
+      for (final s in node.nearby) ...[
+        _NearbyBox(
+          label: 'NEW SIGNAL',
+          name: s.name,
+          sub: '${s.os} · ${s.addr.address}',
+          onPair: node.pair == null ? () => _pair(s) : null,
+        ),
+        const SizedBox(height: 10),
+      ],
+      const SizedBox(height: 6),
+      _pairByIp(context),
+      const SizedBox(height: 18),
+      _activity(),
+      const SizedBox(height: 12),
+      _Box(
+        child: Row(children: [
+          Expanded(
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              const Text('● THIS PHONE', style: TextStyle(color: online, fontSize: 11, letterSpacing: 1.5)),
+              Text(node.name, style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 16)),
+              Text('key ${node.fingerprintText}', style: const TextStyle(fontFamily: 'monospace', fontSize: 12)),
+            ]),
+          ),
+          _SecondaryButton(label: 'Rename', onPressed: () => _rename(context)),
+        ]),
+      ),
+    ];
+  }
+
+  Widget _deviceCard(BuildContext context, PairedPeer p) {
     final st = node.statusOf(p);
-    final (color, label) = switch (st.kind) {
-      StatusKind.verified => (good, 'Online · verified · ${st.rttMs} ms'),
-      StatusKind.checking => (warn, 'On the network · checking'),
-      StatusKind.notAnswering => (warn, 'Not answering: ${st.reason ?? ''}'),
-      StatusKind.identityChanged => (bad, 'Key changed · not trusted'),
-      StatusKind.offline => (grey, 'Offline'),
-    };
+    final (color, text) = _statusLine(st);
+    final isOnline = st.kind == StatusKind.verified || st.kind == StatusKind.checking;
     final addr = node.addressOf(p);
-    return Card(
-      child: ListTile(
-        leading: Icon(Icons.circle, color: color, size: 14),
-        title: Text(p.name, style: const TextStyle(fontWeight: FontWeight.w600)),
-        subtitle: Text('$label\n${p.os}${addr != null ? ' · $addr' : ''}'),
-        isThreeLine: true,
-        trailing: IconButton(
-          tooltip: 'Remove',
-          icon: const Icon(Icons.delete_outline),
-          onPressed: () => _confirmRemove(context, p),
+    return Container(
+      decoration: BoxDecoration(
+        color: box,
+        borderRadius: BorderRadius.circular(12),
+        border: Border(
+          top: BorderSide(color: isOnline ? online : line, width: 3),
+          left: const BorderSide(color: line),
+          right: const BorderSide(color: line),
+          bottom: const BorderSide(color: line),
         ),
       ),
+      padding: const EdgeInsets.all(16),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Expanded(
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Text(p.name.toUpperCase(), style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w800, letterSpacing: .5)),
+              Text('${p.os}${addr != null ? ' · $addr' : ''}', style: const TextStyle(fontSize: 12.5)),
+            ]),
+          ),
+          Text(text.toUpperCase(),
+              style: TextStyle(color: color, fontSize: 11.5, fontWeight: FontWeight.w700, letterSpacing: 1)),
+        ]),
+        const SizedBox(height: 14),
+        if (isOnline)
+          Row(mainAxisAlignment: MainAxisAlignment.spaceAround, children: [
+            _Gauge(value: st.stats?.cpu, label: 'CPU'),
+            _Gauge(value: st.stats?.ram, label: 'RAM'),
+            _Gauge(value: st.stats?.battery, label: 'BATTERY'),
+          ])
+        else
+          Container(
+            height: 76,
+            alignment: Alignment.center,
+            decoration: BoxDecoration(border: Border.all(color: line), borderRadius: BorderRadius.circular(8)),
+            child: const Text('Not reachable right now'),
+          ),
+        const SizedBox(height: 12),
+        Row(children: [
+          Expanded(
+            child: Text('key ${_fp(p.id)}', style: const TextStyle(fontFamily: 'monospace', fontSize: 11.5)),
+          ),
+          _SecondaryButton(label: 'Remove', onPressed: () => _confirmRemove(context, p)),
+        ]),
+      ]),
     );
   }
 
-  Widget _nearbyTile(BuildContext context, Seen s) {
-    return Card(
-      child: ListTile(
-        leading: const Icon(Icons.circle, color: accent, size: 14),
-        title: Text(s.name, style: const TextStyle(fontWeight: FontWeight.w600)),
-        subtitle: Text('${s.os} · ${s.addr.address}'),
-        trailing: FilledButton.tonal(
-          onPressed: node.pair == null
-              ? () => node.pairWith(PairTarget(
-                    host: s.addr.address,
-                    port: s.tcpPort,
-                    name: s.name,
-                    expectedId: s.id,
-                    expectedKey: s.publicKey,
-                  ))
-              : null,
-          child: const Text('Pair'),
-        ),
-      ),
-    );
-  }
+  /// The fingerprint is the device ID shown as `3F9A 0C21 77DE 51B0`, same as on the PC.
+  String _fp(String id) => id.toUpperCase().replaceAllMapped(RegExp(r'.{4}'), (m) => '${m[0]} ').trim();
 
   Widget _pairByIp(BuildContext context) {
     void go() {
@@ -215,56 +343,98 @@ class _HomePageState extends State<HomePage> {
       Expanded(
         child: TextField(
           controller: _ipField,
+          style: const TextStyle(color: white),
           keyboardType: const TextInputType.numberWithOptions(decimal: true),
-          decoration: const InputDecoration(
+          decoration: InputDecoration(
             labelText: 'Not listed? Pair by IP address',
+            labelStyle: const TextStyle(color: white),
             hintText: '192.168.1.31',
-            border: OutlineInputBorder(),
+            filled: true,
+            fillColor: box,
             isDense: true,
+            enabledBorder: OutlineInputBorder(borderSide: const BorderSide(color: line), borderRadius: BorderRadius.circular(10)),
+            focusedBorder: OutlineInputBorder(borderSide: const BorderSide(color: accent), borderRadius: BorderRadius.circular(10)),
           ),
           onSubmitted: (_) => go(),
         ),
       ),
       const SizedBox(width: 8),
-      OutlinedButton(onPressed: go, child: const Text('Pair')),
+      _SecondaryButton(label: 'Pair', onPressed: go),
     ]);
   }
 
-  Widget _activity(BuildContext context) {
-    final t = Theme.of(context).textTheme;
-    return Card(
-      child: ExpansionTile(
-        title: Text('Activity (${node.log.length})'),
-        shape: const Border(),
-        children: [
-          for (final l in node.log.take(40))
-            ListTile(
-              dense: true,
-              leading: Text(_ago(l.at), style: t.bodySmall?.copyWith(color: grey, fontFamily: 'monospace')),
-              title: Text(l.text),
-            ),
-        ],
+  Widget _activity() {
+    return Container(
+      decoration: BoxDecoration(color: box, borderRadius: BorderRadius.circular(12), border: Border.all(color: line)),
+      child: Theme(
+        data: Theme.of(context).copyWith(dividerColor: Colors.transparent),
+        child: ExpansionTile(
+          iconColor: white,
+          collapsedIconColor: white,
+          title: Text('ACTIVITY (${node.log.length})', style: const TextStyle(fontWeight: FontWeight.w700, letterSpacing: 1)),
+          children: [
+            for (final l in node.log.take(40))
+              ListTile(
+                dense: true,
+                leading: Text(_ago(l.at), style: const TextStyle(fontFamily: 'monospace', color: white)),
+                title: Text(l.text, style: const TextStyle(color: white)),
+              ),
+          ],
+        ),
       ),
     );
   }
 
-  Widget _heading(BuildContext context, String text, int count) => Padding(
-        padding: const EdgeInsets.only(bottom: 6),
-        child: Text('$text ($count)',
-            style: Theme.of(context).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w700)),
-      );
+  /* ------------------------------------------------------------ dialogs */
 
-  Widget _hint(BuildContext context, String text) =>
-      Padding(padding: const EdgeInsets.symmetric(vertical: 8), child: _hintText(context, text));
-
-  Widget _hintText(BuildContext context, String text) =>
-      Text(text, style: Theme.of(context).textTheme.bodyMedium?.copyWith(color: grey));
+  void _showDetails(BuildContext context, PairedPeer p) {
+    showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: box,
+      showDragHandle: true,
+      builder: (ctx) => ListenableBuilder(
+        listenable: node,
+        builder: (ctx, _) {
+          if (!node.isPaired(p.id)) return const SizedBox(height: 80);
+          final st = node.statusOf(p);
+          final (color, text) = _statusLine(st);
+          final addr = node.addressOf(p);
+          return Padding(
+            padding: const EdgeInsets.fromLTRB(20, 0, 20, 28),
+            child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Text(p.name.toUpperCase(), style: const TextStyle(fontSize: 20, fontWeight: FontWeight.w800)),
+              const SizedBox(height: 4),
+              Row(children: [_Dot(color: color), const SizedBox(width: 8), Text(text)]),
+              const SizedBox(height: 18),
+              Row(mainAxisAlignment: MainAxisAlignment.spaceAround, children: [
+                _Gauge(value: st.stats?.cpu, label: 'CPU'),
+                _Gauge(value: st.stats?.ram, label: 'RAM'),
+                _Gauge(value: st.stats?.battery, label: 'BATTERY'),
+              ]),
+              const SizedBox(height: 18),
+              Text('${p.os}${addr != null ? ' · $addr' : ''}'),
+              Text('key ${_fp(p.id)}', style: const TextStyle(fontFamily: 'monospace', fontSize: 12)),
+              const SizedBox(height: 16),
+              _SecondaryButton(
+                label: 'Remove device',
+                onPressed: () async {
+                  Navigator.pop(ctx);
+                  await _confirmRemove(context, p);
+                },
+              ),
+            ]),
+          );
+        },
+      ),
+    );
+  }
 
   Future<void> _rename(BuildContext context) async {
     final ctl = TextEditingController(text: node.name);
     final result = await showDialog<String>(
       context: context,
       builder: (ctx) => AlertDialog(
+        backgroundColor: box,
         title: const Text('Name this phone'),
         content: TextField(
           controller: ctl,
@@ -274,7 +444,7 @@ class _HomePageState extends State<HomePage> {
           onSubmitted: (v) => Navigator.pop(ctx, v),
         ),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel', style: TextStyle(color: white))),
           FilledButton(onPressed: () => Navigator.pop(ctx, ctl.text), child: const Text('Save')),
         ],
       ),
@@ -287,12 +457,13 @@ class _HomePageState extends State<HomePage> {
     final ok = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
+        backgroundColor: box,
         title: Text('Remove ${p.name}?'),
         content: const Text('It will no longer be trusted by this phone. You can pair again later.'),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel', style: TextStyle(color: white))),
           FilledButton(
-            style: FilledButton.styleFrom(backgroundColor: bad),
+            style: FilledButton.styleFrom(backgroundColor: const Color(0xFFB4413A)),
             onPressed: () => Navigator.pop(ctx, true),
             child: const Text('Remove'),
           ),
@@ -310,6 +481,198 @@ String _ago(DateTime at) {
   return '${s ~/ 3600}h';
 }
 
+/* ------------------------------------------------------------ pieces */
+
+class _Box extends StatelessWidget {
+  const _Box({required this.child, this.padding = const EdgeInsets.all(16)});
+  final Widget child;
+  final EdgeInsets padding;
+
+  @override
+  Widget build(BuildContext context) => Container(
+        width: double.infinity,
+        padding: padding,
+        decoration: BoxDecoration(color: box, borderRadius: BorderRadius.circular(12), border: Border.all(color: line)),
+        child: DefaultTextStyle.merge(style: const TextStyle(color: white), child: child),
+      );
+}
+
+class _Dot extends StatelessWidget {
+  const _Dot({required this.color});
+  final Color color;
+  @override
+  Widget build(BuildContext context) =>
+      Container(width: 12, height: 12, decoration: BoxDecoration(color: color, shape: BoxShape.circle));
+}
+
+class _SecondaryButton extends StatelessWidget {
+  const _SecondaryButton({required this.label, required this.onPressed});
+  final String label;
+  final VoidCallback? onPressed;
+
+  @override
+  Widget build(BuildContext context) => OutlinedButton(
+        style: OutlinedButton.styleFrom(
+          foregroundColor: white,
+          backgroundColor: box2,
+          side: const BorderSide(color: line),
+          minimumSize: const Size(0, 44),
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+          textStyle: const TextStyle(fontWeight: FontWeight.w700),
+        ),
+        onPressed: onPressed,
+        child: Text(label),
+      );
+}
+
+class _Tile extends StatelessWidget {
+  const _Tile({required this.label, required this.value});
+  final String label;
+  final int value;
+
+  @override
+  Widget build(BuildContext context) => _Box(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Text(label, style: const TextStyle(fontSize: 11, letterSpacing: 1.5, fontWeight: FontWeight.w700)),
+          Text(value.toString().padLeft(2, '0'), style: const TextStyle(fontSize: 26, fontWeight: FontWeight.w800)),
+        ]),
+      );
+}
+
+class _NearbyBox extends StatelessWidget {
+  const _NearbyBox({this.label = 'Found nearby', required this.name, required this.sub, required this.onPair});
+  final String label, name, sub;
+  final VoidCallback? onPair;
+
+  @override
+  Widget build(BuildContext context) => Container(
+        padding: const EdgeInsets.fromLTRB(18, 12, 12, 12),
+        decoration: BoxDecoration(borderRadius: BorderRadius.circular(12), border: Border.all(color: accent)),
+        child: Row(children: [
+          Expanded(
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Text(label, style: const TextStyle(color: online, fontSize: 12, fontWeight: FontWeight.w700, letterSpacing: 1)),
+              Text(name, style: const TextStyle(color: white, fontSize: 17, fontWeight: FontWeight.w700)),
+              Text(sub, style: const TextStyle(color: white, fontSize: 12)),
+            ]),
+          ),
+          FilledButton(
+            style: FilledButton.styleFrom(
+              backgroundColor: accent,
+              foregroundColor: white,
+              minimumSize: const Size(0, 44),
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+              textStyle: const TextStyle(fontWeight: FontWeight.w800),
+            ),
+            onPressed: onPair,
+            child: const Text('Pair'),
+          ),
+        ]),
+      );
+}
+
+class _ModeSwitch extends StatelessWidget {
+  const _ModeSwitch({required this.detailed, required this.onChanged});
+  final bool detailed;
+  final ValueChanged<bool> onChanged;
+
+  Widget _seg(String label, bool value) {
+    final on = detailed == value;
+    return GestureDetector(
+      onTap: on ? null : () => onChanged(value),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+        decoration: BoxDecoration(color: on ? accent : Colors.transparent, borderRadius: BorderRadius.circular(8)),
+        child: Text(label, style: const TextStyle(color: white, fontWeight: FontWeight.w700, fontSize: 13)),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) => Semantics(
+        label: 'Simple or detailed view',
+        child: Container(
+          padding: const EdgeInsets.all(3),
+          decoration: BoxDecoration(color: box, borderRadius: BorderRadius.circular(10), border: Border.all(color: line)),
+          child: Row(mainAxisSize: MainAxisSize.min, children: [_seg('Simple', false), _seg('Detailed', true)]),
+        ),
+      );
+}
+
+class _Logo extends StatelessWidget {
+  const _Logo({required this.size});
+  final double size;
+
+  @override
+  Widget build(BuildContext context) => SizedBox(
+        width: size,
+        height: size,
+        child: Stack(alignment: Alignment.center, children: [
+          Transform.rotate(
+            angle: math.pi / 4,
+            child: Container(
+              width: size * 0.68,
+              height: size * 0.68,
+              decoration: BoxDecoration(border: Border.all(color: accent, width: 2)),
+            ),
+          ),
+          Text('N', style: TextStyle(color: white, fontWeight: FontWeight.w800, fontSize: size * 0.4)),
+        ]),
+      );
+}
+
+class _Gauge extends StatelessWidget {
+  const _Gauge({required this.value, required this.label});
+  final double? value;
+  final String label;
+
+  @override
+  Widget build(BuildContext context) => Column(children: [
+        SizedBox(
+          width: 66,
+          height: 66,
+          child: CustomPaint(
+            painter: _GaugePainter(value),
+            child: Center(
+              child: Text(value == null ? '—' : '${value!.round()}%',
+                  style: const TextStyle(color: white, fontWeight: FontWeight.w700, fontSize: 14)),
+            ),
+          ),
+        ),
+        const SizedBox(height: 4),
+        Text(label, style: const TextStyle(color: white, fontSize: 11, letterSpacing: 1.2, fontWeight: FontWeight.w700)),
+      ]);
+}
+
+class _GaugePainter extends CustomPainter {
+  _GaugePainter(this.value);
+  final double? value;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final rect = Offset.zero & size;
+    final r = rect.deflate(4);
+    final track = Paint()
+      ..color = line
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 5;
+    canvas.drawArc(r, 0, math.pi * 2, false, track);
+    final v = value;
+    if (v != null && v > 0) {
+      final arc = Paint()
+        ..color = ring
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 5
+        ..strokeCap = StrokeCap.round;
+      canvas.drawArc(r, -math.pi / 2, math.pi * 2 * (v.clamp(0, 100) / 100), false, arc);
+    }
+  }
+
+  @override
+  bool shouldRepaint(_GaugePainter old) => old.value != value;
+}
+
 /// Covers the screen while a pairing is in progress.
 class _PairOverlay extends StatelessWidget {
   const _PairOverlay({required this.node, required this.session});
@@ -318,39 +681,47 @@ class _PairOverlay extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final t = Theme.of(context).textTheme;
     final s = session;
     final title = s.role == Role.outgoing ? 'Pair with ${s.peerName}' : '${s.peerName} wants to pair';
     final code = s.code ?? '';
+    final cancel = Align(alignment: Alignment.centerRight, child: _SecondaryButton(label: 'Cancel', onPressed: node.closePair));
 
     final List<Widget> body = switch (s.phase) {
       Phase.connecting => [
           Row(children: [
-            const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2)),
+            const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2, color: accent)),
             const SizedBox(width: 12),
             Expanded(child: Text('Connecting to ${s.peerName}…')),
           ]),
           const SizedBox(height: 16),
-          Align(alignment: Alignment.centerRight, child: TextButton(onPressed: node.closePair, child: const Text('Cancel'))),
+          cancel,
         ],
       Phase.compare || Phase.waiting => [
           Text('Check that ${s.peerName} shows the same number:'),
-          const SizedBox(height: 16),
-          Center(
+          const SizedBox(height: 14),
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.symmetric(vertical: 14),
+            decoration: BoxDecoration(color: box2, borderRadius: BorderRadius.circular(12)),
             child: Text(
               code.length == 6 ? '${code.substring(0, 3)} ${code.substring(3)}' : code,
-              style: t.displayMedium?.copyWith(fontWeight: FontWeight.w700, fontFamily: 'monospace', letterSpacing: 2),
+              textAlign: TextAlign.center,
+              style: const TextStyle(fontSize: 42, fontWeight: FontWeight.w800, fontFamily: 'monospace', letterSpacing: 2),
             ),
           ),
-          const SizedBox(height: 20),
+          const SizedBox(height: 18),
           if (s.phase == Phase.compare)
             Row(children: [
-              Expanded(
-                child: OutlinedButton(onPressed: () => s.answer(false), child: const Text("Don't match")),
-              ),
-              const SizedBox(width: 12),
+              Expanded(child: _SecondaryButton(label: "Don't match", onPressed: () => s.answer(false))),
+              const SizedBox(width: 10),
               Expanded(
                 child: FilledButton(
+                  style: FilledButton.styleFrom(
+                    backgroundColor: accent,
+                    foregroundColor: white,
+                    minimumSize: const Size(0, 44),
+                    textStyle: const TextStyle(fontWeight: FontWeight.w800),
+                  ),
                   onPressed: () => s.answer(true),
                   child: const Text('Numbers match'),
                 ),
@@ -358,49 +729,62 @@ class _PairOverlay extends StatelessWidget {
             ])
           else ...[
             Row(children: [
-              const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2)),
+              const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2, color: accent)),
               const SizedBox(width: 12),
               Expanded(child: Text('Waiting for ${s.peerName} to confirm…')),
             ]),
-            Align(alignment: Alignment.centerRight, child: TextButton(onPressed: node.closePair, child: const Text('Cancel'))),
+            const SizedBox(height: 10),
+            cancel,
           ],
         ],
       Phase.done => [
           Row(children: [
-            const Icon(Icons.check_circle, color: good),
+            const Icon(Icons.check_circle, color: online),
             const SizedBox(width: 10),
-            Expanded(child: Text('Paired with ${s.peerName}', style: t.titleMedium)),
+            Expanded(child: Text('Paired with ${s.peerName}', style: const TextStyle(fontSize: 17, fontWeight: FontWeight.w700))),
           ]),
           const SizedBox(height: 6),
-          const Text('It now appears under My devices.'),
+          const Text('It now shows in your device list.'),
           const SizedBox(height: 16),
-          Align(alignment: Alignment.centerRight, child: FilledButton(onPressed: node.closePair, child: const Text('Done'))),
+          Align(
+            alignment: Alignment.centerRight,
+            child: FilledButton(
+              style: FilledButton.styleFrom(backgroundColor: accent, foregroundColor: white),
+              onPressed: node.closePair,
+              child: const Text('Done'),
+            ),
+          ),
         ],
       Phase.failed => [
           Text(s.error ?? 'Pairing failed', style: const TextStyle(color: bad)),
           const SizedBox(height: 16),
-          Align(alignment: Alignment.centerRight, child: TextButton(onPressed: node.closePair, child: const Text('Close'))),
+          Align(alignment: Alignment.centerRight, child: _SecondaryButton(label: 'Close', onPressed: node.closePair)),
         ],
     };
 
     return Positioned.fill(
       child: Container(
-        color: Colors.black54,
+        color: Colors.black87,
         alignment: Alignment.center,
         padding: const EdgeInsets.all(20),
         child: ConstrainedBox(
           constraints: const BoxConstraints(maxWidth: 420),
-          child: Card(
+          child: Material(
+            color: box,
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14), side: const BorderSide(color: line)),
             child: Padding(
               padding: const EdgeInsets.all(20),
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(title, style: t.titleLarge?.copyWith(fontWeight: FontWeight.w600)),
-                  const SizedBox(height: 14),
-                  ...body,
-                ],
+              child: DefaultTextStyle.merge(
+                style: const TextStyle(color: white),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(title, style: const TextStyle(fontSize: 19, fontWeight: FontWeight.w800)),
+                    const SizedBox(height: 14),
+                    ...body,
+                  ],
+                ),
               ),
             ),
           ),

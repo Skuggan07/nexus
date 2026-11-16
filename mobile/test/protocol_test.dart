@@ -29,6 +29,8 @@ void main() {
 
     final nonce = List<int>.generate(16, (i) => i);
     expect(toHex(await pingMac(dh, nonce, idB, idA)), 'a0076a3d95367e6269cde514a4ad868319a11736f150dffccee35f1d4f2f0027');
+    expect(toHex(await statsMac(dh, nonce, '{"cpu":12.5,"ram":40.0,"battery":null}')),
+        'c907b8868f50ad65d246b1ea19b8c3cbb77290a2c185394f93b4901741739935');
   });
 
   test('hex helpers', () {

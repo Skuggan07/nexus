@@ -19,3 +19,5 @@ nonce = bytes(range(16))
 ping = mac(dh, [b"nexus-ping-v2", nonce, dev_id(pkb).encode(), dev_id(pka).encode()])
 for k, v in [("pka", pka.hex()), ("pkb", pkb.hex()), ("id_a", dev_id(pka)), ("id_b", dev_id(pkb)), ("commit", commit.hex()), ("code", code), ("dh", dh.hex()), ("ping", ping.hex())]:
     print(f"{k} = {v}")
+stats_mac = mac(dh, [b"nexus-stats-v2", nonce, b'{"cpu":12.5,"ram":40.0,"battery":null}'])
+print(f"stats_mac = {stats_mac.hex()}")
