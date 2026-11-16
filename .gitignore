@@ -1,0 +1,9 @@
+/desktop/target/
+/mobile/build/
+/mobile/.dart_tool/
+/mobile/android/
+/mobile/.metadata
+/mobile/.flutter-plugins*
+/mobile/pubspec.lock
+*.iml
+.idea/

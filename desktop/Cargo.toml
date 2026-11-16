@@ -1,0 +1,27 @@
+[package]
+name = "nexus"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+description = "Nexus desktop: discover nearby devices, pair them securely and show their connection status"
+license = "MIT"
+
+[dependencies]
+eframe = "0.29"                                              # native window + egui UI
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+x25519-dalek = { version = "2", features = ["static_secrets"] }  # long-term device keys
+hmac = "0.12"
+sha2 = "0.10"
+rand = "0.8"
+hex = "0.4"
+socket2 = "0.5"                                              # UDP broadcast socket options
+if-addrs = "0.13"                                            # per-interface broadcast addresses
+directories = "5"                                            # %APPDATA% location
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

@@ -1,0 +1,89 @@
+# Builds Nexus for Windows and Android on every push to main,
+# then publishes both files on the repository's Releases page.
+name: Build Nexus
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    name: Windows app
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: desktop
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop
+      - name: Test
+        run: cargo test
+      - name: Build
+        run: cargo build --release
+      - name: Collect
+        run: Copy-Item target/release/nexus.exe ../nexus-windows.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nexus-windows
+          path: nexus-windows.exe
+
+  android:
+    name: Android app
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: mobile
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - name: Generate Android project files
+        run: |
+          flutter create --platforms=android --org app.nexus --project-name nexus_mobile .
+          rm -f test/widget_test.dart
+          python3 ../.github/patch_manifest.py android/app/src/main/AndroidManifest.xml
+      - run: flutter pub get
+      - name: Test (shared protocol vectors)
+        run: flutter test
+      - name: Build APK
+        run: flutter build apk --release
+      - name: Collect
+        run: cp build/app/outputs/flutter-apk/app-release.apk ../nexus-android.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nexus-android
+          path: nexus-android.apk
+
+  release:
+    name: Publish download page
+    needs: [windows, android]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Nexus build ${{ github.run_number }}
+          make_latest: true
+          body: |
+            **Android:** download `nexus-android.apk` on your phone and open it.
+            **Windows:** download `nexus-windows.exe` and run it.
+          files: |
+            out/nexus-windows.exe
+            out/nexus-android.apk
