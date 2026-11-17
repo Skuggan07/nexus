@@ -697,13 +697,14 @@ pub fn wake(peer: &PairedPeer) -> Result<(), String> {
     let mut targets: Vec<SocketAddr> = vec![SocketAddr::from(([255, 255, 255, 255], WOL_PORT))];
     if let Ok(ifaces) = if_addrs::get_if_addrs() {
         for i in ifaces {
+            if i.is_loopback() {
+                continue;
+            }
             if let if_addrs::IfAddr::V4(a) = i.addr {
-                if !i.is_loopback() {
-                    let b = std::net::Ipv4Addr::from(u32::from(a.ip) | !u32::from(a.netmask));
-                    let t = SocketAddr::from((b, WOL_PORT));
-                    if !targets.contains(&t) {
-                        targets.push(t);
-                    }
+                let b = std::net::Ipv4Addr::from(u32::from(a.ip) | !u32::from(a.netmask));
+                let t = SocketAddr::from((b, WOL_PORT));
+                if !targets.contains(&t) {
+                    targets.push(t);
                 }
             }
         }
@@ -858,7 +859,6 @@ mod tests {
         };
         assert!(wake(&peer).is_err());
         let ok = PairedPeer { macs: vec!["aa:bb:cc:dd:ee:ff".into()], ..peer };
-        // A known MAC gets past the "no address" check; sending may or may not reach anything.
         assert!(parse_mac(&ok.macs[0]).is_some());
     }
 
@@ -877,7 +877,6 @@ mod tests {
         Node { me, shared, addr: SocketAddr::from(([127, 0, 0, 1], port)) }
     }
 
-    /// Plays the user: answers the comparison with `accept`, and reports the code it saw.
     fn auto_answer(shared: SharedState, accept: bool) -> thread::JoinHandle<Option<String>> {
         thread::spawn(move || {
             for _ in 0..200 {
