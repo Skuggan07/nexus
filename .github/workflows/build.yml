@@ -55,6 +55,13 @@ jobs:
           flutter create --platforms=android --org app.nexus --project-name nexus_mobile .
           rm -f test/widget_test.dart
           python3 ../.github/patch_manifest.py android/app/src/main/AndroidManifest.xml
+          # Some plugins (file_picker's transitive deps) require compiling against Android API 36.
+          for f in android/app/build.gradle.kts android/app/build.gradle; do
+            if [ -f "$f" ]; then
+              sed -i -E 's/compileSdk(Version)?[ =]+flutter\.compileSdkVersion/compileSdk = 36/' "$f"
+              sed -i -E 's/targetSdk(Version)?[ =]+flutter\.targetSdkVersion/targetSdk = 36/' "$f"
+            fi
+          done
       - run: flutter pub get
       - name: Test (shared protocol vectors)
         run: flutter test
