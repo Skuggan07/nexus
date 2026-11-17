@@ -16,6 +16,9 @@ pub struct PairedPeer {
     /// Last address the device answered on, as `ip:port`.
     #[serde(default)]
     pub last_addr: Option<String>,
+    /// The device's MAC addresses, learned from its announcements, for Wake-on-LAN.
+    #[serde(default)]
+    pub macs: Vec<String>,
 }
 
 /// `%APPDATA%\Nexus\Nexus\data` on Windows. Override with `NEXUS_DATA_DIR`

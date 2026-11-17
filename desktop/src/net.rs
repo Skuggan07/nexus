@@ -43,6 +43,43 @@ pub const LABEL_COMMIT: &[u8] = b"nexus-commit-v2";
 pub const LABEL_SAS: &[u8] = b"nexus-sas-v2";
 pub const LABEL_PING: &[u8] = b"nexus-ping-v2";
 pub const LABEL_STATS: &[u8] = b"nexus-stats-v2";
+pub const LABEL_CMD: &[u8] = b"nexus-cmd-v2";
+pub const LABEL_CMDACK: &[u8] = b"nexus-cmdack-v2";
+/// UDP port the Wake-on-LAN magic packet is sent to (9 = the usual "discard" port).
+pub const WOL_PORT: u16 = 9;
+
+/// Remote actions a paired device may ask this one to perform.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Command {
+    Lock,
+    Restart,
+    Shutdown,
+}
+
+impl Command {
+    pub fn wire(self) -> &'static str {
+        match self {
+            Command::Lock => "lock",
+            Command::Restart => "restart",
+            Command::Shutdown => "shutdown",
+        }
+    }
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "lock" => Some(Command::Lock),
+            "restart" => Some(Command::Restart),
+            "shutdown" => Some(Command::Shutdown),
+            _ => None,
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Command::Lock => "Lock",
+            Command::Restart => "Restart",
+            Command::Shutdown => "Shut down",
+        }
+    }
+}
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -81,6 +118,18 @@ enum Msg {
         stats: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         stats_mac: Option<String>,
+    },
+    /// "Do this" from a paired device: lock, restart or shut down.
+    Command {
+        id: String,
+        nonce: String,
+        action: String,
+        mac: String,
+    },
+    CommandAck {
+        ok: bool,
+        message: String,
+        mac: String,
     },
     Error {
         reason: String,
@@ -125,6 +174,16 @@ pub fn pairing_code(pka: &[u8], pkb: &[u8], na: &[u8], nb: &[u8]) -> String {
 
 pub fn ping_mac(shared_secret: &[u8], nonce: &[u8], responder_id: &str, requester_id: &str) -> Vec<u8> {
     mac(shared_secret, &[LABEL_PING, nonce, responder_id.as_bytes(), requester_id.as_bytes()])
+}
+
+/// Signs a command so only the paired device could have asked for it.
+pub fn command_mac(ss: &[u8], nonce: &[u8], action: &str, responder_id: &str, requester_id: &str) -> Vec<u8> {
+    mac(ss, &[LABEL_CMD, nonce, action.as_bytes(), responder_id.as_bytes(), requester_id.as_bytes()])
+}
+
+/// Signs the reply so the asker knows the answer really came from that device.
+pub fn command_ack_mac(ss: &[u8], nonce: &[u8], message: &str) -> Vec<u8> {
+    mac(ss, &[LABEL_CMDACK, nonce, message.as_bytes()])
 }
 
 fn unhex(s: &str, len: usize) -> Result<Vec<u8>, String> {
@@ -216,11 +275,93 @@ fn handle(stream: TcpStream, me: &Identity, shared: &SharedState, dir: &Path) {
             };
             let _ = c.send(&reply);
         }
+        Ok(Msg::Command { id, nonce, action, mac: tag }) => host_command(c, me, shared, id, nonce, action, tag),
         Ok(Msg::PairHello { v, id, name, os, public_key }) => {
             host_pair(c, me, shared, dir, v, id, name, os, public_key)
         }
         _ => {}
     }
+}
+
+/// Runs a lock/restart/shutdown asked for by a verified, paired device.
+fn host_command(
+    mut c: Conn,
+    me: &Identity,
+    shared: &SharedState,
+    id: String,
+    nonce: String,
+    action: String,
+    tag: String,
+) {
+    let outcome = (|| -> Result<(Command, Vec<u8>), String> {
+        let peer = lock(shared).paired.iter().find(|p| p.id == id).cloned();
+        let (peer, n) = match (peer, hex::decode(&nonce)) {
+            (Some(p), Ok(n)) => (p, n),
+            _ => return Err(format!("{} does not trust this device", me.name)),
+        };
+        let pk = identity::decode_public(&peer.public_key).ok_or("Stored key is damaged")?;
+        let ss = me.secret.diffie_hellman(&pk);
+        if !mac_ok(ss.as_bytes(), &[LABEL_CMD, &n, action.as_bytes(), me.id.as_bytes(), id.as_bytes()], &tag) {
+            return Err("Command failed its security check".into());
+        }
+        let cmd = Command::parse(&action).ok_or("Unknown command")?;
+        Ok((cmd, ss.as_bytes().to_vec()))
+    })();
+
+    match outcome {
+        Ok((cmd, ss)) => {
+            let n = hex::decode(&nonce).unwrap_or_default();
+            // Reply before acting: restart and shutdown end this process.
+            let _ = c.send(&Msg::CommandAck {
+                ok: true,
+                message: "ok".into(),
+                mac: hex::encode(command_ack_mac(&ss, &n, "ok")),
+            });
+            let _ = c.writer.flush();
+            {
+                let mut s = lock(shared);
+                let who = s
+                    .paired
+                    .iter()
+                    .find(|p| p.id == id)
+                    .map(|p| p.name.clone())
+                    .unwrap_or_else(|| "A paired device".into());
+                s.log(format!("{who} asked to {}", cmd.label().to_lowercase()));
+            }
+            thread::sleep(Duration::from_millis(150));
+            if let Err(e) = run_action(cmd) {
+                lock(shared).log(format!("Could not {}: {e}", cmd.label().to_lowercase()));
+            }
+        }
+        Err(e) => {
+            let _ = c.send(&Msg::Error { reason: e });
+        }
+    }
+}
+
+/// Carries out a power command on this computer. Spawns and returns at once so
+/// the reply has already been sent; restart and shutdown then take this app down with them.
+fn run_action(cmd: Command) -> Result<(), String> {
+    use std::process::Command as Proc;
+    #[cfg(windows)]
+    let (program, args): (&str, &[&str]) = match cmd {
+        Command::Lock => ("rundll32.exe", &["user32.dll,LockWorkStation"]),
+        Command::Restart => ("shutdown", &["/r", "/t", "0"]),
+        Command::Shutdown => ("shutdown", &["/s", "/t", "0"]),
+    };
+    #[cfg(target_os = "macos")]
+    let (program, args): (&str, &[&str]) = match cmd {
+        Command::Lock => ("pmset", &["displaysleepnow"]),
+        Command::Restart => ("osascript", &["-e", "tell application \"System Events\" to restart"]),
+        Command::Shutdown => ("osascript", &["-e", "tell application \"System Events\" to shut down"]),
+    };
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let (program, args): (&str, &[&str]) = match cmd {
+        Command::Lock => ("loginctl", &["lock-session"]),
+        Command::Restart => ("systemctl", &["reboot"]),
+        Command::Shutdown => ("systemctl", &["poweroff"]),
+    };
+    Proc::new(program).args(args).spawn().map(|_| ()).map_err(|e| e.to_string())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -303,6 +444,7 @@ fn host_pair(
                     public_key: pka_hex,
                     paired_at: store::now_unix(),
                     last_addr,
+                    macs: Vec::new(),
                 },
             );
             s.window = None;
@@ -486,6 +628,7 @@ pub(crate) fn pair_client(
         public_key,
         paired_at: store::now_unix(),
         last_addr: Some(target.addr.to_string()),
+        macs: Vec::new(),
     })
 }
 
@@ -512,6 +655,89 @@ pub(crate) fn ping(me: &Identity, peer: &PairedPeer, addr: SocketAddr) -> Result
         _ => None,
     };
     Ok((rtt, stats))
+}
+
+/// Asks a paired device to lock, restart or shut down. Returns when it has acknowledged.
+pub(crate) fn send_command(me: &Identity, peer: &PairedPeer, addr: SocketAddr, cmd: Command) -> Result<(), String> {
+    let pk = identity::decode_public(&peer.public_key).ok_or("Stored key is damaged")?;
+    let ss = me.secret.diffie_hellman(&pk);
+    let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(3)).map_err(|_| "Not reachable".to_string())?;
+    let mut c = Conn::new(stream, Duration::from_secs(5))?;
+    let nonce: [u8; 16] = rand::random();
+    c.send(&Msg::Command {
+        id: me.id.clone(),
+        nonce: hex::encode(nonce),
+        action: cmd.wire().into(),
+        mac: hex::encode(command_mac(ss.as_bytes(), &nonce, cmd.wire(), &peer.id, &me.id)),
+    })?;
+    match c.recv()? {
+        Msg::CommandAck { ok, message, mac: tag } => {
+            if !mac_ok(ss.as_bytes(), &[LABEL_CMDACK, nonce.as_slice(), message.as_bytes()], &tag) {
+                return Err("The device answered, but the reply failed its security check".into());
+            }
+            if ok {
+                Ok(())
+            } else {
+                Err(message)
+            }
+        }
+        _ => Err(unexpected()),
+    }
+}
+
+/// Builds and broadcasts a Wake-on-LAN "magic packet" for each known MAC of a device.
+/// The device must have Wake-on-LAN enabled in its BIOS/network card for this to wake it.
+pub fn wake(peer: &PairedPeer) -> Result<(), String> {
+    let macs: Vec<[u8; 6]> = peer.macs.iter().filter_map(|m| parse_mac(m)).collect();
+    if macs.is_empty() {
+        return Err("No network address on file for this device yet. Connect it once while it is on.".into());
+    }
+    let sock = std::net::UdpSocket::bind(("0.0.0.0", 0)).map_err(|e| e.to_string())?;
+    sock.set_broadcast(true).map_err(|e| e.to_string())?;
+    let mut targets: Vec<SocketAddr> = vec![SocketAddr::from(([255, 255, 255, 255], WOL_PORT))];
+    if let Ok(ifaces) = if_addrs::get_if_addrs() {
+        for i in ifaces {
+            if let if_addrs::IfAddr::V4(a) = i.addr {
+                if !i.is_loopback() {
+                    let b = std::net::Ipv4Addr::from(u32::from(a.ip) | !u32::from(a.netmask));
+                    let t = SocketAddr::from((b, WOL_PORT));
+                    if !targets.contains(&t) {
+                        targets.push(t);
+                    }
+                }
+            }
+        }
+    }
+    for m in &macs {
+        let mut packet = vec![0xFFu8; 6];
+        for _ in 0..16 {
+            packet.extend_from_slice(m);
+        }
+        for t in &targets {
+            let _ = sock.send_to(&packet, t);
+        }
+    }
+    Ok(())
+}
+
+fn parse_mac(s: &str) -> Option<[u8; 6]> {
+    let hex: String = s.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+    let bytes = hex::decode(hex).ok()?;
+    <[u8; 6]>::try_from(bytes.as_slice()).ok().filter(|b| b.iter().any(|&x| x != 0))
+}
+
+/// This computer's MAC addresses (colon form), for Wake-on-LAN by paired devices.
+pub fn local_macs() -> Vec<String> {
+    let mut out = Vec::new();
+    if let Ok(iter) = mac_address::MacAddressIterator::new() {
+        for m in iter {
+            let s = m.to_string();
+            if parse_mac(&s).is_some() && !out.contains(&s) {
+                out.push(s);
+            }
+        }
+    }
+    out
 }
 
 /// Checks every paired device every few seconds.
@@ -609,6 +835,31 @@ mod tests {
         let parsed: Stats = serde_json::from_slice(stats).unwrap();
         assert_eq!(parsed.cpu, Some(12.5));
         assert_eq!(parsed.battery, None);
+        assert_eq!(
+            hex::encode(command_mac(dh.as_bytes(), &nonce, "restart", &id_b, &id_a)),
+            "cc23f5b317576fbab9eaeb6679cccb8505c71920ff2e9f84994ee520f2b3719a"
+        );
+        assert_eq!(
+            hex::encode(command_ack_mac(dh.as_bytes(), &nonce, "ok")),
+            "0d7987eada42979766a460a96ea74e2981dedf85e6ecb4af3573d20fdfb63344"
+        );
+    }
+
+    #[test]
+    fn wake_needs_a_known_mac() {
+        let peer = PairedPeer {
+            id: "x".into(),
+            name: "PC".into(),
+            os: "Windows".into(),
+            public_key: "00".into(),
+            paired_at: 0,
+            last_addr: None,
+            macs: vec![],
+        };
+        assert!(wake(&peer).is_err());
+        let ok = PairedPeer { macs: vec!["aa:bb:cc:dd:ee:ff".into()], ..peer };
+        // A known MAC gets past the "no address" check; sending may or may not reach anything.
+        assert!(parse_mac(&ok.macs[0]).is_some());
     }
 
     struct Node {

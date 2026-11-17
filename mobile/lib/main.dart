@@ -273,7 +273,9 @@ class _HomePageState extends State<HomePage> {
     final (color, text) = _statusLine(st);
     final isOnline = st.kind == StatusKind.verified || st.kind == StatusKind.checking;
     final addr = node.addressOf(p);
-    return Container(
+    return GestureDetector(
+      onTap: () => _showDetails(context, p),
+      child: Container(
       decoration: BoxDecoration(
         color: box,
         borderRadius: BorderRadius.circular(12),
@@ -318,6 +320,7 @@ class _HomePageState extends State<HomePage> {
           _SecondaryButton(label: 'Remove', onPressed: () => _confirmRemove(context, p)),
         ]),
       ]),
+      ),
     );
   }
 
@@ -415,6 +418,8 @@ class _HomePageState extends State<HomePage> {
               Text('${p.os}${addr != null ? ' · $addr' : ''}'),
               Text('key ${_fp(p.id)}', style: const TextStyle(fontFamily: 'monospace', fontSize: 12)),
               const SizedBox(height: 16),
+              ..._powerControls(context, p, st),
+              const SizedBox(height: 8),
               _SecondaryButton(
                 label: 'Remove device',
                 onPressed: () async {
@@ -427,6 +432,78 @@ class _HomePageState extends State<HomePage> {
         },
       ),
     );
+  }
+
+  /// Lock / Restart / Shut down (when the computer is online) and Wake (when it's offline).
+  /// Only shown for computers — a phone can't be controlled this way.
+  List<Widget> _powerControls(BuildContext context, PairedPeer p, PeerStatus st) {
+    if (!p.controllable) return const [];
+    final isOnline = st.kind == StatusKind.verified || st.kind == StatusKind.checking;
+    if (isOnline) {
+      return [
+        Row(children: [
+          Expanded(child: _SecondaryButton(label: 'Lock', onPressed: () => node.sendCommand(p, 'lock'))),
+          const SizedBox(width: 8),
+          Expanded(child: _SecondaryButton(label: 'Restart', onPressed: () => _confirmPower(context, p, 'restart'))),
+          const SizedBox(width: 8),
+          Expanded(
+            child: OutlinedButton(
+              style: OutlinedButton.styleFrom(
+                foregroundColor: white,
+                backgroundColor: box2,
+                side: const BorderSide(color: bad),
+                minimumSize: const Size(0, 44),
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+                textStyle: const TextStyle(fontWeight: FontWeight.w700),
+              ),
+              onPressed: () => _confirmPower(context, p, 'shutdown'),
+              child: const Text('Shut down'),
+            ),
+          ),
+        ]),
+      ];
+    }
+    if (p.macs.isNotEmpty) {
+      return [
+        SizedBox(
+          width: double.infinity,
+          height: 46,
+          child: FilledButton.icon(
+            style: FilledButton.styleFrom(
+              backgroundColor: accent,
+              foregroundColor: white,
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+              textStyle: const TextStyle(fontWeight: FontWeight.w800),
+            ),
+            onPressed: () => node.wake(p),
+            icon: const Icon(Icons.power_settings_new),
+            label: const Text('Wake'),
+          ),
+        ),
+      ];
+    }
+    return const [];
+  }
+
+  Future<void> _confirmPower(BuildContext context, PairedPeer p, String action) async {
+    final label = action == 'restart' ? 'Restart' : 'Shut down';
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: box,
+        title: Text('$label ${p.name}?'),
+        content: Text('This will $action the computer now.'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel', style: TextStyle(color: white))),
+          FilledButton(
+            style: FilledButton.styleFrom(backgroundColor: const Color(0xFFB4413A)),
+            onPressed: () => Navigator.pop(ctx, true),
+            child: Text('Yes, $label'),
+          ),
+        ],
+      ),
+    );
+    if (ok == true) await node.sendCommand(p, action);
   }
 
   Future<void> _rename(BuildContext context) async {

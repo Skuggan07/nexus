@@ -31,6 +31,10 @@ void main() {
     expect(toHex(await pingMac(dh, nonce, idB, idA)), 'a0076a3d95367e6269cde514a4ad868319a11736f150dffccee35f1d4f2f0027');
     expect(toHex(await statsMac(dh, nonce, '{"cpu":12.5,"ram":40.0,"battery":null}')),
         'c907b8868f50ad65d246b1ea19b8c3cbb77290a2c185394f93b4901741739935');
+    expect(toHex(await commandMac(dh, nonce, 'restart', idB, idA)),
+        'cc23f5b317576fbab9eaeb6679cccb8505c71920ff2e9f84994ee520f2b3719a');
+    expect(toHex(await commandAckMac(dh, nonce, 'ok')),
+        '0d7987eada42979766a460a96ea74e2981dedf85e6ecb4af3573d20fdfb63344');
   });
 
   test('hex helpers', () {
@@ -39,5 +43,11 @@ void main() {
     expect(() => fromHex('zz'), throwsA(isA<NexusError>()));
     expect(sameBytes([1, 2, 3], [1, 2, 3]), isTrue);
     expect(sameBytes([1, 2, 3], [1, 2, 4]), isFalse);
+  });
+
+  test('mac parsing', () {
+    expect(parseMac('aa:bb:cc:dd:ee:ff'), [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
+    expect(parseMac('00-00-00-00-00-00'), isNull);
+    expect(parseMac('not a mac'), isNull);
   });
 }

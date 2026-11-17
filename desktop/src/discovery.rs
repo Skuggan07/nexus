@@ -4,7 +4,9 @@
 
 use crate::{
     identity::{self, Identity},
+    net,
     state::{lock, Seen, SharedState},
+    store,
 };
 use serde::{Deserialize, Serialize};
 use socket2::{Domain, Protocol, Socket, Type};
@@ -27,9 +29,12 @@ struct Announce {
     os: String,
     public_key: String,
     tcp_port: u16,
+    /// MAC addresses, so paired devices can wake this one. Older versions omit it.
+    #[serde(default)]
+    macs: Vec<String>,
 }
 
-pub fn start(me: Arc<Identity>, shared: SharedState, tcp_port: u16) -> Result<(), String> {
+pub fn start(me: Arc<Identity>, shared: SharedState, dir: std::path::PathBuf, tcp_port: u16) -> Result<(), String> {
     let sock = bind().map_err(|e| format!("Discovery could not use UDP port {PORT}: {e}"))?;
     let tx = sock.try_clone().map_err(|e| e.to_string())?;
 
@@ -41,6 +46,7 @@ pub fn start(me: Arc<Identity>, shared: SharedState, tcp_port: u16) -> Result<()
         os: identity::os_label(),
         public_key: me.public_hex(),
         tcp_port,
+        macs: net::local_macs(),
     })
     .expect("announcement serializes");
 
@@ -80,6 +86,15 @@ pub fn start(me: Arc<Identity>, shared: SharedState, tcp_port: u16) -> Result<()
                 if returning {
                     let what = if s.is_paired(&a.id) { "is back on the network" } else { "found nearby" };
                     s.log(format!("{} {what} ({})", a.name, from.ip()));
+                }
+                // Remember a paired device's MAC addresses so it can be woken later.
+                if !a.macs.is_empty() {
+                    if let Some(p) = s.paired.iter_mut().find(|p| p.id == a.id) {
+                        if p.macs != a.macs {
+                            p.macs = a.macs.clone();
+                            let _ = store::save_peers(&dir, &s.paired);
+                        }
+                    }
                 }
                 s.seen.insert(
                     a.id.clone(),

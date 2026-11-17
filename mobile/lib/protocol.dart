@@ -16,6 +16,10 @@ final labelCommit = utf8.encode('nexus-commit-v2');
 final labelSas = utf8.encode('nexus-sas-v2');
 final labelPing = utf8.encode('nexus-ping-v2');
 final labelStats = utf8.encode('nexus-stats-v2');
+final labelCmd = utf8.encode('nexus-cmd-v2');
+final labelCmdAck = utf8.encode('nexus-cmdack-v2');
+
+const wolPort = 9;
 
 final _x25519 = X25519();
 final _sha256 = Sha256();
@@ -95,6 +99,25 @@ Future<List<int>> pingMac(List<int> sharedSecret, List<int> nonce, String respon
 
 Future<List<int>> statsMac(List<int> sharedSecret, List<int> nonce, String statsJson) =>
     hmac(sharedSecret, [labelStats, nonce, utf8.encode(statsJson)]);
+
+Future<List<int>> commandMac(
+        List<int> ss, List<int> nonce, String action, String responderId, String requesterId) =>
+    hmac(ss, [labelCmd, nonce, utf8.encode(action), utf8.encode(responderId), utf8.encode(requesterId)]);
+
+Future<List<int>> commandAckMac(List<int> ss, List<int> nonce, String message) =>
+    hmac(ss, [labelCmdAck, nonce, utf8.encode(message)]);
+
+/// Parses "aa:bb:cc:dd:ee:ff" (any separators) into 6 bytes, or null if it is all zeros / malformed.
+List<int>? parseMac(String s) {
+  final hex = s.split('').where((c) => RegExp(r'[0-9a-fA-F]').hasMatch(c)).join();
+  if (hex.length != 12) return null;
+  try {
+    final b = fromHex(hex, 6);
+    return b.any((x) => x != 0) ? b : null;
+  } catch (_) {
+    return null;
+  }
+}
 
 Future<SimpleKeyPair> keyPairFromSeed(List<int> seed) => _x25519.newKeyPairFromSeed(seed);
 

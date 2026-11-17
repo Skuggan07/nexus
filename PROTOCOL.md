@@ -11,10 +11,10 @@ Each device has a long-term X25519 key pair. Its **ID** is the first 8 bytes of 
 Every 2 seconds, each device broadcasts this JSON message to `255.255.255.255` and to the broadcast address of each of its networks:
 
 ```json
-{"app":"nexus","v":1,"id":"…","name":"Gaming PC","os":"Windows","public_key":"<64 hex>","tcp_port":47801}
+{"app":"nexus","v":1,"id":"…","name":"Gaming PC","os":"Windows","public_key":"<64 hex>","tcp_port":47801,"macs":["aa:bb:cc:dd:ee:ff"]}
 ```
 
-A receiver ignores the message if `id` doesn't match `public_key`. A device counts as present for 7 seconds after its last announcement.
+A receiver ignores the message if `id` doesn't match `public_key`. A device counts as present for 7 seconds after its last announcement. `macs` (optional) lists the device's MAC addresses; a paired device remembers them so it can send a Wake-on-LAN packet later. Phones send an empty list.
 
 ## Control channel: TCP port 47801
 
@@ -47,5 +47,22 @@ B commits to Nb before it sees Na. That means a device listening in the middle c
 | B → A | `pong {mac: HMAC-SHA256(key=X25519(B, PKa), "nexus-ping-v2" ‖ nonce ‖ B's id ‖ A's id)}` |
 
 Only the real B can produce the right `mac`. A sends a ping to every paired device every 5 seconds. A result counts for 15 seconds.
+
+A `pong` may also carry live stats, signed on their own so older versions can ignore them:
+`stats` (compact JSON `{"cpu":…,"ram":…,"battery":…}`, each a percent or null) and
+`stats_mac: HMAC-SHA256(key=X25519(B, PKa), "nexus-stats-v2" ‖ nonce ‖ stats)`. A trusts the stats only if `stats_mac` checks out.
+
+### Remote command (lock / restart / shut down)
+
+| Step | Message |
+|---|---|
+| A → B | `command {id: A's id, nonce (16 bytes), action: "lock"\|"restart"\|"shutdown", mac: HMAC-SHA256(key=X25519(A, PKb), "nexus-cmd-v2" ‖ nonce ‖ action ‖ B's id ‖ A's id)}` |
+| B → A | `command_ack {ok, message, mac: HMAC-SHA256(key=X25519(B, PKa), "nexus-cmdack-v2" ‖ nonce ‖ message)}` |
+
+B runs the action only if `mac` is valid and A is a paired device, so only a paired device can trigger it. B replies **before** acting, since restart and shut down end its process. Phones can't run these and reply with `ok:false`.
+
+### Wake-on-LAN
+
+To wake a device that is asleep or off, Nexus broadcasts a standard magic packet (6 bytes of `0xFF` followed by the target MAC repeated 16 times) to UDP port 9, to `255.255.255.255` and to each network's broadcast address. The target's MAC comes from the `macs` field it announced while it was on. Waking requires Wake-on-LAN to be enabled in the target's BIOS and network card.
 
 All binary values on the wire are lowercase hex.

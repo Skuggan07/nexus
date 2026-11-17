@@ -19,6 +19,7 @@ socket2 = "0.5"                                              # UDP broadcast soc
 if-addrs = "0.13"                                            # per-interface broadcast addresses
 directories = "5"                                            # %APPDATA% location
 sysinfo = { version = "0.30", default-features = false }   # CPU and RAM usage
+mac_address = "1"                                           # local MAC addresses for Wake-on-LAN
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_System_Power", "Win32_Foundation"] }  # battery level

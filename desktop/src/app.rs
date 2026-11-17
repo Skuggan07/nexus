@@ -5,7 +5,7 @@
 
 use crate::{
     identity::{self, Identity},
-    net::{self, PairTarget},
+    net::{self, Command, PairTarget},
     state::{lock, PairSession, Phase, Role, SharedState, Status},
     store::{self, PairedPeer},
     sysstats::Stats,
@@ -45,6 +45,8 @@ pub struct NexusApp {
     startup_error: Option<String>,
     manual_addr: String,
     confirm_remove: Option<String>,
+    /// A restart/shutdown awaiting the user's confirmation: (device id, command).
+    confirm_cmd: Option<(String, Command)>,
     details: Option<String>,
     detailed: bool,
     tab: Tab,
@@ -64,6 +66,10 @@ enum Action {
     Go(Tab),
     SetDetailed(bool),
     ShowDetails(Option<String>),
+    AskCommand(String, Command),
+    CancelCommand,
+    RunCommand(String, Command),
+    Wake(String),
 }
 
 impl NexusApp {
@@ -83,6 +89,7 @@ impl NexusApp {
             startup_error,
             manual_addr: String::new(),
             confirm_remove: None,
+            confirm_cmd: None,
             details: None,
             detailed,
             tab: Tab::Devices,
@@ -144,6 +151,50 @@ impl NexusApp {
             Action::ShowDetails(id) => {
                 self.details = id;
                 self.confirm_remove = None;
+                self.confirm_cmd = None;
+            }
+            Action::AskCommand(id, cmd) => self.confirm_cmd = Some((id, cmd)),
+            Action::CancelCommand => self.confirm_cmd = None,
+            Action::RunCommand(id, cmd) => {
+                self.confirm_cmd = None;
+                let me = self.me.clone();
+                let shared = self.shared.clone();
+                let resolved = {
+                    let s = lock(&self.shared);
+                    s.paired.iter().find(|p| p.id == id).cloned().map(|p| {
+                        let addr = s
+                            .seen
+                            .get(&p.id)
+                            .filter(|x| x.fresh())
+                            .map(|x| SocketAddr::new(x.addr, x.tcp_port))
+                            .or_else(|| p.last_addr.as_deref().and_then(|a| a.parse().ok()));
+                        (p, addr)
+                    })
+                };
+                if let Some((peer, Some(addr))) = resolved {
+                    std::thread::spawn(move || {
+                        let msg = match net::send_command(&me, &peer, addr, cmd) {
+                            Ok(()) => format!("Asked {} to {}", peer.name, cmd.label().to_lowercase()),
+                            Err(e) => format!("Could not {} {}: {e}", cmd.label().to_lowercase(), peer.name),
+                        };
+                        lock(&shared).log(msg);
+                    });
+                } else {
+                    lock(&self.shared).log("That device is not reachable right now");
+                }
+            }
+            Action::Wake(id) => {
+                let peer = lock(&self.shared).paired.iter().find(|p| p.id == id).cloned();
+                if let Some(peer) = peer {
+                    let shared = self.shared.clone();
+                    std::thread::spawn(move || {
+                        let msg = match net::wake(&peer) {
+                            Ok(()) => format!("Sent a wake signal to {}", peer.name),
+                            Err(e) => format!("Could not wake {}: {e}", peer.name),
+                        };
+                        lock(&shared).log(msg);
+                    });
+                }
             }
         }
     }
@@ -602,9 +653,10 @@ impl NexusApp {
             });
         } else {
             let cols = ((ui.available_width() + 10.0) / 330.0).floor().max(1.0) as usize;
+            let confirm_cmd = self.confirm_cmd.clone();
             ui.columns(cols, |c| {
                 for (i, r) in rows.iter().enumerate() {
-                    device_card(&mut c[i % cols], r, self.confirm_remove.as_deref(), actions);
+                    device_card(&mut c[i % cols], r, self.confirm_remove.as_deref(), confirm_cmd.as_ref(), actions);
                 }
             });
         }
@@ -706,6 +758,8 @@ impl NexusApp {
                     RichText::new(format!("key {}", identity::fingerprint(&r.peer.public_key))).monospace().size(12.5),
                 );
                 ui.add_space(6.0);
+                power_controls(ui, r, self.confirm_cmd.as_ref(), actions);
+                ui.add_space(2.0);
                 remove_controls(ui, r, self.confirm_remove.as_deref(), actions);
             });
         if !open {
@@ -721,6 +775,61 @@ fn pair_action(n: &Near) -> Action {
         expected_id: Some(n.id.clone()),
         expected_key: Some(n.public_key.clone()),
     })
+}
+
+/// Lock / Restart / Shut down when the device is online; Wake when it is offline and its MAC is known.
+fn power_controls(ui: &mut egui::Ui, r: &Row, confirm_cmd: Option<&(String, Command)>, actions: &mut Vec<Action>) {
+    // Phones can't be locked/restarted/woken remotely, so only offer this for computers.
+    if matches!(r.peer.os.as_str(), "Android" | "iOS") {
+        return;
+    }
+    let id = r.peer.id.clone();
+    if let Some((cid, cmd)) = confirm_cmd {
+        if *cid == id {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(format!("{} this device now?", cmd.label())).strong());
+                if ui
+                    .add(
+                        egui::Button::new(
+                            RichText::new(format!("Yes, {}", cmd.label().to_lowercase())).strong().color(TEXT),
+                        )
+                        .fill(BAD.gamma_multiply(0.85)),
+                    )
+                    .clicked()
+                {
+                    actions.push(Action::RunCommand(id.clone(), *cmd));
+                }
+                if ui.add(secondary("Cancel")).clicked() {
+                    actions.push(Action::CancelCommand);
+                }
+            });
+            return;
+        }
+    }
+    if is_online(&r.status) {
+        ui.horizontal(|ui| {
+            if ui.add(secondary("Lock")).clicked() {
+                actions.push(Action::RunCommand(id.clone(), Command::Lock));
+            }
+            if ui.add(secondary("Restart")).clicked() {
+                actions.push(Action::AskCommand(id.clone(), Command::Restart));
+            }
+            if ui
+                .add(
+                    egui::Button::new(RichText::new("Shut down").strong().color(TEXT))
+                        .fill(BOX2)
+                        .stroke(Stroke::new(1.0, BAD)),
+                )
+                .clicked()
+            {
+                actions.push(Action::AskCommand(id.clone(), Command::Shutdown));
+            }
+        });
+    } else if !r.peer.macs.is_empty() {
+        if ui.add(primary("Wake")).clicked() {
+            actions.push(Action::Wake(id));
+        }
+    }
 }
 
 fn remove_controls(ui: &mut egui::Ui, r: &Row, confirm: Option<&str>, actions: &mut Vec<Action>) {
@@ -742,7 +851,13 @@ fn remove_controls(ui: &mut egui::Ui, r: &Row, confirm: Option<&str>, actions: &
     });
 }
 
-fn device_card(ui: &mut egui::Ui, r: &Row, confirm: Option<&str>, actions: &mut Vec<Action>) {
+fn device_card(
+    ui: &mut egui::Ui,
+    r: &Row,
+    confirm: Option<&str>,
+    confirm_cmd: Option<&(String, Command)>,
+    actions: &mut Vec<Action>,
+) {
     let online = is_online(&r.status);
     let (color, text) = status_line(&r.status);
     let stats = stats_of(&r.status).cloned().unwrap_or_default();
@@ -779,6 +894,7 @@ fn device_card(ui: &mut egui::Ui, r: &Row, confirm: Option<&str>, actions: &mut 
                 });
         }
         ui.label(RichText::new(format!("key {}", identity::fingerprint(&r.peer.public_key))).monospace().size(12.0));
+        power_controls(ui, r, confirm_cmd, actions);
         remove_controls(ui, r, confirm, actions);
     });
     // Teal stripe along the top of online cards.

@@ -29,6 +29,7 @@ class PairedPeer {
     required this.publicKey,
     required this.pairedAt,
     this.lastAddr,
+    this.macs = const [],
   });
 
   final String id;
@@ -37,9 +38,17 @@ class PairedPeer {
   final String publicKey;
   final int pairedAt;
   String? lastAddr; // "ip:port"
+  List<String> macs; // learned from announcements, for Wake-on-LAN
 
-  Map<String, Object?> toJson() =>
-      {'id': id, 'name': name, 'os': os, 'public_key': publicKey, 'paired_at': pairedAt, 'last_addr': lastAddr};
+  Map<String, Object?> toJson() => {
+        'id': id,
+        'name': name,
+        'os': os,
+        'public_key': publicKey,
+        'paired_at': pairedAt,
+        'last_addr': lastAddr,
+        'macs': macs,
+      };
 
   static PairedPeer fromJson(Map<String, dynamic> j) => PairedPeer(
         id: j['id'] as String,
@@ -48,7 +57,10 @@ class PairedPeer {
         publicKey: j['public_key'] as String,
         pairedAt: (j['paired_at'] as num?)?.toInt() ?? 0,
         lastAddr: j['last_addr'] as String?,
+        macs: (j['macs'] as List<dynamic>?)?.map((e) => '$e').toList() ?? const [],
       );
+
+  bool get controllable => os != 'Android' && os != 'iOS';
 }
 
 class Seen {
@@ -416,6 +428,80 @@ class NexusNode extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// Resolves a peer's current host/port, from a fresh announcement or its last address.
+  (String, int)? _addressFor(PairedPeer p) {
+    final s = seen[p.id];
+    if (s != null && s.fresh) return (s.addr.address, s.tcpPort);
+    final a = p.lastAddr;
+    if (a == null) return null;
+    final i = a.lastIndexOf(':');
+    if (i <= 0) return null;
+    final port = int.tryParse(a.substring(i + 1));
+    return port == null ? null : (a.substring(0, i), port);
+  }
+
+  /// Asks a paired computer to lock, restart or shut down.
+  Future<void> sendCommand(PairedPeer p, String action) async {
+    final addr = _addressFor(p);
+    if (addr == null) {
+      addLog('${p.name} is not reachable right now');
+      notifyListeners();
+      return;
+    }
+    Conn? c;
+    try {
+      final sock = await Socket.connect(addr.$1, addr.$2, timeout: const Duration(seconds: 3));
+      c = Conn(sock);
+      final nonce = randomBytes(16);
+      final ss = await sharedSecret(_keyPair, fromHex(p.publicKey, 32));
+      c.send({'t': 'command', 'id': id, 'nonce': toHex(nonce), 'action': action, 'mac': toHex(await commandMac(ss, nonce, action, p.id, id))});
+      final m = await c.recv(const Duration(seconds: 5));
+      if (m['t'] != 'command_ack') throw NexusError(unexpectedMessage);
+      final msg = '${m['message'] ?? ''}';
+      if (!sameBytes(await commandAckMac(ss, nonce, msg), fromHex(_str(m, 'mac')))) {
+        throw NexusError('The reply failed its security check');
+      }
+      addLog(m['ok'] == true ? 'Asked ${p.name} to $action' : 'Could not $action ${p.name}: $msg');
+    } on NexusError catch (e) {
+      addLog('Could not $action ${p.name}: ${e.message}');
+    } catch (e) {
+      addLog('Could not $action ${p.name}: $e');
+    } finally {
+      c?.close();
+      notifyListeners();
+    }
+  }
+
+  /// Sends a Wake-on-LAN magic packet for each known MAC of a device.
+  Future<void> wake(PairedPeer p) async {
+    final macs = p.macs.map(parseMac).whereType<List<int>>().toList();
+    if (macs.isEmpty) {
+      addLog('No network address on file for ${p.name} yet. Connect it once while it is on.');
+      notifyListeners();
+      return;
+    }
+    RawDatagramSocket? sock;
+    try {
+      sock = await RawDatagramSocket.bind(InternetAddress.anyIPv4, 0);
+      sock.broadcastEnabled = true;
+      final targets = await _broadcastTargets();
+      for (final mac in macs) {
+        final packet = <int>[...List.filled(6, 0xFF), for (var i = 0; i < 16; i++) ...mac];
+        for (final t in targets) {
+          try {
+            sock.send(packet, t, wolPort);
+          } catch (_) {}
+        }
+      }
+      addLog('Sent a wake signal to ${p.name}');
+    } catch (e) {
+      addLog('Could not wake ${p.name}: $e');
+    } finally {
+      sock?.close();
+      notifyListeners();
+    }
+  }
+
   /// Closes the pairing dialog; a pairing still in progress is cancelled.
   void closePair() {
     pair?.answer(false);
@@ -476,6 +562,7 @@ class NexusNode extends ChangeNotifier {
         'os': osLabel,
         'public_key': toHex(publicKey),
         'tcp_port': tcpPort,
+        'macs': const <String>[], // Android does not expose the phone's own MAC
       }));
       for (final t in await _broadcastTargets()) {
         try {
@@ -523,6 +610,17 @@ class NexusNode extends ChangeNotifier {
     if (prev == null || !prev.fresh) {
       addLog('$peerName ${isPaired(peerId) ? 'is back on the network' : 'found nearby'} (${d.address.address})');
     }
+    // Remember a paired device's MAC addresses so it can be woken later.
+    final rawMacs = a['macs'];
+    if (rawMacs is List && rawMacs.isNotEmpty) {
+      final macs = rawMacs.map((e) => '$e').toList();
+      for (final p in paired) {
+        if (p.id == peerId && !listEquals(p.macs, macs)) {
+          p.macs = macs;
+          await _savePeers();
+        }
+      }
+    }
     seen[peerId] = Seen(peerId, peerName, '${a['os'] ?? ''}', key, d.address, port, DateTime.now());
   }
 
@@ -535,6 +633,8 @@ class NexusNode extends ChangeNotifier {
       switch (m['t']) {
         case 'ping':
           await _answerPing(c, m);
+        case 'command':
+          await _answerCommand(c, m);
         case 'pair_hello':
           await _hostPair(c, m);
       }
@@ -563,6 +663,29 @@ class NexusNode extends ChangeNotifier {
       if (stats != null) 'stats': stats,
       if (stats != null) 'stats_mac': toHex(await statsMac(ss, nonce, stats)),
     });
+  }
+
+  /// Android apps can't lock, restart or shut down the phone, so Nexus declines these — but still
+  /// verifies the request came from a paired device before answering.
+  Future<void> _answerCommand(Conn c, Map<String, dynamic> m) async {
+    final requester = _str(m, 'id');
+    PairedPeer? peer;
+    for (final p in paired) {
+      if (p.id == requester) peer = p;
+    }
+    if (peer == null) {
+      c.send({'t': 'error', 'reason': '$name no longer trusts this device. Pair again.'});
+      return;
+    }
+    final nonce = fromHex(_str(m, 'nonce'));
+    final action = _str(m, 'action');
+    final ss = await sharedSecret(_keyPair, fromHex(peer.publicKey, 32));
+    if (!sameBytes(await commandMac(ss, nonce, action, id, requester), fromHex(_str(m, 'mac')))) {
+      c.send({'t': 'error', 'reason': 'Command failed its security check'});
+      return;
+    }
+    const message = 'A phone cannot run that remotely';
+    c.send({'t': 'command_ack', 'ok': false, 'message': message, 'mac': toHex(await commandAckMac(ss, nonce, message))});
   }
 
   Future<void> _hostPair(Conn c, Map<String, dynamic> m) async {

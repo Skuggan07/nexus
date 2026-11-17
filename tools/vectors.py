@@ -21,3 +21,7 @@ for k, v in [("pka", pka.hex()), ("pkb", pkb.hex()), ("id_a", dev_id(pka)), ("id
     print(f"{k} = {v}")
 stats_mac = mac(dh, [b"nexus-stats-v2", nonce, b'{"cpu":12.5,"ram":40.0,"battery":null}'])
 print(f"stats_mac = {stats_mac.hex()}")
+cmd_restart = mac(dh, [b"nexus-cmd-v2", nonce, b"restart", dev_id(pkb).encode(), dev_id(pka).encode()])
+cmd_ack = mac(dh, [b"nexus-cmdack-v2", nonce, b"ok"])
+print(f"cmd_restart = {cmd_restart.hex()}")
+print(f"cmd_ack_ok = {cmd_ack.hex()}")

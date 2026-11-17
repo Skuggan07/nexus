@@ -30,7 +30,7 @@ fn main() -> eframe::Result<()> {
         problems.push(e);
         0
     });
-    if let Err(e) = discovery::start(me.clone(), shared.clone(), tcp_port) {
+    if let Err(e) = discovery::start(me.clone(), shared.clone(), dir.clone(), tcp_port) {
         problems.push(e);
     }
     sysstats::start_sampler();
