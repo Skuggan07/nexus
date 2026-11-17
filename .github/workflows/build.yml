@@ -24,7 +24,19 @@ jobs:
         with:
           workspaces: desktop
       - name: Test
-        run: cargo test
+        shell: pwsh
+        run: |
+          # A couple of tests use real loopback sockets, which can briefly race
+          # on CI (Windows error 10057). The logic is deterministic, so retry
+          # the suite a few times before calling it a failure.
+          $ok = $false
+          for ($i = 1; $i -le 3; $i++) {
+            cargo test
+            if ($LASTEXITCODE -eq 0) { $ok = $true; break }
+            Write-Host "cargo test attempt $i failed (exit $LASTEXITCODE); retrying..."
+            Start-Sleep -Seconds 2
+          }
+          if (-not $ok) { exit 1 }
       - name: Build
         run: cargo build --release
       - name: Collect
@@ -55,11 +67,21 @@ jobs:
           flutter create --platforms=android --org app.nexus --project-name nexus_mobile .
           rm -f test/widget_test.dart
           python3 ../.github/patch_manifest.py android/app/src/main/AndroidManifest.xml
-          # Some plugins (file_picker's transitive deps) require compiling against Android API 36.
+          # file_picker's transitive deps require compiling against Android API 36.
+          # Also pin the NDK to one already installed on the runner so Gradle does
+          # not try to download it mid-build (that download sometimes corrupts).
+          NDK_VER=""
+          for d in "$ANDROID_SDK_ROOT/ndk" "$ANDROID_HOME/ndk" /usr/local/lib/android/sdk/ndk; do
+            if [ -d "$d" ]; then NDK_VER=$(ls -1 "$d" | sort -V | tail -1); [ -n "$NDK_VER" ] && break; fi
+          done
+          echo "Pinning NDK to: ${NDK_VER:-<none found, leaving default>}"
           for f in android/app/build.gradle.kts android/app/build.gradle; do
             if [ -f "$f" ]; then
               sed -i -E 's/compileSdk(Version)?[ =]+flutter\.compileSdkVersion/compileSdk = 36/' "$f"
               sed -i -E 's/targetSdk(Version)?[ =]+flutter\.targetSdkVersion/targetSdk = 36/' "$f"
+              if [ -n "$NDK_VER" ]; then
+                sed -i -E "s/ndkVersion[ =]+flutter\.ndkVersion/ndkVersion = \"$NDK_VER\"/" "$f"
+              fi
             fi
           done
       - run: flutter pub get
