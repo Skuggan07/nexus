@@ -18,12 +18,13 @@ dev_dependencies:
   flutter_test:
     sdk: flutter
 
-# Newer flutter_plugin_android_lifecycle releases (2.0.24+) force every Android
-# module to compile against SDK 36, which the stable CI toolchain doesn't ship
-# yet. file_picker and battery_plus pull it in transitively; pin it to a
-# 34-compatible release so the release APK builds cleanly.
+# flutter_plugin_android_lifecycle 2.0.28+ compiles against flutter.compileSdkVersion
+# (36 on current toolchains), which makes every dependent module demand SDK 36 and
+# breaks the release APK on the stable CI toolchain. file_picker and battery_plus
+# pull it in transitively. Pin it to 2.0.24: v2-embedding only (so it builds on
+# modern Flutter) and still on compileSdk 35 (so nothing forces SDK 36).
 dependency_overrides:
-  flutter_plugin_android_lifecycle: 2.0.17
+  flutter_plugin_android_lifecycle: 2.0.24
 
 flutter:
   uses-material-design: true
