@@ -1,5 +1,6 @@
 import 'dart:math' as math;
 
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 
 import 'node.dart';
@@ -419,6 +420,21 @@ class _HomePageState extends State<HomePage> {
               Text('key ${_fp(p.id)}', style: const TextStyle(fontFamily: 'monospace', fontSize: 12)),
               const SizedBox(height: 16),
               ..._powerControls(context, p, st),
+              if (st.kind == StatusKind.verified || st.kind == StatusKind.checking) ...[
+                const SizedBox(height: 8),
+                SizedBox(
+                  width: double.infinity,
+                  child: _SecondaryButton(
+                    label: 'Browse files',
+                    onPressed: () {
+                      Navigator.pop(ctx);
+                      Navigator.of(context).push(
+                        MaterialPageRoute<void>(builder: (_) => FileBrowserPage(node: node, peer: p)),
+                      );
+                    },
+                  ),
+                ),
+              ],
               const SizedBox(height: 8),
               _SecondaryButton(
                 label: 'Remove device',
@@ -748,6 +764,193 @@ class _GaugePainter extends CustomPainter {
 
   @override
   bool shouldRepaint(_GaugePainter old) => old.value != value;
+}
+
+/// Browse a paired device's files: navigate folders, download, and upload.
+class FileBrowserPage extends StatefulWidget {
+  const FileBrowserPage({super.key, required this.node, required this.peer});
+  final NexusNode node;
+  final PairedPeer peer;
+
+  @override
+  State<FileBrowserPage> createState() => _FileBrowserPageState();
+}
+
+class _FileBrowserPageState extends State<FileBrowserPage> {
+  final List<String> _path = [];
+  List<FsEntry> _entries = [];
+  bool _loading = true;
+  bool _busy = false;
+  String? _error;
+  String? _status;
+
+  NexusNode get node => widget.node;
+  PairedPeer get peer => widget.peer;
+  String get _rel => _path.join('/');
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Future<void> _load() async {
+    setState(() {
+      _loading = true;
+      _error = null;
+    });
+    try {
+      final list = await node.fsList(peer, _rel);
+      if (!mounted) return;
+      setState(() {
+        _entries = list;
+        _loading = false;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _entries = [];
+        _loading = false;
+        _error = e is NexusError ? e.message : '$e';
+      });
+    }
+  }
+
+  void _into(String name) {
+    setState(() => _path.add(name));
+    _load();
+  }
+
+  void _up() {
+    if (_path.isEmpty) return;
+    setState(() => _path.removeLast());
+    _load();
+  }
+
+  String _child(String name) => _path.isEmpty ? name : '$_rel/$name';
+
+  Future<void> _download(FsEntry e) async {
+    setState(() {
+      _busy = true;
+      _status = 'Downloading ${e.name}…';
+    });
+    try {
+      final saved = await node.fsGet(peer, _child(e.name), e.name);
+      if (mounted) setState(() => _status = 'Saved to $saved');
+    } catch (err) {
+      if (mounted) setState(() => _status = 'Download failed: ${err is NexusError ? err.message : err}');
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  Future<void> _upload() async {
+    final picked = await FilePicker.platform.pickFiles();
+    final path = picked?.files.single.path;
+    if (path == null) return;
+    setState(() {
+      _busy = true;
+      _status = 'Uploading…';
+    });
+    try {
+      final saved = await node.fsPut(peer, path);
+      if (mounted) setState(() => _status = 'Uploaded $saved to ${peer.name}’s “Nexus Inbox”');
+    } catch (err) {
+      if (mounted) setState(() => _status = 'Upload failed: ${err is NexusError ? err.message : err}');
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: bg,
+      appBar: AppBar(
+        backgroundColor: box,
+        foregroundColor: white,
+        title: Text('${peer.name} · files', style: const TextStyle(fontWeight: FontWeight.w700)),
+        actions: [
+          IconButton(onPressed: _loading ? null : _load, icon: const Icon(Icons.refresh)),
+        ],
+      ),
+      floatingActionButton: FloatingActionButton.extended(
+        backgroundColor: accent,
+        foregroundColor: white,
+        onPressed: _busy ? null : _upload,
+        icon: const Icon(Icons.upload_file),
+        label: const Text('Upload'),
+      ),
+      body: Column(
+        children: [
+          // Breadcrumb
+          Container(
+            width: double.infinity,
+            color: box,
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+            child: Row(children: [
+              const Icon(Icons.folder_open, size: 16, color: online),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text('/${_path.join('/')}',
+                    style: const TextStyle(color: white, fontFamily: 'monospace', fontSize: 13), overflow: TextOverflow.ellipsis),
+              ),
+              if (_path.isNotEmpty)
+                TextButton(onPressed: _busy ? null : _up, child: const Text('Up', style: TextStyle(color: online))),
+            ]),
+          ),
+          if (_busy) const LinearProgressIndicator(color: accent, backgroundColor: box2, minHeight: 2),
+          if (_status != null)
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
+              child: Text(_status!, style: const TextStyle(color: online, fontSize: 13)),
+            ),
+          if (_error != null)
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
+              child: Text(_error!, style: const TextStyle(color: bad)),
+            ),
+          Expanded(
+            child: _loading
+                ? const Center(child: CircularProgressIndicator(color: accent))
+                : ListView(
+                    children: [
+                      for (final e in _entries)
+                        ListTile(
+                          leading: Icon(e.dir ? Icons.folder : Icons.insert_drive_file, color: e.dir ? online : white),
+                          title: Text(e.name, style: const TextStyle(color: white)),
+                          subtitle: e.dir ? null : Text(_humanSize(e.size), style: const TextStyle(color: off)),
+                          trailing: e.dir
+                              ? const Icon(Icons.chevron_right, color: white)
+                              : IconButton(
+                                  icon: const Icon(Icons.download, color: online),
+                                  onPressed: _busy ? null : () => _download(e),
+                                ),
+                          onTap: e.dir ? () => _into(e.name) : null,
+                        ),
+                      if (_entries.isEmpty)
+                        const Padding(
+                          padding: EdgeInsets.all(24),
+                          child: Center(child: Text('This folder is empty', style: TextStyle(color: off))),
+                        ),
+                    ],
+                  ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+String _humanSize(int bytes) {
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  var v = bytes.toDouble();
+  var i = 0;
+  while (v >= 1024 && i < units.length - 1) {
+    v /= 1024;
+    i++;
+  }
+  return i == 0 ? '$bytes B' : '${v.toStringAsFixed(1)} ${units[i]}';
 }
 
 /// Covers the screen while a pairing is in progress.

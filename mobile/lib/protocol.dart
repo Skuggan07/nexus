@@ -18,8 +18,10 @@ final labelPing = utf8.encode('nexus-ping-v2');
 final labelStats = utf8.encode('nexus-stats-v2');
 final labelCmd = utf8.encode('nexus-cmd-v2');
 final labelCmdAck = utf8.encode('nexus-cmdack-v2');
+final labelFs = utf8.encode('nexus-fs-v2');
 
 const wolPort = 9;
+const fsChunk = 256 * 1024;
 
 final _x25519 = X25519();
 final _sha256 = Sha256();
@@ -106,6 +108,10 @@ Future<List<int>> commandMac(
 
 Future<List<int>> commandAckMac(List<int> ss, List<int> nonce, String message) =>
     hmac(ss, [labelCmdAck, nonce, utf8.encode(message)]);
+
+/// File-transfer handshake MAC: HMAC(ss, labelFs | n1 | n2 | idA | idB).
+Future<List<int>> fsMac(List<int> ss, List<int> n1, List<int> n2, String a, String b) =>
+    hmac(ss, [labelFs, n1, n2, utf8.encode(a), utf8.encode(b)]);
 
 /// Parses "aa:bb:cc:dd:ee:ff" (any separators) into 6 bytes, or null if it is all zeros / malformed.
 List<int>? parseMac(String s) {

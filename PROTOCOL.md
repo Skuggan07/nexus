@@ -65,4 +65,23 @@ B runs the action only if `mac` is valid and A is a paired device, so only a pai
 
 To wake a device that is asleep or off, Nexus broadcasts a standard magic packet (6 bytes of `0xFF` followed by the target MAC repeated 16 times) to UDP port 9, to `255.255.255.255` and to each network's broadcast address. The target's MAC comes from the `macs` field it announced while it was on. Waking requires Wake-on-LAN to be enabled in the target's BIOS and network card.
 
+### File transfer
+
+A separate TCP connection carries file browsing and transfer. It opens with a three-message mutual handshake so each side proves it is the paired device (A is the side that connected):
+
+| Step | Message |
+|---|---|
+| A → B | `fs_hello {id: A's id, nonce: Na}` (16 bytes) |
+| B → A | `fs_ready {nonce: Nb, mac: HMAC-SHA256(key=X25519(B, PKa), "nexus-fs-v2" ‖ Na ‖ Nb ‖ B's id ‖ A's id)}` |
+| A → B | `fs_auth {mac: HMAC-SHA256(key=X25519(A, PKb), "nexus-fs-v2" ‖ Nb ‖ Na ‖ A's id ‖ B's id)}` |
+
+B refuses the connection unless A is a paired device and `mac` checks out. After the handshake, the connection is trusted and requests flow as plain JSON lines (no `t` field):
+
+- `{op:"list", path}` → `{entries:[{name, dir, size}]}` — `path` is relative to the device's shared root (its home folder on a PC); `..` is refused.
+- `{op:"get", path}` → `{size}`, then repeated `{data:"<hex>"}` frames (up to 256 KiB each) ending with `{eof:true}`.
+- `{op:"put", name}` → `{ok:true}`; A then sends `{data:"<hex>"}` frames ending with `{end:true}`; B replies `{saved}`. Uploads land in a "Nexus Inbox" folder under the shared root.
+- `{op:"bye"}` closes the connection.
+
+Any request may be answered with `{error:"…"}`. File transfers are authenticated so only paired devices can reach them; the file bytes themselves are not yet encrypted on the wire (a planned addition). The maximum JSON line is raised to 2 MiB on this connection so a data frame fits.
+
 All binary values on the wire are lowercase hex.

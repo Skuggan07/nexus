@@ -106,6 +106,21 @@ class Check {
   bool get valid => DateTime.now().difference(at) < checkValid;
 }
 
+/// One entry in a remote directory listing.
+class FsEntry {
+  FsEntry(this.name, this.dir, this.size);
+  final String name;
+  final bool dir;
+  final int size;
+
+  static FsEntry? fromJson(Object? j) {
+    if (j is! Map) return null;
+    final n = j['name'];
+    if (n is! String) return null;
+    return FsEntry(n, j['dir'] == true, (j['size'] as num?)?.toInt() ?? 0);
+  }
+}
+
 enum StatusKind { verified, checking, notAnswering, identityChanged, offline }
 
 class PeerStatus {
@@ -230,6 +245,7 @@ class NexusNode extends ChangeNotifier {
   final _timers = <Timer>[];
   ServerSocket? _server;
   RawDatagramSocket? _udp;
+  Directory? _fsRoot; // the folder this phone shares with paired devices
 
   /* ------------------------------------------------------------ startup */
 
@@ -249,6 +265,12 @@ class NexusNode extends ChangeNotifier {
         await _startDiscovery();
       } catch (e) {
         startupError = 'Discovery could not start: $e';
+      }
+      try {
+        _fsRoot = (await getExternalStorageDirectory()) ?? _dir;
+        await _fsRoot!.create(recursive: true);
+      } catch (_) {
+        _fsRoot = _dir;
       }
       await _loadPrefs();
       await _sampleStats();
@@ -502,6 +524,107 @@ class NexusNode extends ChangeNotifier {
     }
   }
 
+  /// Opens an authenticated file-transfer connection to a paired device.
+  Future<Conn> _fsOpen(PairedPeer p) async {
+    final addr = _addressFor(p);
+    if (addr == null) throw NexusError('${p.name} is not reachable right now');
+    final sock = await Socket.connect(addr.$1, addr.$2, timeout: const Duration(seconds: 4));
+    final c = Conn(sock);
+    try {
+      final nonceC = randomBytes(16);
+      final ss = await sharedSecret(_keyPair, fromHex(p.publicKey, 32));
+      c.send({'t': 'fs_hello', 'id': id, 'nonce': toHex(nonceC)});
+      final ready = await c.recv();
+      if (ready['t'] != 'fs_ready') throw NexusError(unexpectedMessage);
+      final nonceS = fromHex(_str(ready, 'nonce'));
+      if (!sameBytes(await fsMac(ss, nonceC, nonceS, p.id, id), fromHex(_str(ready, 'mac')))) {
+        throw NexusError('The device failed the file-transfer security check');
+      }
+      c.send({'t': 'fs_auth', 'mac': toHex(await fsMac(ss, nonceS, nonceC, id, p.id))});
+      return c;
+    } catch (e) {
+      c.close();
+      rethrow;
+    }
+  }
+
+  /// Lists a folder on a paired device.
+  Future<List<FsEntry>> fsList(PairedPeer p, String path) async {
+    final c = await _fsOpen(p);
+    try {
+      c.send({'op': 'list', 'path': path});
+      final v = await c.recv();
+      if (v['error'] != null) throw NexusError('${v['error']}');
+      final list = (v['entries'] as List?) ?? const [];
+      final out = <FsEntry>[];
+      for (final e in list) {
+        final fe = FsEntry.fromJson(e);
+        if (fe != null) out.add(fe);
+      }
+      c.send({'op': 'bye'});
+      return out;
+    } finally {
+      c.close();
+    }
+  }
+
+  /// Downloads a file from a paired device into this phone's "Nexus Downloads" folder.
+  Future<String> fsGet(PairedPeer p, String path, String fileName) async {
+    final c = await _fsOpen(p);
+    try {
+      c.send({'op': 'get', 'path': path});
+      final head = await c.recv();
+      if (head['error'] != null) throw NexusError('${head['error']}');
+      final dir = Directory('${_fsRoot!.path}/Nexus Downloads');
+      await dir.create(recursive: true);
+      final dest = File('${dir.path}/$fileName');
+      final sink = dest.openWrite();
+      try {
+        while (true) {
+          final frame = await c.recv();
+          if (frame['error'] != null) throw NexusError('${frame['error']}');
+          if (frame['eof'] == true) break;
+          final d = frame['data'];
+          if (d is String) sink.add(fromHex(d));
+        }
+      } finally {
+        await sink.close();
+      }
+      c.send({'op': 'bye'});
+      return dest.path;
+    } finally {
+      c.close();
+    }
+  }
+
+  /// Uploads a local file to a paired device's "Nexus Inbox" folder.
+  Future<String> fsPut(PairedPeer p, String localPath) async {
+    final c = await _fsOpen(p);
+    try {
+      final f = File(localPath);
+      final name = localPath.split('/').last.split('\\').last;
+      c.send({'op': 'put', 'name': name});
+      final ack = await c.recv();
+      if (ack['error'] != null) throw NexusError('${ack['error']}');
+      final raf = await f.open();
+      try {
+        while (true) {
+          final chunk = await raf.read(fsChunk);
+          if (chunk.isEmpty) break;
+          c.send({'data': toHex(chunk)});
+        }
+      } finally {
+        await raf.close();
+      }
+      c.send({'end': true});
+      final done = await c.recv();
+      if (done['error'] != null) throw NexusError('${done['error']}');
+      return '${done['saved'] ?? name}';
+    } finally {
+      c.close();
+    }
+  }
+
   /// Closes the pairing dialog; a pairing still in progress is cancelled.
   void closePair() {
     pair?.answer(false);
@@ -635,6 +758,8 @@ class NexusNode extends ChangeNotifier {
           await _answerPing(c, m);
         case 'command':
           await _answerCommand(c, m);
+        case 'fs_hello':
+          await _fsServe(c, m);
         case 'pair_hello':
           await _hostPair(c, m);
       }
@@ -686,6 +811,122 @@ class NexusNode extends ChangeNotifier {
     }
     const message = 'A phone cannot run that remotely';
     c.send({'t': 'command_ack', 'ok': false, 'message': message, 'mac': toHex(await commandAckMac(ss, nonce, message))});
+  }
+
+  /// Joins a client-supplied relative path under the shared root, refusing anything that escapes it.
+  String? _fsResolve(String rel) {
+    final root = _fsRoot;
+    if (root == null) return null;
+    final parts = rel.split('/').where((p) => p.isNotEmpty && p != '.').toList();
+    if (parts.contains('..')) return null;
+    return parts.isEmpty ? root.path : '${root.path}/${parts.join('/')}';
+  }
+
+  /// Serves file requests to a paired device over one authenticated connection.
+  Future<void> _fsServe(Conn c, Map<String, dynamic> m) async {
+    final requester = _str(m, 'id');
+    PairedPeer? peer;
+    for (final p in paired) {
+      if (p.id == requester) peer = p;
+    }
+    if (peer == null) {
+      c.send({'t': 'error', 'reason': '$name no longer trusts this device. Pair again.'});
+      return;
+    }
+    final nonceC = fromHex(_str(m, 'nonce'));
+    final ss = await sharedSecret(_keyPair, fromHex(peer.publicKey, 32));
+    final nonceS = randomBytes(16);
+    c.send({'t': 'fs_ready', 'nonce': toHex(nonceS), 'mac': toHex(await fsMac(ss, nonceC, nonceS, id, requester))});
+    final auth = await c.recv();
+    if (auth['t'] != 'fs_auth' ||
+        !sameBytes(await fsMac(ss, nonceS, nonceC, requester, id), fromHex(_str(auth, 'mac')))) {
+      c.send({'t': 'error', 'reason': 'File-transfer security check failed'});
+      return;
+    }
+    addLog('${peer.name} opened a file connection');
+    notifyListeners();
+    while (true) {
+      final v = await c.recv();
+      final op = v['t'] == null ? v['op'] : null;
+      try {
+        if (op == 'list') {
+          await _fsList(c, '${v['path'] ?? ''}');
+        } else if (op == 'get') {
+          await _fsGet(c, '${v['path'] ?? ''}');
+        } else if (op == 'put') {
+          await _fsPut(c, '${v['name'] ?? ''}');
+        } else if (op == 'bye') {
+          return;
+        } else {
+          c.send({'error': 'Unknown request'});
+        }
+      } on NexusError catch (e) {
+        c.send({'error': e.message});
+      } catch (e) {
+        c.send({'error': '$e'});
+      }
+    }
+  }
+
+  Future<void> _fsList(Conn c, String rel) async {
+    final path = _fsResolve(rel);
+    if (path == null) throw NexusError('That path is not allowed');
+    final dir = Directory(path);
+    final entries = <Map<String, Object?>>[];
+    await for (final e in dir.list(followLinks: false)) {
+      final isDir = e is Directory;
+      int size = 0;
+      try {
+        if (!isDir) size = await File(e.path).length();
+      } catch (_) {}
+      entries.add({'name': e.path.split('/').last, 'dir': isDir, 'size': size});
+    }
+    entries.sort((a, b) {
+      final ad = a['dir'] == true, bd = b['dir'] == true;
+      if (ad != bd) return ad ? -1 : 1;
+      return '${a['name']}'.toLowerCase().compareTo('${b['name']}'.toLowerCase());
+    });
+    c.send({'entries': entries});
+  }
+
+  Future<void> _fsGet(Conn c, String rel) async {
+    final path = _fsResolve(rel);
+    if (path == null) throw NexusError('That path is not allowed');
+    final f = File(path);
+    final size = await f.length();
+    c.send({'size': size});
+    final raf = await f.open();
+    try {
+      while (true) {
+        final chunk = await raf.read(fsChunk);
+        if (chunk.isEmpty) break;
+        c.send({'data': toHex(chunk)});
+      }
+    } finally {
+      await raf.close();
+    }
+    c.send({'eof': true});
+  }
+
+  Future<void> _fsPut(Conn c, String name) async {
+    final base = name.split('/').last.split('\\').last;
+    if (base.isEmpty) throw NexusError('Bad file name');
+    final inbox = Directory('${_fsRoot!.path}/Nexus Inbox');
+    await inbox.create(recursive: true);
+    final dest = File('${inbox.path}/$base');
+    final sink = dest.openWrite();
+    c.send({'ok': true});
+    try {
+      while (true) {
+        final frame = await c.recv();
+        if (frame['end'] == true) break;
+        final d = frame['data'];
+        if (d is String) sink.add(fromHex(d));
+      }
+    } finally {
+      await sink.close();
+    }
+    c.send({'saved': base});
   }
 
   Future<void> _hostPair(Conn c, Map<String, dynamic> m) async {

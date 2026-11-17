@@ -5,7 +5,7 @@
 
 use crate::{
     identity::{self, Identity},
-    net::{self, Command, PairTarget},
+    net::{self, Command, Entry, PairTarget},
     state::{lock, PairSession, Phase, Role, SharedState, Status},
     store::{self, PairedPeer},
     sysstats::Stats,
@@ -14,9 +14,29 @@ use eframe::egui::{self, Color32, FontId, Margin, Pos2, RichText, Rounding, Sens
 use std::{
     net::SocketAddr,
     path::PathBuf,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
+
+/// Live state of the file browser, shared with the worker threads that do the transfers.
+#[derive(Default)]
+struct BrowserInner {
+    req: u64,
+    loading: bool,
+    entries: Vec<Entry>,
+    error: Option<String>,
+    status: Option<String>,
+    busy: bool,
+}
+
+/// The open file browser: which device, where in its folders, and the live results.
+struct Browser {
+    peer_id: String,
+    peer_name: String,
+    path: Vec<String>,
+    upload_input: String,
+    inner: Arc<Mutex<BrowserInner>>,
+}
 
 const BG: Color32 = Color32::from_rgb(0, 0, 0);
 const SIDEBAR: Color32 = Color32::from_rgb(10, 10, 10);
@@ -48,6 +68,7 @@ pub struct NexusApp {
     /// A restart/shutdown awaiting the user's confirmation: (device id, command).
     confirm_cmd: Option<(String, Command)>,
     details: Option<String>,
+    browser: Option<Browser>,
     detailed: bool,
     tab: Tab,
     styled: bool,
@@ -70,6 +91,11 @@ enum Action {
     CancelCommand,
     RunCommand(String, Command),
     Wake(String),
+    OpenBrowser(String),
+    CloseBrowser,
+    BrowseTo(Vec<String>),
+    Download(String),
+    Upload(String),
 }
 
 impl NexusApp {
@@ -91,6 +117,7 @@ impl NexusApp {
             confirm_remove: None,
             confirm_cmd: None,
             details: None,
+            browser: None,
             detailed,
             tab: Tab::Devices,
             styled: false,
@@ -196,7 +223,129 @@ impl NexusApp {
                     });
                 }
             }
+            Action::OpenBrowser(id) => {
+                let name = lock(&self.shared)
+                    .paired
+                    .iter()
+                    .find(|p| p.id == id)
+                    .map(|p| p.name.clone())
+                    .unwrap_or_else(|| "Device".into());
+                self.details = None;
+                self.browser = Some(Browser {
+                    peer_id: id,
+                    peer_name: name,
+                    path: Vec::new(),
+                    upload_input: String::new(),
+                    inner: Arc::new(Mutex::new(BrowserInner::default())),
+                });
+                self.start_list();
+            }
+            Action::CloseBrowser => self.browser = None,
+            Action::BrowseTo(path) => {
+                if let Some(b) = self.browser.as_mut() {
+                    b.path = path;
+                }
+                self.start_list();
+            }
+            Action::Download(name) => self.start_transfer(Some(name), None),
+            Action::Upload(path) => self.start_transfer(None, Some(path)),
         }
+    }
+
+    fn addr_of(&self, id: &str) -> Option<SocketAddr> {
+        let s = lock(&self.shared);
+        s.seen.get(id).filter(|x| x.fresh()).map(|x| SocketAddr::new(x.addr, x.tcp_port)).or_else(|| {
+            s.paired.iter().find(|p| p.id == id).and_then(|p| p.last_addr.as_deref()).and_then(|a| a.parse().ok())
+        })
+    }
+
+    fn peer_of(&self, id: &str) -> Option<PairedPeer> {
+        lock(&self.shared).paired.iter().find(|p| p.id == id).cloned()
+    }
+
+    /// Loads the current folder of the open browser in the background.
+    fn start_list(&self) {
+        let Some(b) = &self.browser else { return };
+        let inner = b.inner.clone();
+        let req = {
+            let mut g = inner.lock().unwrap();
+            g.req += 1;
+            g.loading = true;
+            g.error = None;
+            g.req
+        };
+        let (Some(addr), Some(peer)) = (self.addr_of(&b.peer_id), self.peer_of(&b.peer_id)) else {
+            let mut g = inner.lock().unwrap();
+            g.loading = false;
+            g.error = Some("That device is not reachable right now".into());
+            return;
+        };
+        let me = self.me.clone();
+        let rel = b.path.join("/");
+        std::thread::spawn(move || {
+            let res = net::fs_list(&me, &peer, addr, &rel);
+            let mut g = inner.lock().unwrap();
+            if g.req != req {
+                return; // a newer navigation replaced this one
+            }
+            g.loading = false;
+            match res {
+                Ok(entries) => {
+                    g.entries = entries;
+                    g.error = None;
+                }
+                Err(e) => {
+                    g.entries.clear();
+                    g.error = Some(e);
+                }
+            }
+        });
+    }
+
+    /// Downloads a file (name set) or uploads a local file (path set), in the background.
+    fn start_transfer(&self, download: Option<String>, upload: Option<String>) {
+        let Some(b) = &self.browser else { return };
+        let inner = b.inner.clone();
+        {
+            let mut g = inner.lock().unwrap();
+            if g.busy {
+                return;
+            }
+            g.busy = true;
+            g.status = Some("Transferring…".into());
+        }
+        let (Some(addr), Some(peer)) = (self.addr_of(&b.peer_id), self.peer_of(&b.peer_id)) else {
+            let mut g = inner.lock().unwrap();
+            g.busy = false;
+            g.status = Some("That device is not reachable right now".into());
+            return;
+        };
+        let me = self.me.clone();
+        let path = b.path.clone();
+        std::thread::spawn(move || {
+            let status = if let Some(name) = download {
+                let rel = if path.is_empty() { name.clone() } else { format!("{}/{}", path.join("/"), name) };
+                let dir = directories::UserDirs::new()
+                    .and_then(|u| u.download_dir().map(|d| d.to_path_buf()))
+                    .unwrap_or_else(std::env::temp_dir);
+                let _ = std::fs::create_dir_all(&dir);
+                let dest = dir.join(&name);
+                match net::fs_get(&me, &peer, addr, &rel, &dest) {
+                    Ok(()) => format!("Saved to {}", dest.display()),
+                    Err(e) => format!("Download failed: {e}"),
+                }
+            } else if let Some(p) = upload {
+                match net::fs_put(&me, &peer, addr, std::path::Path::new(p.trim())) {
+                    Ok(saved) => format!("Uploaded {saved} to the device's “Nexus Inbox” folder"),
+                    Err(e) => format!("Upload failed: {e}"),
+                }
+            } else {
+                String::new()
+            };
+            let mut g = inner.lock().unwrap();
+            g.busy = false;
+            g.status = Some(status);
+        });
     }
 }
 
@@ -421,11 +570,15 @@ impl eframe::App for NexusApp {
         if let Some(p) = &session {
             pair_dialog(ctx, p, &mut actions);
         }
+        if self.browser.is_some() {
+            self.file_browser(ctx, &mut actions);
+        }
 
         for a in actions {
             self.apply(a);
         }
-        let fast = session.is_some() || window.is_some();
+        let browsing = self.browser.is_some();
+        let fast = session.is_some() || window.is_some() || browsing;
         ctx.request_repaint_after(Duration::from_millis(if fast { 250 } else { 1000 }));
     }
 }
@@ -583,7 +736,7 @@ impl NexusApp {
                     }
                 }
                 ui.add_space(6.0);
-                ui.label(RichText::new("Coming next: Remote screen · Files · Monitoring · Security").size(12.0));
+                ui.label(RichText::new("Coming next: Remote screen · Monitoring · Security").size(12.0));
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
                     ui.label(
                         RichText::new(format!("key {}", identity::fingerprint(&self.me.public_hex())))
@@ -711,6 +864,7 @@ impl NexusApp {
                     ("Key fingerprint", identity::fingerprint(&self.me.public_hex())),
                     ("Device ID", self.me.id.clone()),
                     ("Listening on", format!("TCP {} · discovery UDP 47800", self.tcp_port)),
+                    ("Shared folder", net::fs_root().display().to_string()),
                     ("Data folder", self.dir.display().to_string()),
                     ("Version", env!("CARGO_PKG_VERSION").to_string()),
                 ] {
@@ -724,8 +878,9 @@ impl NexusApp {
             ui.set_width(ui.available_width());
             ui.label(RichText::new("PRIVACY AND SECURITY").size(14.0).strong());
             ui.label(
-                "Only devices you paired by comparing the 6-digit number are trusted. Every status check is a signed \
-                 challenge that only the real device can answer, and the CPU, RAM and battery numbers travel inside it.",
+                "Only devices you paired by comparing the 6-digit number are trusted. Status checks and remote \
+                 commands are signed so only the real device can issue them. File browsing opens a separate \
+                 connection that both sides authenticate before any file is listed or sent.",
             );
         });
     }
@@ -759,12 +914,120 @@ impl NexusApp {
                 );
                 ui.add_space(6.0);
                 power_controls(ui, r, self.confirm_cmd.as_ref(), actions);
+                if is_online(&r.status) {
+                    ui.add_space(2.0);
+                    if ui.add(secondary("Browse files").min_size(Vec2::new(0.0, 36.0))).clicked() {
+                        actions.push(Action::OpenBrowser(r.peer.id.clone()));
+                    }
+                }
                 ui.add_space(2.0);
                 remove_controls(ui, r, self.confirm_remove.as_deref(), actions);
             });
         if !open {
             actions.push(Action::ShowDetails(None));
         }
+    }
+
+    /// The file browser window: breadcrumb, folder list, download and upload.
+    fn file_browser(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
+        let Some(b) = self.browser.as_mut() else { return };
+        let (loading, entries, error, status, busy) = {
+            let g = b.inner.lock().unwrap_or_else(|e| e.into_inner());
+            (g.loading, g.entries.clone(), g.error.clone(), g.status.clone(), g.busy)
+        };
+        let mut open = true;
+        egui::Window::new(RichText::new(format!("{} — files", b.peer_name)).size(17.0).strong())
+            .collapsible(false)
+            .resizable(true)
+            .open(&mut open)
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .frame(box_frame().inner_margin(Margin::same(18.0)))
+            .show(ctx, |ui| {
+                ui.set_width(540.0);
+                ui.horizontal_wrapped(|ui| {
+                    if ui.add(secondary("Home")).clicked() {
+                        actions.push(Action::BrowseTo(Vec::new()));
+                    }
+                    let mut acc = Vec::new();
+                    for part in &b.path {
+                        ui.label("/");
+                        acc.push(part.clone());
+                        if ui.add(secondary(part.as_str())).clicked() {
+                            actions.push(Action::BrowseTo(acc.clone()));
+                        }
+                    }
+                });
+                ui.separator();
+                if loading {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Loading…");
+                    });
+                }
+                if let Some(e) = &error {
+                    ui.label(RichText::new(e).color(BAD));
+                }
+                egui::ScrollArea::vertical().max_height(320.0).auto_shrink([false, false]).show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    if !b.path.is_empty() && ui.add(secondary("Up one folder")).clicked() {
+                        let mut p = b.path.clone();
+                        p.pop();
+                        actions.push(Action::BrowseTo(p));
+                    }
+                    for e in &entries {
+                        ui.horizontal(|ui| {
+                            if e.dir {
+                                if ui.add(secondary(&format!("{}/", e.name))).clicked() {
+                                    let mut p = b.path.clone();
+                                    p.push(e.name.clone());
+                                    actions.push(Action::BrowseTo(p));
+                                }
+                            } else {
+                                ui.label(format!("{}  ·  {}", e.name, human_size(e.size)));
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    if ui.add_enabled(!busy, secondary("Download")).clicked() {
+                                        actions.push(Action::Download(e.name.clone()));
+                                    }
+                                });
+                            }
+                        });
+                    }
+                });
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label("Upload (full path):");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut b.upload_input)
+                            .hint_text("C:\\Users\\me\\file.pdf")
+                            .desired_width(280.0),
+                    );
+                    let ready = !busy && !b.upload_input.trim().is_empty();
+                    if ui.add_enabled(ready, primary("Upload")).clicked() {
+                        actions.push(Action::Upload(b.upload_input.clone()));
+                    }
+                });
+                if let Some(st) = &status {
+                    ui.label(RichText::new(st).color(ONLINE));
+                }
+            });
+        if !open {
+            actions.push(Action::CloseBrowser);
+        }
+    }
+}
+
+fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut v = bytes as f64;
+    let mut i = 0;
+    while v >= 1024.0 && i < UNITS.len() - 1 {
+        v /= 1024.0;
+        i += 1;
+    }
+    if i == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{v:.1} {}", UNITS[i])
     }
 }
 
@@ -895,6 +1158,9 @@ fn device_card(
         }
         ui.label(RichText::new(format!("key {}", identity::fingerprint(&r.peer.public_key))).monospace().size(12.0));
         power_controls(ui, r, confirm_cmd, actions);
+        if online && ui.add(secondary("Browse files")).clicked() {
+            actions.push(Action::OpenBrowser(r.peer.id.clone()));
+        }
         remove_controls(ui, r, confirm, actions);
     });
     // Teal stripe along the top of online cards.

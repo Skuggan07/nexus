@@ -35,6 +35,12 @@ void main() {
         'cc23f5b317576fbab9eaeb6679cccb8505c71920ff2e9f84994ee520f2b3719a');
     expect(toHex(await commandAckMac(dh, nonce, 'ok')),
         '0d7987eada42979766a460a96ea74e2981dedf85e6ecb4af3573d20fdfb63344');
+
+    final nonceS = List<int>.generate(16, (i) => 16 + i);
+    expect(toHex(await fsMac(dh, nonce, nonceS, idB, idA)),
+        '181f683e3bdb4c9808f7692d7a3d86b9f717386ee0871f8eff9dda6d2abbb64c');
+    expect(toHex(await fsMac(dh, nonceS, nonce, idA, idB)),
+        'dafce46c82f3601de254baba89d4351921cf0b2d4d386cb6e1bbec3cf7650f96');
   });
 
   test('hex helpers', () {

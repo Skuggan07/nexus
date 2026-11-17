@@ -45,8 +45,13 @@ pub const LABEL_PING: &[u8] = b"nexus-ping-v2";
 pub const LABEL_STATS: &[u8] = b"nexus-stats-v2";
 pub const LABEL_CMD: &[u8] = b"nexus-cmd-v2";
 pub const LABEL_CMDACK: &[u8] = b"nexus-cmdack-v2";
+pub const LABEL_FS: &[u8] = b"nexus-fs-v2";
 /// UDP port the Wake-on-LAN magic packet is sent to (9 = the usual "discard" port).
 pub const WOL_PORT: u16 = 9;
+/// File data travels in chunks of this many bytes (sent as hex inside a JSON line).
+const FS_CHUNK: usize = 256 * 1024;
+/// The longest JSON line we accept, raised from 64 KiB so a file chunk fits.
+const MAX_LINE: u64 = 2 * 1024 * 1024;
 
 /// Remote actions a paired device may ask this one to perform.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -129,6 +134,18 @@ enum Msg {
     CommandAck {
         ok: bool,
         message: String,
+        mac: String,
+    },
+    /// Opens an authenticated file-transfer connection.
+    FsHello {
+        id: String,
+        nonce: String,
+    },
+    FsReady {
+        nonce: String,
+        mac: String,
+    },
+    FsAuth {
         mac: String,
     },
     Error {
@@ -216,6 +233,25 @@ impl Conn {
     fn recv(&mut self) -> Result<Msg, String> {
         read_msg(&mut self.reader)
     }
+    /// A plain JSON line, used for file-transfer frames after both sides have authenticated.
+    fn send_val(&mut self, v: &serde_json::Value) -> Result<(), String> {
+        let mut line = v.to_string();
+        line.push('\n');
+        self.writer.write_all(line.as_bytes()).map_err(|_| "Connection lost".to_string())
+    }
+    fn recv_val(&mut self) -> Result<serde_json::Value, String> {
+        let mut line = String::new();
+        let n = self
+            .reader
+            .by_ref()
+            .take(MAX_LINE)
+            .read_line(&mut line)
+            .map_err(|_| "No answer from the other device".to_string())?;
+        if n == 0 {
+            return Err("The other device closed the connection".into());
+        }
+        serde_json::from_str(&line).map_err(|_| "Garbled message".to_string())
+    }
 }
 
 fn send_msg(w: &mut TcpStream, m: &Msg) -> Result<(), String> {
@@ -227,7 +263,7 @@ fn send_msg(w: &mut TcpStream, m: &Msg) -> Result<(), String> {
 /// Reads one message. An `error` message from the other side becomes `Err(reason)`.
 fn read_msg(r: &mut BufReader<TcpStream>) -> Result<Msg, String> {
     let mut line = String::new();
-    let n = r.take(64 * 1024).read_line(&mut line).map_err(|_| "No answer from the other device".to_string())?;
+    let n = r.take(MAX_LINE).read_line(&mut line).map_err(|_| "No answer from the other device".to_string())?;
     if n == 0 {
         return Err("The other device closed the connection".into());
     }
@@ -276,11 +312,160 @@ fn handle(stream: TcpStream, me: &Identity, shared: &SharedState, dir: &Path) {
             let _ = c.send(&reply);
         }
         Ok(Msg::Command { id, nonce, action, mac: tag }) => host_command(c, me, shared, id, nonce, action, tag),
+        Ok(Msg::FsHello { id, nonce }) => fs_serve(c, me, shared, id, nonce),
         Ok(Msg::PairHello { v, id, name, os, public_key }) => {
             host_pair(c, me, shared, dir, v, id, name, os, public_key)
         }
         _ => {}
     }
+}
+
+/* ----------------------------------------------------------- file transfer */
+
+/// One entry in a directory listing.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Entry {
+    pub name: String,
+    pub dir: bool,
+    pub size: u64,
+}
+
+/// The folder this device shares. Everything is resolved under here; paths can't escape it.
+/// Override with NEXUS_FS_ROOT (used by the tests).
+pub fn fs_root() -> PathBuf {
+    if let Ok(d) = std::env::var("NEXUS_FS_ROOT") {
+        return PathBuf::from(d);
+    }
+    directories::BaseDirs::new().map(|b| b.home_dir().to_path_buf()).unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// Joins a client-supplied relative path to the shared root and refuses anything that escapes it.
+fn fs_resolve(root: &Path, rel: &str) -> Result<PathBuf, String> {
+    let mut p = root.to_path_buf();
+    for part in rel.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => return Err("That path is not allowed".into()),
+            _ => p.push(part),
+        }
+    }
+    // Canonicalize when it exists, then re-check it is still inside the root.
+    let canon_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    if let Ok(c) = p.canonicalize() {
+        if !c.starts_with(&canon_root) {
+            return Err("That path is not allowed".into());
+        }
+        return Ok(c);
+    }
+    Ok(p)
+}
+
+/// Serves file requests to a paired device over one authenticated connection.
+fn fs_serve(mut c: Conn, me: &Identity, shared: &SharedState, id: String, nonce_c_hex: String) {
+    let setup = (|| -> Result<(), String> {
+        let peer = lock(shared).paired.iter().find(|p| p.id == id).cloned();
+        let (peer, nonce_c) = match (peer, hex::decode(&nonce_c_hex)) {
+            (Some(p), Ok(n)) => (p, n),
+            _ => return Err(format!("{} does not trust this device", me.name)),
+        };
+        let pk = identity::decode_public(&peer.public_key).ok_or("Stored key is damaged")?;
+        let ss = me.secret.diffie_hellman(&pk).as_bytes().to_vec();
+        let nonce_s: [u8; 16] = rand::random();
+        let mac_s = mac(&ss, &[LABEL_FS, &nonce_c, &nonce_s, me.id.as_bytes(), id.as_bytes()]);
+        c.send(&Msg::FsReady { nonce: hex::encode(nonce_s), mac: hex::encode(mac_s) })?;
+        let Msg::FsAuth { mac: mac_c } = c.recv()? else { return Err(unexpected()) };
+        if !mac_ok(&ss, &[LABEL_FS, &nonce_s, &nonce_c, id.as_bytes(), me.id.as_bytes()], &mac_c) {
+            return Err("The other device failed the file-transfer security check".into());
+        }
+        Ok(())
+    })();
+    if let Err(e) = setup {
+        let _ = c.send(&Msg::Error { reason: e });
+        return;
+    }
+    let who = peer_name(shared, &id);
+    lock(shared).log(format!("{who} opened a file connection"));
+    let root = fs_root();
+    // Trusted request loop. Each op is a plain JSON line.
+    while let Ok(v) = c.recv_val() {
+        let op = v.get("op").and_then(|x| x.as_str()).unwrap_or("");
+        let result = match op {
+            "list" => fs_do_list(&mut c, &root, &v),
+            "get" => fs_do_get(&mut c, &root, &v),
+            "put" => fs_do_put(&mut c, &root, &v),
+            "bye" => break,
+            _ => Err("Unknown request".into()),
+        };
+        if let Err(e) = result {
+            let _ = c.send_val(&serde_json::json!({ "error": e }));
+        }
+    }
+}
+
+fn peer_name(shared: &SharedState, id: &str) -> String {
+    lock(shared).paired.iter().find(|p| p.id == id).map(|p| p.name.clone()).unwrap_or_else(|| "A device".into())
+}
+
+fn fs_path_arg<'a>(v: &'a serde_json::Value) -> &'a str {
+    v.get("path").and_then(|x| x.as_str()).unwrap_or("")
+}
+
+fn fs_do_list(c: &mut Conn, root: &Path, v: &serde_json::Value) -> Result<(), String> {
+    let dir = fs_resolve(root, fs_path_arg(v))?;
+    let mut entries = Vec::new();
+    for e in std::fs::read_dir(&dir).map_err(|e| format!("Cannot open that folder: {e}"))?.flatten() {
+        let md = match e.metadata() {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        entries.push(Entry {
+            name: e.file_name().to_string_lossy().into_owned(),
+            dir: md.is_dir(),
+            size: if md.is_dir() { 0 } else { md.len() },
+        });
+    }
+    entries.sort_by(|a, b| (b.dir, a.name.to_lowercase()).cmp(&(a.dir, b.name.to_lowercase())));
+    c.send_val(&serde_json::json!({ "entries": entries }))
+}
+
+fn fs_do_get(c: &mut Conn, root: &Path, v: &serde_json::Value) -> Result<(), String> {
+    let path = fs_resolve(root, fs_path_arg(v))?;
+    let mut f = std::fs::File::open(&path).map_err(|e| format!("Cannot open that file: {e}"))?;
+    let size = f.metadata().map(|m| m.len()).unwrap_or(0);
+    c.send_val(&serde_json::json!({ "size": size }))?;
+    let mut buf = vec![0u8; FS_CHUNK];
+    loop {
+        let n = f.read(&mut buf).map_err(|e| e.to_string())?;
+        if n == 0 {
+            break;
+        }
+        c.send_val(&serde_json::json!({ "data": hex::encode(&buf[..n]) }))?;
+    }
+    c.send_val(&serde_json::json!({ "eof": true }))
+}
+
+fn fs_do_put(c: &mut Conn, root: &Path, v: &serde_json::Value) -> Result<(), String> {
+    // Uploads always land in a "Nexus Inbox" folder under the shared root, by base name only.
+    let name = v.get("name").and_then(|x| x.as_str()).unwrap_or("");
+    let base = std::path::Path::new(name).file_name().and_then(|n| n.to_str()).filter(|n| !n.is_empty());
+    let base = base.ok_or("Bad file name")?;
+    let inbox = root.join("Nexus Inbox");
+    std::fs::create_dir_all(&inbox).map_err(|e| format!("Cannot create the inbox: {e}"))?;
+    let dest = inbox.join(base);
+    let mut f = std::fs::File::create(&dest).map_err(|e| format!("Cannot save the file: {e}"))?;
+    c.send_val(&serde_json::json!({ "ok": true }))?;
+    loop {
+        let frame = c.recv_val()?;
+        if frame.get("end").and_then(|x| x.as_bool()) == Some(true) {
+            break;
+        }
+        if let Some(d) = frame.get("data").and_then(|x| x.as_str()) {
+            let bytes = hex::decode(d).map_err(|_| "Garbled file data".to_string())?;
+            f.write_all(&bytes).map_err(|e| e.to_string())?;
+        }
+    }
+    f.flush().map_err(|e| e.to_string())?;
+    c.send_val(&serde_json::json!({ "saved": dest.file_name().unwrap_or_default().to_string_lossy() }))
 }
 
 /// Runs a lock/restart/shutdown asked for by a verified, paired device.
@@ -685,6 +870,96 @@ pub(crate) fn send_command(me: &Identity, peer: &PairedPeer, addr: SocketAddr, c
     }
 }
 
+/// Opens an authenticated file-transfer connection to a paired device.
+fn fs_open(me: &Identity, peer: &PairedPeer, addr: SocketAddr) -> Result<Conn, String> {
+    let pk = identity::decode_public(&peer.public_key).ok_or("Stored key is damaged")?;
+    let ss = me.secret.diffie_hellman(&pk).as_bytes().to_vec();
+    let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(4)).map_err(|_| "Not reachable".to_string())?;
+    let mut c = Conn::new(stream, Duration::from_secs(30))?;
+    let nonce_c: [u8; 16] = rand::random();
+    c.send(&Msg::FsHello { id: me.id.clone(), nonce: hex::encode(nonce_c) })?;
+    let Msg::FsReady { nonce: nonce_s_hex, mac: mac_s } = c.recv()? else { return Err(unexpected()) };
+    let nonce_s = hex::decode(&nonce_s_hex).map_err(|_| unexpected())?;
+    if !mac_ok(&ss, &[LABEL_FS, &nonce_c, &nonce_s, peer.id.as_bytes(), me.id.as_bytes()], &mac_s) {
+        return Err("The device failed the file-transfer security check".into());
+    }
+    let mac_c = mac(&ss, &[LABEL_FS, &nonce_s, &nonce_c, me.id.as_bytes(), peer.id.as_bytes()]);
+    c.send(&Msg::FsAuth { mac: hex::encode(mac_c) })?;
+    Ok(c)
+}
+
+/// Reads an error reply, if the value is one.
+fn fs_err(v: &serde_json::Value) -> Option<String> {
+    v.get("error").and_then(|x| x.as_str()).map(|s| s.to_string())
+}
+
+/// Lists a folder on a paired device.
+pub fn fs_list(me: &Identity, peer: &PairedPeer, addr: SocketAddr, path: &str) -> Result<Vec<Entry>, String> {
+    let mut c = fs_open(me, peer, addr)?;
+    c.send_val(&serde_json::json!({ "op": "list", "path": path }))?;
+    let v = c.recv_val()?;
+    if let Some(e) = fs_err(&v) {
+        return Err(e);
+    }
+    let entries = v.get("entries").cloned().ok_or_else(unexpected)?;
+    let entries: Vec<Entry> = serde_json::from_value(entries).map_err(|_| unexpected())?;
+    let _ = c.send_val(&serde_json::json!({ "op": "bye" }));
+    Ok(entries)
+}
+
+/// Downloads a file from a paired device to `dest`.
+pub fn fs_get(me: &Identity, peer: &PairedPeer, addr: SocketAddr, path: &str, dest: &Path) -> Result<(), String> {
+    let mut c = fs_open(me, peer, addr)?;
+    c.send_val(&serde_json::json!({ "op": "get", "path": path }))?;
+    let head = c.recv_val()?;
+    if let Some(e) = fs_err(&head) {
+        return Err(e);
+    }
+    let mut f = std::fs::File::create(dest).map_err(|e| format!("Cannot create {}: {e}", dest.display()))?;
+    loop {
+        let frame = c.recv_val()?;
+        if let Some(e) = fs_err(&frame) {
+            return Err(e);
+        }
+        if frame.get("eof").and_then(|x| x.as_bool()) == Some(true) {
+            break;
+        }
+        if let Some(d) = frame.get("data").and_then(|x| x.as_str()) {
+            let bytes = hex::decode(d).map_err(|_| "Garbled file data".to_string())?;
+            f.write_all(&bytes).map_err(|e| e.to_string())?;
+        }
+    }
+    f.flush().map_err(|e| e.to_string())?;
+    let _ = c.send_val(&serde_json::json!({ "op": "bye" }));
+    Ok(())
+}
+
+/// Uploads a local file to a paired device's inbox. Returns the saved name.
+pub fn fs_put(me: &Identity, peer: &PairedPeer, addr: SocketAddr, src: &Path) -> Result<String, String> {
+    let name = src.file_name().and_then(|n| n.to_str()).ok_or("Bad file name")?;
+    let mut f = std::fs::File::open(src).map_err(|e| format!("Cannot open {}: {e}", src.display()))?;
+    let mut c = fs_open(me, peer, addr)?;
+    c.send_val(&serde_json::json!({ "op": "put", "name": name }))?;
+    let ack = c.recv_val()?;
+    if let Some(e) = fs_err(&ack) {
+        return Err(e);
+    }
+    let mut buf = vec![0u8; FS_CHUNK];
+    loop {
+        let n = f.read(&mut buf).map_err(|e| e.to_string())?;
+        if n == 0 {
+            break;
+        }
+        c.send_val(&serde_json::json!({ "data": hex::encode(&buf[..n]) }))?;
+    }
+    c.send_val(&serde_json::json!({ "end": true }))?;
+    let done = c.recv_val()?;
+    if let Some(e) = fs_err(&done) {
+        return Err(e);
+    }
+    Ok(done.get("saved").and_then(|x| x.as_str()).unwrap_or(name).to_string())
+}
+
 /// Builds and broadcasts a Wake-on-LAN "magic packet" for each known MAC of a device.
 /// The device must have Wake-on-LAN enabled in its BIOS/network card for this to wake it.
 pub fn wake(peer: &PairedPeer) -> Result<(), String> {
@@ -844,6 +1119,15 @@ mod tests {
             hex::encode(command_ack_mac(dh.as_bytes(), &nonce, "ok")),
             "0d7987eada42979766a460a96ea74e2981dedf85e6ecb4af3573d20fdfb63344"
         );
+        let nonce_s: Vec<u8> = (16..32).collect();
+        assert_eq!(
+            hex::encode(mac(dh.as_bytes(), &[LABEL_FS, &nonce, &nonce_s, id_b.as_bytes(), id_a.as_bytes()])),
+            "181f683e3bdb4c9808f7692d7a3d86b9f717386ee0871f8eff9dda6d2abbb64c"
+        );
+        assert_eq!(
+            hex::encode(mac(dh.as_bytes(), &[LABEL_FS, &nonce_s, &nonce, id_a.as_bytes(), id_b.as_bytes()])),
+            "dafce46c82f3601de254baba89d4351921cf0b2d4d386cb6e1bbec3cf7650f96"
+        );
     }
 
     #[test]
@@ -859,6 +1143,7 @@ mod tests {
         };
         assert!(wake(&peer).is_err());
         let ok = PairedPeer { macs: vec!["aa:bb:cc:dd:ee:ff".into()], ..peer };
+        // A known MAC gets past the "no address" check; sending may or may not reach anything.
         assert!(parse_mac(&ok.macs[0]).is_some());
     }
 
@@ -877,6 +1162,7 @@ mod tests {
         Node { me, shared, addr: SocketAddr::from(([127, 0, 0, 1], port)) }
     }
 
+    /// Plays the user: answers the comparison with `accept`, and reports the code it saw.
     fn auto_answer(shared: SharedState, accept: bool) -> thread::JoinHandle<Option<String>> {
         thread::spawn(move || {
             for _ in 0..200 {
