@@ -26,6 +26,10 @@ dev_dependencies:
 # modern Flutter) and still on compileSdk 35 (so nothing forces SDK 36).
 dependency_overrides:
   flutter_plugin_android_lifecycle: 2.0.24
+  # path_provider_android 2.3.x switched to JNI and can fail at startup with
+  # "ClassNotFoundException: Landroid/content/Context;". 2.2.22 is the last
+  # version on the old, working channel-based implementation.
+  path_provider_android: 2.2.22
 
 flutter:
   uses-material-design: true
