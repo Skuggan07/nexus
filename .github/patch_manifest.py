@@ -14,6 +14,7 @@ perms = [
     "FOREGROUND_SERVICE",
     "FOREGROUND_SERVICE_MEDIA_PROJECTION",
     "POST_NOTIFICATIONS",
+    "REQUEST_INSTALL_PACKAGES",
 ]
 add = "".join(
     f'\n    <uses-permission android:name="android.permission.{p}"/>'

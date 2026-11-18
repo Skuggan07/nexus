@@ -9,6 +9,7 @@ use crate::{
     state::{lock, PairSession, Phase, Role, SharedState, Status},
     store::{self, PairedPeer},
     sysstats::Stats,
+    update,
 };
 use eframe::egui::{self, Color32, FontId, Margin, Pos2, RichText, Rounding, Sense, Stroke, TextStyle, Vec2};
 use std::{
@@ -147,6 +148,8 @@ pub struct NexusApp {
     screens: Vec<ScreenView>,
     fullscreen_on: bool,
     awake_on: bool,
+    updates: update::Shared,
+    update_hidden: bool,
     detailed: bool,
     tab: Tab,
     styled: bool,
@@ -204,6 +207,12 @@ impl NexusApp {
             screens: Vec::new(),
             fullscreen_on: false,
             awake_on: false,
+            updates: {
+                let u = update::Shared::default();
+                update::check(&u);
+                u
+            },
+            update_hidden: false,
             detailed,
             tab: Tab::Devices,
             styled: false,
@@ -674,6 +683,7 @@ impl eframe::App for NexusApp {
             apply_style(ctx);
             self.styled = true;
         }
+        self.update_banner(ctx);
 
         let (rows, nearby, window, session, log) = {
             let s = lock(&self.shared);
@@ -1077,7 +1087,81 @@ impl NexusApp {
         });
     }
 
+    /// A strip at the top of the window when a newer Nexus is available or downloading.
+    fn update_banner(&mut self, ctx: &egui::Context) {
+        let state = update::lock(&self.updates).clone();
+        let show = match &state {
+            update::State::Available { .. } => !self.update_hidden,
+            update::State::Downloading { .. } => true,
+            _ => false,
+        };
+        if !show {
+            return;
+        }
+        egui::TopBottomPanel::top("update-banner")
+            .frame(egui::Frame::none().fill(BOX2).inner_margin(Margin::symmetric(16.0, 8.0)))
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| match state {
+                    update::State::Available { build, .. } => {
+                        ui.label(
+                            RichText::new(format!(
+                                "Nexus build {build} is available (you have build {})",
+                                update::build()
+                            ))
+                            .strong(),
+                        );
+                        if ui.add(primary("Update now")).clicked() {
+                            update::install(&self.updates);
+                        }
+                        if ui.add(secondary("Later")).clicked() {
+                            self.update_hidden = true;
+                        }
+                    }
+                    update::State::Downloading { build, done, total } => {
+                        ui.label(
+                            RichText::new(format!("Downloading build {build}… Nexus restarts by itself")).strong(),
+                        );
+                        let frac = if total > 0 { done as f32 / total as f32 } else { 0.0 };
+                        ui.add(egui::ProgressBar::new(frac).desired_width(220.0).show_percentage());
+                    }
+                    _ => {}
+                });
+            });
+        ctx.request_repaint_after(Duration::from_millis(200));
+    }
+
     fn settings(&self, ui: &mut egui::Ui) {
+        box_frame().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(RichText::new("UPDATES").size(14.0).strong());
+            let state = update::lock(&self.updates).clone();
+            let mine = update::build();
+            let text = match &state {
+                update::State::Idle => format!("This is build {mine}."),
+                update::State::Checking => "Checking for a newer version…".to_string(),
+                update::State::UpToDate => format!("This is build {mine} — the newest version."),
+                update::State::Available { build, .. } => {
+                    format!("Build {build} is available (you have build {mine}).")
+                }
+                update::State::Downloading { build, .. } => format!("Downloading build {build}…"),
+                update::State::Failed(e) => format!("Could not update: {e}"),
+            };
+            ui.label(RichText::new(text).color(if matches!(state, update::State::Failed(_)) { BAD } else { TEXT }));
+            ui.horizontal(|ui| {
+                if matches!(state, update::State::Available { .. }) {
+                    if ui.add(primary("Update now")).clicked() {
+                        update::install(&self.updates);
+                    }
+                } else if ui.add(secondary("Check for updates")).clicked() {
+                    update::check(&self.updates);
+                }
+            });
+            ui.label(
+                RichText::new("Nexus checks when it starts. Updating keeps your paired devices and settings.")
+                    .size(12.0)
+                    .color(OFF),
+            );
+        });
         box_frame().show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.label(RichText::new("THIS PC").size(14.0).strong());

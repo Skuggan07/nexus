@@ -14,6 +14,8 @@ jobs:
   windows:
     name: Windows app
     runs-on: windows-latest
+    env:
+      NEXUS_BUILD: ${{ github.run_number }}  # shown in the app and used by the updater
     defaults:
       run:
         working-directory: desktop
@@ -91,8 +93,25 @@ jobs:
       - run: flutter pub get
       - name: Test (shared protocol vectors)
         run: flutter test
+      - name: Sign with the Nexus key (if the repo has it)
+        env:
+          NEXUS_KEYSTORE_B64: ${{ secrets.NEXUS_KEYSTORE_B64 }}
+        run: |
+          # The same key on every build lets phone updates install over the old app.
+          if [ -z "$NEXUS_KEYSTORE_B64" ]; then
+            echo "::warning::No NEXUS_KEYSTORE_B64 secret - this APK uses a temporary key and cannot update an installed app."
+            exit 0
+          fi
+          echo "$NEXUS_KEYSTORE_B64" | base64 -d > android/app/nexus-release.jks
+          python3 ../.github/use_signing_key.py android/app/build.gradle.kts
       - name: Build APK
-        run: flutter build apk --release
+        env:
+          NEXUS_KEY_PASSWORD: ${{ secrets.NEXUS_KEY_PASSWORD }}
+        run: >
+          flutter build apk --release
+          --build-number=${{ github.run_number }}
+          --build-name=1.0.${{ github.run_number }}
+          --dart-define=NEXUS_BUILD=${{ github.run_number }}
       - name: Collect
         run: cp build/app/outputs/flutter-apk/app-release.apk ../nexus-android.apk
       - uses: actions/upload-artifact@v4

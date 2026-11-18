@@ -9,6 +9,7 @@ import 'package:wakelock_plus/wakelock_plus.dart';
 
 import 'node.dart';
 import 'protocol.dart';
+import 'update.dart';
 
 // The chosen look: black background, dark green boxes, teal buttons,
 // dark orange gauges, white text. Simple mode by default, Detailed on request.
@@ -64,11 +65,19 @@ class HomePage extends StatefulWidget {
 
 class _HomePageState extends State<HomePage> {
   final _ipField = TextEditingController();
+  final _updater = Updater();
   NexusNode get node => widget.node;
+
+  @override
+  void initState() {
+    super.initState();
+    _updater.check();
+  }
 
   @override
   void dispose() {
     _ipField.dispose();
+    _updater.dispose();
     super.dispose();
   }
 
@@ -99,7 +108,10 @@ class _HomePageState extends State<HomePage> {
                       padding: const EdgeInsets.only(bottom: 12),
                       child: Text(node.startupError!, style: const TextStyle(color: bad)),
                     ),
+                  _UpdateCard(updater: _updater),
                   ...(node.detailed ? _detailed(context) : _simple(context)),
+                  const SizedBox(height: 16),
+                  _VersionLine(updater: _updater),
                 ],
               ),
             ),
@@ -1845,6 +1857,96 @@ class _PhoneSharingBoxState extends State<_PhoneSharingBox> with WidgetsBindingO
           ),
         ]),
       ]),
+    );
+  }
+}
+
+/// Shown at the top of the home screen when a newer Nexus is available.
+class _UpdateCard extends StatelessWidget {
+  const _UpdateCard({required this.updater});
+
+  final Updater updater;
+
+  @override
+  Widget build(BuildContext context) {
+    return ListenableBuilder(
+      listenable: updater,
+      builder: (context, _) {
+        final u = updater;
+        if (!(u.hasUpdate || u.phase == UpdatePhase.installing)) return const SizedBox.shrink();
+        final downloading = u.phase == UpdatePhase.downloading;
+        return Padding(
+          padding: const EdgeInsets.only(bottom: 12),
+          child: Container(
+            padding: const EdgeInsets.all(14),
+            decoration: BoxDecoration(
+              color: box2,
+              borderRadius: BorderRadius.circular(12),
+              border: Border.all(color: accent),
+            ),
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Row(children: [
+                const Icon(Icons.system_update, color: online),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: Text(
+                    'Nexus build ${u.newBuild} is available',
+                    style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 15),
+                  ),
+                ),
+                if (!downloading && u.phase != UpdatePhase.installing)
+                  FilledButton(
+                    style: FilledButton.styleFrom(backgroundColor: accent),
+                    onPressed: u.install,
+                    child: const Text('Update'),
+                  ),
+              ]),
+              if (downloading) ...[
+                const SizedBox(height: 10),
+                LinearProgressIndicator(value: u.progress > 0 ? u.progress : null, color: online, backgroundColor: line),
+                const SizedBox(height: 4),
+                Text('Downloading… ${(u.progress * 100).toStringAsFixed(0)}%', style: const TextStyle(fontSize: 12)),
+              ],
+              if (u.message != null) ...[
+                const SizedBox(height: 6),
+                Text(u.message!, style: const TextStyle(fontSize: 12, color: white)),
+              ],
+            ]),
+          ),
+        );
+      },
+    );
+  }
+}
+
+/// "Nexus build N · Check for updates" at the bottom of the home screen.
+class _VersionLine extends StatelessWidget {
+  const _VersionLine({required this.updater});
+
+  final Updater updater;
+
+  @override
+  Widget build(BuildContext context) {
+    return ListenableBuilder(
+      listenable: updater,
+      builder: (context, _) {
+        final status = switch (updater.phase) {
+          UpdatePhase.checking => 'Checking for updates…',
+          UpdatePhase.upToDate => 'Up to date',
+          UpdatePhase.failed => updater.message ?? 'Could not check',
+          UpdatePhase.available || UpdatePhase.downloading => 'Update available',
+          UpdatePhase.installing => 'Installing…',
+          UpdatePhase.idle => '',
+        };
+        return Column(children: [
+          Text('Nexus build $appBuild${status.isEmpty ? '' : ' · $status'}',
+              style: const TextStyle(color: off, fontSize: 12)),
+          TextButton(
+            onPressed: updater.phase == UpdatePhase.checking ? null : updater.check,
+            child: const Text('Check for updates', style: TextStyle(color: online)),
+          ),
+        ]);
+      },
     );
   }
 }

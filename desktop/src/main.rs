@@ -10,11 +10,17 @@ mod screen;
 mod state;
 mod store;
 mod sysstats;
+mod update;
 
 use eframe::egui;
 use std::sync::{Arc, Mutex};
 
 fn main() -> eframe::Result<()> {
+    // Started by the updater: give the previous version a moment to close and free its ports.
+    if std::env::args().any(|a| a == update::AFTER_UPDATE) {
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+    }
+    update::cleanup();
     let dir = store::data_dir();
     let _ = std::fs::create_dir_all(&dir);
     let me = match identity::Identity::load_or_create(&dir, std::env::var("NEXUS_NAME").ok()) {
