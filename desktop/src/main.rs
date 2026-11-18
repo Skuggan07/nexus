@@ -5,6 +5,7 @@ mod app;
 mod discovery;
 mod identity;
 mod net;
+mod screen;
 mod state;
 mod store;
 mod sysstats;

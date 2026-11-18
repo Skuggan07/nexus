@@ -20,9 +20,16 @@ if-addrs = "0.13"                                            # per-interface bro
 directories = "5"                                            # %APPDATA% location
 sysinfo = { version = "0.30", default-features = false }   # CPU and RAM usage
 mac_address = "1"                                           # local MAC addresses for Wake-on-LAN
+image = { version = "0.25", default-features = false, features = ["jpeg"] }  # encode/decode screen frames
+base64 = "0.22"                                            # frames travel as base64 inside a JSON line
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_System_Power", "Win32_Foundation"] }  # battery level
+windows-sys = { version = "0.59", features = [
+    "Win32_System_Power",        # battery level + keep-awake
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",        # screen capture (BitBlt / GetDIBits)
+    "Win32_UI_WindowsAndMessaging",  # GetSystemMetrics
+] }
 
 [profile.release]
 opt-level = 3

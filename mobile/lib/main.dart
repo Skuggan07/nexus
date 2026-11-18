@@ -1,7 +1,10 @@
+import 'dart:async';
 import 'dart:math' as math;
+import 'dart:typed_data';
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
+import 'package:wakelock_plus/wakelock_plus.dart';
 
 import 'node.dart';
 import 'protocol.dart';
@@ -430,6 +433,19 @@ class _HomePageState extends State<HomePage> {
                       Navigator.pop(ctx);
                       Navigator.of(context).push(
                         MaterialPageRoute<void>(builder: (_) => FileBrowserPage(node: node, peer: p)),
+                      );
+                    },
+                  ),
+                ),
+                const SizedBox(height: 8),
+                SizedBox(
+                  width: double.infinity,
+                  child: _SecondaryButton(
+                    label: 'View screen',
+                    onPressed: () {
+                      Navigator.pop(ctx);
+                      Navigator.of(context).push(
+                        MaterialPageRoute<void>(builder: (_) => ScreenViewPage(node: node, peer: p)),
                       );
                     },
                   ),
@@ -1069,6 +1085,103 @@ class _PairOverlay extends StatelessWidget {
             ),
           ),
         ),
+      ),
+    );
+  }
+}
+
+/// Live view of a paired device's screen. Keeps this phone's screen awake while
+/// open (as requested), and shows incoming JPEG frames as they arrive.
+class ScreenViewPage extends StatefulWidget {
+  const ScreenViewPage({super.key, required this.node, required this.peer});
+
+  final NexusNode node;
+  final PairedPeer peer;
+
+  @override
+  State<ScreenViewPage> createState() => _ScreenViewPageState();
+}
+
+class _ScreenViewPageState extends State<ScreenViewPage> {
+  StreamSubscription<ScreenFrame>? _sub;
+  Uint8List? _frame;
+  int _w = 0, _h = 0, _count = 0;
+  String? _error;
+
+  @override
+  void initState() {
+    super.initState();
+    WakelockPlus.enable();
+    _sub = widget.node.screenStream(widget.peer).listen(
+      (f) {
+        if (!mounted) return;
+        setState(() {
+          _frame = f.jpeg;
+          _w = f.w;
+          _h = f.h;
+          _count++;
+          _error = null;
+        });
+      },
+      onError: (Object e) {
+        if (!mounted) return;
+        setState(() => _error = '$e');
+      },
+      cancelOnError: true,
+    );
+  }
+
+  @override
+  void dispose() {
+    _sub?.cancel();
+    WakelockPlus.disable();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: Colors.black,
+      appBar: AppBar(
+        backgroundColor: bg,
+        foregroundColor: white,
+        title: Text('${widget.peer.name} — screen'),
+      ),
+      body: Column(
+        children: [
+          Expanded(
+            child: Center(
+              child: _error != null
+                  ? Padding(
+                      padding: const EdgeInsets.all(24),
+                      child: Text(_error!, style: const TextStyle(color: bad), textAlign: TextAlign.center),
+                    )
+                  : _frame == null
+                      ? const Text('Connecting to the screen…', style: TextStyle(color: white))
+                      : InteractiveViewer(
+                          maxScale: 5,
+                          child: Image.memory(
+                            _frame!,
+                            gaplessPlayback: true,
+                            filterQuality: FilterQuality.medium,
+                            fit: BoxFit.contain,
+                          ),
+                        ),
+            ),
+          ),
+          Container(
+            width: double.infinity,
+            color: bg,
+            padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 16),
+            child: Text(
+              _frame == null
+                  ? 'Your screen stays on while viewing'
+                  : '$_w×$_h · $_count frames · your screen stays on while viewing',
+              style: const TextStyle(color: off, fontSize: 12),
+              textAlign: TextAlign.center,
+            ),
+          ),
+        ],
       ),
     );
   }

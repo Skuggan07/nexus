@@ -121,6 +121,14 @@ class FsEntry {
   }
 }
 
+/// One decoded screen frame: its source size and the JPEG bytes.
+class ScreenFrame {
+  ScreenFrame(this.w, this.h, this.jpeg);
+  final int w;
+  final int h;
+  final Uint8List jpeg;
+}
+
 enum StatusKind { verified, checking, notAnswering, identityChanged, offline }
 
 class PeerStatus {
@@ -548,6 +556,55 @@ class NexusNode extends ChangeNotifier {
     }
   }
 
+  /// Opens an authenticated screen-sharing connection to a paired device (we view it).
+  Future<Conn> _screenOpen(PairedPeer p) async {
+    final addr = _addressFor(p);
+    if (addr == null) throw NexusError('${p.name} is not reachable right now');
+    final sock = await Socket.connect(addr.$1, addr.$2, timeout: const Duration(seconds: 4));
+    final c = Conn(sock);
+    try {
+      final nonceC = randomBytes(16);
+      final ss = await sharedSecret(_keyPair, fromHex(p.publicKey, 32));
+      c.send({'t': 'screen_hello', 'id': id, 'nonce': toHex(nonceC)});
+      final ready = await c.recv();
+      if (ready['t'] != 'screen_ready') throw NexusError(unexpectedMessage);
+      final nonceS = fromHex(_str(ready, 'nonce'));
+      if (!sameBytes(await screenMac(ss, nonceC, nonceS, p.id, id), fromHex(_str(ready, 'mac')))) {
+        throw NexusError('The device failed the screen-sharing security check');
+      }
+      c.send({'t': 'screen_auth', 'mac': toHex(await screenMac(ss, nonceS, nonceC, id, p.id))});
+      return c;
+    } catch (e) {
+      c.close();
+      rethrow;
+    }
+  }
+
+  /// Streams a paired device's screen as JPEG frames. Closing the subscription
+  /// tears the connection down, which stops the other device capturing.
+  Stream<ScreenFrame> screenStream(PairedPeer p, {int fps = 10, int maxW = 1280}) async* {
+    final c = await _screenOpen(p);
+    try {
+      c.send({'op': 'start', 'fps': fps, 'maxw': maxW});
+      while (true) {
+        final v = await c.recv(const Duration(seconds: 20));
+        if (v['error'] != null) throw NexusError('${v['error']}');
+        final data = v['data'];
+        if (data is! String) continue;
+        yield ScreenFrame(
+          (v['w'] as num?)?.toInt() ?? 0,
+          (v['h'] as num?)?.toInt() ?? 0,
+          base64Decode(data),
+        );
+      }
+    } finally {
+      try {
+        c.send({'op': 'bye'});
+      } catch (_) {}
+      c.close();
+    }
+  }
+
   /// Lists a folder on a paired device.
   Future<List<FsEntry>> fsList(PairedPeer p, String path) async {
     final c = await _fsOpen(p);
@@ -760,6 +817,8 @@ class NexusNode extends ChangeNotifier {
           await _answerCommand(c, m);
         case 'fs_hello':
           await _fsServe(c, m);
+        case 'screen_hello':
+          c.send({'t': 'error', 'reason': 'Viewing an Android screen isn\'t supported yet'});
         case 'pair_hello':
           await _hostPair(c, m);
       }

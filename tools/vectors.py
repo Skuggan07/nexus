@@ -30,3 +30,7 @@ fs_mac_s = mac(dh, [b"nexus-fs-v2", nonce, nonce_s, dev_id(pkb).encode(), dev_id
 fs_mac_c = mac(dh, [b"nexus-fs-v2", nonce_s, nonce, dev_id(pka).encode(), dev_id(pkb).encode()])
 print(f"fs_mac_s = {fs_mac_s.hex()}")
 print(f"fs_mac_c = {fs_mac_c.hex()}")
+screen_mac_s = mac(dh, [b"nexus-screen-v2", nonce, nonce_s, dev_id(pkb).encode(), dev_id(pka).encode()])
+screen_mac_c = mac(dh, [b"nexus-screen-v2", nonce_s, nonce, dev_id(pka).encode(), dev_id(pkb).encode()])
+print(f"screen_mac_s = {screen_mac_s.hex()}")
+print(f"screen_mac_c = {screen_mac_c.hex()}")

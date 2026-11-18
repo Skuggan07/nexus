@@ -5,7 +5,7 @@ import sys
 
 path = sys.argv[1]
 s = open(path, encoding="utf-8").read()
-perms = ["INTERNET", "ACCESS_NETWORK_STATE", "ACCESS_WIFI_STATE", "CHANGE_WIFI_MULTICAST_STATE"]
+perms = ["INTERNET", "ACCESS_NETWORK_STATE", "ACCESS_WIFI_STATE", "CHANGE_WIFI_MULTICAST_STATE", "WAKE_LOCK"]
 add = "".join(
     f'\n    <uses-permission android:name="android.permission.{p}"/>'
     for p in perms

@@ -41,6 +41,10 @@ void main() {
         '181f683e3bdb4c9808f7692d7a3d86b9f717386ee0871f8eff9dda6d2abbb64c');
     expect(toHex(await fsMac(dh, nonceS, nonce, idA, idB)),
         'dafce46c82f3601de254baba89d4351921cf0b2d4d386cb6e1bbec3cf7650f96');
+    expect(toHex(await screenMac(dh, nonce, nonceS, idB, idA)),
+        'af1f2124658e278983f98683cf08c52941038f0445b62a1b25700967de1c8883');
+    expect(toHex(await screenMac(dh, nonceS, nonce, idA, idB)),
+        '7d886b0f703a31a451e390d80e7c010d1fb29db902e6ebbad2951cedd08cc87f');
   });
 
   test('hex helpers', () {

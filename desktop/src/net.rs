@@ -23,6 +23,7 @@ use crate::{
     store::{self, PairedPeer},
     sysstats::{self, Stats},
 };
+use base64::Engine as _;
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -46,6 +47,7 @@ pub const LABEL_STATS: &[u8] = b"nexus-stats-v2";
 pub const LABEL_CMD: &[u8] = b"nexus-cmd-v2";
 pub const LABEL_CMDACK: &[u8] = b"nexus-cmdack-v2";
 pub const LABEL_FS: &[u8] = b"nexus-fs-v2";
+pub const LABEL_SCREEN: &[u8] = b"nexus-screen-v2";
 /// UDP port the Wake-on-LAN magic packet is sent to (9 = the usual "discard" port).
 pub const WOL_PORT: u16 = 9;
 /// File data travels in chunks of this many bytes (sent as hex inside a JSON line).
@@ -146,6 +148,18 @@ enum Msg {
         mac: String,
     },
     FsAuth {
+        mac: String,
+    },
+    /// Opens an authenticated live screen-sharing connection (viewer → host).
+    ScreenHello {
+        id: String,
+        nonce: String,
+    },
+    ScreenReady {
+        nonce: String,
+        mac: String,
+    },
+    ScreenAuth {
         mac: String,
     },
     Error {
@@ -313,6 +327,7 @@ fn handle(stream: TcpStream, me: &Identity, shared: &SharedState, dir: &Path) {
         }
         Ok(Msg::Command { id, nonce, action, mac: tag }) => host_command(c, me, shared, id, nonce, action, tag),
         Ok(Msg::FsHello { id, nonce }) => fs_serve(c, me, shared, id, nonce),
+        Ok(Msg::ScreenHello { id, nonce }) => screen_serve(c, me, shared, id, nonce),
         Ok(Msg::PairHello { v, id, name, os, public_key }) => {
             host_pair(c, me, shared, dir, v, id, name, os, public_key)
         }
@@ -404,6 +419,139 @@ fn fs_serve(mut c: Conn, me: &Identity, shared: &SharedState, id: String, nonce_
 
 fn peer_name(shared: &SharedState, id: &str) -> String {
     lock(shared).paired.iter().find(|p| p.id == id).map(|p| p.name.clone()).unwrap_or_else(|| "A device".into())
+}
+
+/* ------------------------------------------------------------ screen share */
+
+/// Shared handshake for a screen session; returns the X25519 shared secret.
+fn screen_auth_host(
+    c: &mut Conn,
+    me: &Identity,
+    shared: &SharedState,
+    id: &str,
+    nonce_c_hex: &str,
+) -> Result<(), String> {
+    let peer = lock(shared).paired.iter().find(|p| p.id == id).cloned();
+    let (peer, nonce_c) = match (peer, hex::decode(nonce_c_hex)) {
+        (Some(p), Ok(n)) => (p, n),
+        _ => return Err(format!("{} does not trust this device", me.name)),
+    };
+    let pk = identity::decode_public(&peer.public_key).ok_or("Stored key is damaged")?;
+    let ss = me.secret.diffie_hellman(&pk).as_bytes().to_vec();
+    let nonce_s: [u8; 16] = rand::random();
+    let mac_s = mac(&ss, &[LABEL_SCREEN, &nonce_c, &nonce_s, me.id.as_bytes(), id.as_bytes()]);
+    c.send(&Msg::ScreenReady { nonce: hex::encode(nonce_s), mac: hex::encode(mac_s) })?;
+    let Msg::ScreenAuth { mac: mac_c } = c.recv()? else { return Err(unexpected()) };
+    if !mac_ok(&ss, &[LABEL_SCREEN, &nonce_s, &nonce_c, id.as_bytes(), me.id.as_bytes()], &mac_c) {
+        return Err("The other device failed the screen-sharing security check".into());
+    }
+    Ok(())
+}
+
+/// Streams the primary display to a paired viewer, frame by frame, until it disconnects.
+fn screen_serve(mut c: Conn, me: &Identity, shared: &SharedState, id: String, nonce_c_hex: String) {
+    if let Err(e) = screen_auth_host(&mut c, me, shared, &id, &nonce_c_hex) {
+        let _ = c.send(&Msg::Error { reason: e });
+        return;
+    }
+    // The viewer sends one "start" line with its preferred frame rate and size.
+    let start = match c.recv_val() {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    let fps = start.get("fps").and_then(|x| x.as_u64()).unwrap_or(8).clamp(1, 30);
+    let max_w = start.get("maxw").and_then(|x| x.as_u64()).unwrap_or(1280).clamp(320, 3840) as u32;
+    let quality = start.get("quality").and_then(|x| x.as_u64()).unwrap_or(55).clamp(20, 90) as u8;
+    let who = peer_name(shared, &id);
+    lock(shared).log(format!("{who} is viewing this screen"));
+    let gap = Duration::from_millis(1000 / fps);
+    let mut seq: u64 = 0;
+    loop {
+        let started = Instant::now();
+        match crate::screen::capture_jpeg(max_w, quality) {
+            Ok((w, h, jpeg)) => {
+                let data = base64::engine::general_purpose::STANDARD.encode(&jpeg);
+                let frame = serde_json::json!({ "op": "frame", "w": w, "h": h, "seq": seq, "data": data });
+                if c.send_val(&frame).is_err() {
+                    break; // viewer closed the window
+                }
+                seq += 1;
+            }
+            Err(e) => {
+                let _ = c.send_val(&serde_json::json!({ "error": e }));
+                break;
+            }
+        }
+        let spent = started.elapsed();
+        if spent < gap {
+            thread::sleep(gap - spent);
+        }
+    }
+    lock(shared).log(format!("{who} stopped viewing this screen"));
+}
+
+/// Opens an authenticated screen connection to a paired device (we are the viewer).
+fn screen_open(me: &Identity, peer: &PairedPeer, addr: SocketAddr) -> Result<Conn, String> {
+    let pk = identity::decode_public(&peer.public_key).ok_or("Stored key is damaged")?;
+    let ss = me.secret.diffie_hellman(&pk).as_bytes().to_vec();
+    let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(4)).map_err(|_| "Not reachable".to_string())?;
+    let mut c = Conn::new(stream, Duration::from_secs(20))?;
+    let nonce_c: [u8; 16] = rand::random();
+    c.send(&Msg::ScreenHello { id: me.id.clone(), nonce: hex::encode(nonce_c) })?;
+    let Msg::ScreenReady { nonce: nonce_s_hex, mac: mac_s } = c.recv()? else { return Err(unexpected()) };
+    let nonce_s = hex::decode(&nonce_s_hex).map_err(|_| unexpected())?;
+    if !mac_ok(&ss, &[LABEL_SCREEN, &nonce_c, &nonce_s, peer.id.as_bytes(), me.id.as_bytes()], &mac_s) {
+        return Err("The device failed the screen-sharing security check".into());
+    }
+    let mac_c = mac(&ss, &[LABEL_SCREEN, &nonce_s, &nonce_c, me.id.as_bytes(), peer.id.as_bytes()]);
+    c.send(&Msg::ScreenAuth { mac: hex::encode(mac_c) })?;
+    Ok(c)
+}
+
+/// One decoded screen frame handed back to the viewer UI.
+pub struct Frame {
+    pub w: u32,
+    pub h: u32,
+    pub seq: u64,
+    pub jpeg: Vec<u8>,
+}
+
+/// Connects to a paired device and calls `on_frame` for every screen frame until
+/// `keep_going` returns false or the connection ends. Runs on its own thread.
+pub fn screen_stream<F, G>(
+    me: &Identity,
+    peer: &PairedPeer,
+    addr: SocketAddr,
+    fps: u64,
+    max_w: u32,
+    mut on_frame: F,
+    keep_going: G,
+) -> Result<(), String>
+where
+    F: FnMut(Frame),
+    G: Fn() -> bool,
+{
+    let mut c = screen_open(me, peer, addr)?;
+    c.send_val(&serde_json::json!({ "op": "start", "fps": fps, "maxw": max_w }))?;
+    while keep_going() {
+        let v = c.recv_val()?;
+        if let Some(e) = fs_err(&v) {
+            return Err(e);
+        }
+        let (Some(data), Some(w), Some(h), Some(seq)) = (
+            v.get("data").and_then(|x| x.as_str()),
+            v.get("w").and_then(|x| x.as_u64()),
+            v.get("h").and_then(|x| x.as_u64()),
+            v.get("seq").and_then(|x| x.as_u64()),
+        ) else {
+            continue;
+        };
+        let jpeg =
+            base64::engine::general_purpose::STANDARD.decode(data).map_err(|_| "Garbled screen frame".to_string())?;
+        on_frame(Frame { w: w as u32, h: h as u32, seq, jpeg });
+    }
+    let _ = c.send_val(&serde_json::json!({ "op": "bye" }));
+    Ok(())
 }
 
 fn fs_path_arg<'a>(v: &'a serde_json::Value) -> &'a str {
@@ -1127,6 +1275,14 @@ mod tests {
         assert_eq!(
             hex::encode(mac(dh.as_bytes(), &[LABEL_FS, &nonce_s, &nonce, id_a.as_bytes(), id_b.as_bytes()])),
             "dafce46c82f3601de254baba89d4351921cf0b2d4d386cb6e1bbec3cf7650f96"
+        );
+        assert_eq!(
+            hex::encode(mac(dh.as_bytes(), &[LABEL_SCREEN, &nonce, &nonce_s, id_b.as_bytes(), id_a.as_bytes()])),
+            "af1f2124658e278983f98683cf08c52941038f0445b62a1b25700967de1c8883"
+        );
+        assert_eq!(
+            hex::encode(mac(dh.as_bytes(), &[LABEL_SCREEN, &nonce_s, &nonce, id_a.as_bytes(), id_b.as_bytes()])),
+            "7d886b0f703a31a451e390d80e7c010d1fb29db902e6ebbad2951cedd08cc87f"
         );
     }
 

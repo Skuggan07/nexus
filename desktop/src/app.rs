@@ -38,6 +38,26 @@ struct Browser {
     inner: Arc<Mutex<BrowserInner>>,
 }
 
+/// Live state of a screen-view session, shared with its streaming thread.
+#[derive(Default)]
+struct ScreenInner {
+    jpeg: Option<Vec<u8>>,
+    seq: u64,
+    dims: (u32, u32),
+    frames: u64,
+    error: Option<String>,
+    stop: bool,
+}
+
+/// The open screen viewer: which device, the latest frame, and its GPU texture.
+struct ScreenView {
+    peer_id: String,
+    peer_name: String,
+    inner: Arc<Mutex<ScreenInner>>,
+    tex: Option<egui::TextureHandle>,
+    shown_seq: u64,
+}
+
 const BG: Color32 = Color32::from_rgb(0, 0, 0);
 const SIDEBAR: Color32 = Color32::from_rgb(10, 10, 10);
 const BOX: Color32 = Color32::from_rgb(14, 58, 42);
@@ -69,6 +89,7 @@ pub struct NexusApp {
     confirm_cmd: Option<(String, Command)>,
     details: Option<String>,
     browser: Option<Browser>,
+    screen: Option<ScreenView>,
     detailed: bool,
     tab: Tab,
     styled: bool,
@@ -96,6 +117,8 @@ enum Action {
     BrowseTo(Vec<String>),
     Download(String),
     Upload(String),
+    ViewScreen(String),
+    CloseScreen,
 }
 
 impl NexusApp {
@@ -118,6 +141,7 @@ impl NexusApp {
             confirm_cmd: None,
             details: None,
             browser: None,
+            screen: None,
             detailed,
             tab: Tab::Devices,
             styled: false,
@@ -249,7 +273,62 @@ impl NexusApp {
             }
             Action::Download(name) => self.start_transfer(Some(name), None),
             Action::Upload(path) => self.start_transfer(None, Some(path)),
+            Action::ViewScreen(id) => self.open_screen(id),
+            Action::CloseScreen => {
+                if let Some(s) = &self.screen {
+                    s.inner.lock().unwrap_or_else(|e| e.into_inner()).stop = true;
+                }
+                self.screen = None;
+                crate::screen::keep_display_awake(false);
+            }
         }
+    }
+
+    /// Opens a live screen view of a paired device and starts the streaming thread.
+    fn open_screen(&mut self, id: String) {
+        let name = self.peer_of(&id).map(|p| p.name).unwrap_or_else(|| "Device".into());
+        if let Some(s) = &self.screen {
+            s.inner.lock().unwrap_or_else(|e| e.into_inner()).stop = true;
+        }
+        let inner = Arc::new(Mutex::new(ScreenInner::default()));
+        self.details = None;
+        self.browser = None;
+        self.screen = Some(ScreenView {
+            peer_id: id.clone(),
+            peer_name: name,
+            inner: inner.clone(),
+            tex: None,
+            shown_seq: u64::MAX,
+        });
+        let (Some(addr), Some(peer)) = (self.addr_of(&id), self.peer_of(&id)) else {
+            inner.lock().unwrap().error = Some("That device is not reachable right now".into());
+            return;
+        };
+        let me = self.me.clone();
+        let (frames_ref, stop_ref, err_ref) = (inner.clone(), inner.clone(), inner.clone());
+        std::thread::spawn(move || {
+            let res = net::screen_stream(
+                &me,
+                &peer,
+                addr,
+                10,
+                1280,
+                move |f| {
+                    let mut g = frames_ref.lock().unwrap_or_else(|e| e.into_inner());
+                    g.jpeg = Some(f.jpeg);
+                    g.seq = f.seq;
+                    g.dims = (f.w, f.h);
+                    g.frames += 1;
+                },
+                move || !stop_ref.lock().unwrap_or_else(|e| e.into_inner()).stop,
+            );
+            if let Err(e) = res {
+                let mut g = err_ref.lock().unwrap_or_else(|e| e.into_inner());
+                if !g.stop {
+                    g.error = Some(e);
+                }
+            }
+        });
     }
 
     fn addr_of(&self, id: &str) -> Option<SocketAddr> {
@@ -573,13 +652,24 @@ impl eframe::App for NexusApp {
         if self.browser.is_some() {
             self.file_browser(ctx, &mut actions);
         }
+        if self.screen.is_some() {
+            self.screen_window(ctx, &mut actions);
+            crate::screen::keep_display_awake(true);
+        }
 
         for a in actions {
             self.apply(a);
         }
-        let browsing = self.browser.is_some();
-        let fast = session.is_some() || window.is_some() || browsing;
-        ctx.request_repaint_after(Duration::from_millis(if fast { 250 } else { 1000 }));
+        let viewing = self.screen.is_some();
+        let fast = session.is_some() || window.is_some() || self.browser.is_some() || viewing;
+        let ms = if viewing {
+            80
+        } else if fast {
+            250
+        } else {
+            1000
+        };
+        ctx.request_repaint_after(Duration::from_millis(ms));
     }
 }
 
@@ -919,6 +1009,10 @@ impl NexusApp {
                     if ui.add(secondary("Browse files").min_size(Vec2::new(0.0, 36.0))).clicked() {
                         actions.push(Action::OpenBrowser(r.peer.id.clone()));
                     }
+                    ui.add_space(2.0);
+                    if ui.add(secondary("View screen").min_size(Vec2::new(0.0, 36.0))).clicked() {
+                        actions.push(Action::ViewScreen(r.peer.id.clone()));
+                    }
                 }
                 ui.add_space(2.0);
                 remove_controls(ui, r, self.confirm_remove.as_deref(), actions);
@@ -1012,6 +1106,66 @@ impl NexusApp {
             });
         if !open {
             actions.push(Action::CloseBrowser);
+        }
+    }
+
+    /// The live screen viewer window. Decodes the newest frame into a texture and
+    /// scales it to fit; the viewing machine is kept awake while this is open.
+    fn screen_window(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
+        let Some(sv) = self.screen.as_mut() else { return };
+        let (new_jpeg, dims, error, frames, cur_seq) = {
+            let g = sv.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let nj = if g.jpeg.is_some() && g.seq != sv.shown_seq { g.jpeg.clone() } else { None };
+            (nj, g.dims, g.error.clone(), g.frames, g.seq)
+        };
+        if let Some(bytes) = new_jpeg {
+            if let Ok(decoded) = image::load_from_memory(&bytes) {
+                let rgba = decoded.to_rgba8();
+                let size = [rgba.width() as usize, rgba.height() as usize];
+                let color = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
+                match &mut sv.tex {
+                    Some(t) => t.set(color, egui::TextureOptions::LINEAR),
+                    None => sv.tex = Some(ctx.load_texture("screen-frame", color, egui::TextureOptions::LINEAR)),
+                }
+                sv.shown_seq = cur_seq;
+            }
+        }
+        let mut open = true;
+        egui::Window::new(RichText::new(format!("{} — screen", sv.peer_name)).size(17.0).strong())
+            .open(&mut open)
+            .collapsible(false)
+            .default_size(Vec2::new(900.0, 560.0))
+            .show(ctx, |ui| {
+                if let Some(e) = &error {
+                    ui.colored_label(BAD, e);
+                    ui.add_space(4.0);
+                }
+                if let Some(tex) = &sv.tex {
+                    let avail = ui.available_size();
+                    let [tw, th] = tex.size();
+                    let (tw, th) = (tw as f32, th as f32);
+                    let scale = (avail.x / tw).min((avail.y - 28.0) / th).clamp(0.05, 2.0);
+                    ui.centered_and_justified(|ui| {
+                        ui.add(egui::Image::new(egui::load::SizedTexture::new(
+                            tex.id(),
+                            Vec2::new(tw * scale, th * scale),
+                        )));
+                    });
+                } else if error.is_none() {
+                    ui.centered_and_justified(|ui| ui.label("Connecting to the screen…"));
+                }
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(format!(
+                        "{}×{} · {} frames · this screen stays awake while viewing",
+                        dims.0, dims.1, frames
+                    ))
+                    .size(12.0)
+                    .color(OFF),
+                );
+            });
+        if !open {
+            actions.push(Action::CloseScreen);
         }
     }
 }
@@ -1160,6 +1314,9 @@ fn device_card(
         power_controls(ui, r, confirm_cmd, actions);
         if online && ui.add(secondary("Browse files")).clicked() {
             actions.push(Action::OpenBrowser(r.peer.id.clone()));
+        }
+        if online && ui.add(secondary("View screen")).clicked() {
+            actions.push(Action::ViewScreen(r.peer.id.clone()));
         }
         remove_controls(ui, r, confirm, actions);
     });
