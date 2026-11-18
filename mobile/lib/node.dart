@@ -623,10 +623,10 @@ class NexusNode extends ChangeNotifier {
 
   /// Streams a paired device's screen as JPEG frames. Closing the subscription
   /// tears the connection down, which stops the other device capturing.
-  Stream<ScreenFrame> screenStream(PairedPeer p, {int fps = 10, int maxW = 1280}) async* {
+  Stream<ScreenFrame> screenStream(PairedPeer p, {int fps = 12, int maxW = 1920, int quality = 75}) async* {
     final c = await _screenOpen(p);
     try {
-      c.send({'op': 'start', 'fps': fps, 'maxw': maxW});
+      c.send({'op': 'start', 'fps': fps, 'maxw': maxW, 'quality': quality});
       while (true) {
         final v = await c.recv(const Duration(seconds: 20));
         if (v['error'] != null) throw NexusError('${v['error']}');
@@ -951,7 +951,7 @@ class NexusNode extends ChangeNotifier {
   }
 
   /// Asks Android for permission to share this phone's screen (shows the system prompt).
-  Future<bool> startScreenShare() async => await _native('startCapture', {'maxw': 1280}) == true;
+  Future<bool> startScreenShare() async => await _native('startCapture', {'maxw': 1920}) == true;
   Future<void> stopScreenShare() async => _native('stopCapture');
   Future<bool> isScreenShared() async => await _native('isCapturing') == true;
 

@@ -82,7 +82,7 @@ B refuses the connection unless A is a paired device and `mac` checks out. After
 - `{op:"put", name}` → `{ok:true}`; A then sends `{data:"<hex>"}` frames ending with `{end:true}`; B replies `{saved}`. Uploads land in a "Nexus Inbox" folder under the shared root.
 - `{op:"bye"}` closes the connection.
 
-Any request may be answered with `{error:"…"}`. File transfers are authenticated so only paired devices can reach them; the file bytes themselves are not yet encrypted on the wire (a planned addition). The maximum JSON line is raised to 2 MiB on this connection so a data frame fits.
+Any request may be answered with `{error:"…"}`. File transfers are authenticated so only paired devices can reach them; the file bytes themselves are not yet encrypted on the wire (a planned addition). The maximum JSON line is raised to 8 MiB so a data frame (or a sharp screen frame) fits.
 
 All binary values on the wire are lowercase hex.
 

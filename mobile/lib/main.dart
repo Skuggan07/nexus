@@ -4,6 +4,7 @@ import 'dart:typed_data';
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 
 import 'node.dart';
@@ -209,6 +210,11 @@ class _HomePageState extends State<HomePage> {
         ),
         const SizedBox(height: 10),
       ],
+      if (_onlineCount > 0) ...[
+        const SizedBox(height: 4),
+        _watchAllButton(context),
+        const SizedBox(height: 10),
+      ],
       for (final s in node.nearby) ...[
         const SizedBox(height: 6),
         _NearbyBox(name: s.name, sub: '${s.os} · ${s.addr.address}', onPair: node.pair == null ? () => _pair(s) : null),
@@ -257,6 +263,10 @@ class _HomePageState extends State<HomePage> {
       const SizedBox(height: 6),
       _pairByIp(context),
       const SizedBox(height: 18),
+      if (_onlineCount > 0) ...[
+        _watchAllButton(context),
+        const SizedBox(height: 12),
+      ],
       _activity(),
       const SizedBox(height: 12),
       _PhoneSharingBox(node: node),
@@ -275,6 +285,16 @@ class _HomePageState extends State<HomePage> {
       ),
     ];
   }
+
+  Widget _watchAllButton(BuildContext context) => SizedBox(
+        width: double.infinity,
+        child: _SecondaryButton(
+          label: 'Watch all screens',
+          onPressed: () => Navigator.of(context).push(
+            MaterialPageRoute<void>(builder: (_) => ScreenGridPage(node: node)),
+          ),
+        ),
+      );
 
   Widget _deviceCard(BuildContext context, PairedPeer p) {
     final st = node.statusOf(p);
@@ -1106,11 +1126,34 @@ class ScreenViewPage extends StatefulWidget {
   State<ScreenViewPage> createState() => _ScreenViewPageState();
 }
 
+/// Picture presets for screen viewing.
+enum ViewQuality {
+  smooth('Smooth', 15, 1280, 60),
+  balanced('Balanced', 12, 1920, 75),
+  sharp('Sharp', 8, 2560, 88);
+
+  const ViewQuality(this.label, this.fps, this.maxW, this.quality);
+  final String label;
+  final int fps;
+  final int maxW;
+  final int quality;
+}
+
 class _ScreenViewPageState extends State<ScreenViewPage> {
   StreamSubscription<ScreenFrame>? _sub;
   Uint8List? _frame;
   int _w = 0, _h = 0, _count = 0;
   String? _error;
+  ViewQuality _quality = ViewQuality.balanced;
+  bool _fullscreen = false;
+  final _zoom = TransformationController();
+  bool _zoomed = false;
+
+  // Frames-per-second readout.
+  Timer? _fpsTimer;
+  int _fpsFrames = 0;
+  double _fps = 0;
+  DateTime? _lastFrameAt;
 
   // Remote control.
   bool _control = false;
@@ -1128,7 +1171,25 @@ class _ScreenViewPageState extends State<ScreenViewPage> {
   void initState() {
     super.initState();
     WakelockPlus.enable();
-    _sub = widget.node.screenStream(widget.peer).listen(
+    _zoom.addListener(() {
+      final zoomed = _zoom.value.getMaxScaleOnAxis() > 1.01;
+      if (zoomed != _zoomed && mounted) setState(() => _zoomed = zoomed);
+    });
+    _fpsTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (!mounted) return;
+      setState(() {
+        _fps = (_count - _fpsFrames).toDouble();
+        _fpsFrames = _count;
+      });
+    });
+    _listen();
+  }
+
+  void _listen() {
+    _sub?.cancel();
+    _sub = widget.node
+        .screenStream(widget.peer, fps: _quality.fps, maxW: _quality.maxW, quality: _quality.quality)
+        .listen(
       (f) {
         if (!mounted) return;
         setState(() {
@@ -1136,6 +1197,7 @@ class _ScreenViewPageState extends State<ScreenViewPage> {
           _w = f.w;
           _h = f.h;
           _count++;
+          _lastFrameAt = DateTime.now();
           _error = null;
         });
       },
@@ -1147,12 +1209,29 @@ class _ScreenViewPageState extends State<ScreenViewPage> {
     );
   }
 
+  void _setQuality(ViewQuality q) {
+    if (q == _quality) return;
+    setState(() {
+      _quality = q;
+      _error = null;
+    });
+    _listen();
+  }
+
+  void _setFullscreen(bool on) {
+    setState(() => _fullscreen = on);
+    SystemChrome.setEnabledSystemUIMode(on ? SystemUiMode.immersiveSticky : SystemUiMode.edgeToEdge);
+  }
+
   @override
   void dispose() {
     _sub?.cancel();
+    _fpsTimer?.cancel();
     _ctl?.close();
     _typed.dispose();
     _typeFocus.dispose();
+    _zoom.dispose();
+    if (_fullscreen) SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
     WakelockPlus.disable();
     super.dispose();
   }
@@ -1210,23 +1289,27 @@ class _ScreenViewPageState extends State<ScreenViewPage> {
     _typeFocus.requestFocus();
   }
 
+  bool get _isLive => _lastFrameAt != null && DateTime.now().difference(_lastFrameAt!) < const Duration(seconds: 4);
+
   Widget _picture() {
-    final picture = Image.memory(_frame!, gaplessPlayback: true, filterQuality: FilterQuality.medium, fit: BoxFit.fill);
-    return LayoutBuilder(builder: (ctx, box) {
+    final picture =
+        Image.memory(_frame!, gaplessPlayback: true, filterQuality: FilterQuality.medium, fit: BoxFit.fill);
+    return LayoutBuilder(builder: (ctx, area) {
       final aspect = (_w > 0 && _h > 0) ? _w / _h : 16 / 9;
-      var dw = box.maxWidth, dh = dw / aspect;
-      if (dh > box.maxHeight) {
-        dh = box.maxHeight;
+      var dw = area.maxWidth, dh = dw / aspect;
+      if (dh > area.maxHeight) {
+        dh = area.maxHeight;
         dw = dh * aspect;
       }
       final size = Size(dw, dh);
-      final img = SizedBox(width: dw, height: dh, child: picture);
       final c = _live;
-      if (!_control || c == null) {
-        return InteractiveViewer(maxScale: 5, child: Center(child: img));
-      }
-      return Center(
-        child: GestureDetector(
+      final controlling = _control && c != null;
+      Widget img = SizedBox(width: dw, height: dh, child: picture);
+      if (_control && c != null) {
+        // One finger drives the other device; two fingers pinch-zoom (handled by
+        // InteractiveViewer). Positions here are in picture coordinates, so zoom
+        // does not change where taps land.
+        img = GestureDetector(
           behavior: HitTestBehavior.opaque,
           onTapUp: (d) {
             final (x, y) = _norm(d.localPosition, size);
@@ -1258,9 +1341,64 @@ class _ScreenViewPageState extends State<ScreenViewPage> {
             decoration: BoxDecoration(border: Border.all(color: online, width: 1.5)),
             child: img,
           ),
-        ),
+        );
+      }
+      return InteractiveViewer(
+        transformationController: _zoom,
+        maxScale: 6,
+        panEnabled: !controlling,
+        child: SizedBox(width: area.maxWidth, height: area.maxHeight, child: Center(child: img)),
       );
     });
+  }
+
+  Widget _toolbar() {
+    final live = _isLive;
+    return Container(
+      color: bg,
+      padding: const EdgeInsets.fromLTRB(4, 0, 4, 6),
+      child: Row(children: [
+        Icon(Icons.circle, size: 10, color: live ? online : off),
+        const SizedBox(width: 6),
+        Expanded(
+          child: Text(
+            _frame == null
+                ? (live ? 'LIVE' : 'Connecting…')
+                : '${live ? 'LIVE' : 'WAITING'} · $_w×$_h · ${_fps.toStringAsFixed(0)} fps',
+            style: TextStyle(color: live ? online : off, fontSize: 12, fontWeight: FontWeight.w600),
+          ),
+        ),
+        PopupMenuButton<ViewQuality>(
+          tooltip: 'Picture quality',
+          initialValue: _quality,
+          onSelected: _setQuality,
+          color: box,
+          itemBuilder: (_) => [
+            for (final q in ViewQuality.values)
+              PopupMenuItem(value: q, child: Text(q.label, style: const TextStyle(color: white))),
+          ],
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+            child: Row(children: [
+              const Icon(Icons.high_quality, color: white, size: 20),
+              const SizedBox(width: 4),
+              Text(_quality.label, style: const TextStyle(color: white, fontSize: 13)),
+            ]),
+          ),
+        ),
+        if (_zoomed)
+          IconButton(
+            tooltip: 'Fit to screen',
+            icon: const Icon(Icons.fit_screen, color: white),
+            onPressed: () => _zoom.value = Matrix4.identity(),
+          ),
+        IconButton(
+          tooltip: 'Fullscreen',
+          icon: const Icon(Icons.fullscreen, color: white),
+          onPressed: () => _setFullscreen(true),
+        ),
+      ]),
+    );
   }
 
   Widget _controlBar() {
@@ -1311,8 +1449,8 @@ class _ScreenViewPageState extends State<ScreenViewPage> {
                 chip('⌫', (c) => c.key('backspace')),
                 chip('Enter', (c) => c.key('enter')),
                 chip('Tab', (c) => c.key('tab')),
-                chip('Esc', (c) => c.key('escape')),
-                chip('Start', (c) => c.key('win')),
+                chip('Esc / Back', (c) => c.key('escape')),
+                chip('Start / Home', (c) => c.key('win')),
                 chip('←', (c) => c.key('left')),
                 chip('↑', (c) => c.key('up')),
                 chip('↓', (c) => c.key('down')),
@@ -1330,24 +1468,67 @@ class _ScreenViewPageState extends State<ScreenViewPage> {
     );
   }
 
+  Widget _body() {
+    if (_error != null) {
+      return Padding(
+        padding: const EdgeInsets.all(24),
+        child: Text(_error!, style: const TextStyle(color: bad), textAlign: TextAlign.center),
+      );
+    }
+    if (_frame == null) {
+      return const Column(mainAxisSize: MainAxisSize.min, children: [
+        CircularProgressIndicator(color: accent),
+        SizedBox(height: 14),
+        Text('Connecting to the screen…', style: TextStyle(color: white)),
+      ]);
+    }
+    return _picture();
+  }
+
   @override
   Widget build(BuildContext context) {
+    if (_fullscreen) {
+      return PopScope(
+        canPop: false,
+        onPopInvokedWithResult: (didPop, _) {
+          if (!didPop) _setFullscreen(false);
+        },
+        child: Scaffold(
+          backgroundColor: Colors.black,
+          body: Stack(children: [
+            Positioned.fill(child: Center(child: _body())),
+            Positioned(
+              top: 8,
+              right: 8,
+              child: Row(children: [
+                _RoundIcon(
+                  icon: _control ? Icons.touch_app : Icons.pan_tool_outlined,
+                  tooltip: _control ? 'Control is on' : 'Control is off',
+                  active: _control,
+                  onTap: (_ctlBusy || _frame == null) ? null : () => _setControl(!_control),
+                ),
+                const SizedBox(width: 8),
+                _RoundIcon(icon: Icons.fullscreen_exit, tooltip: 'Exit fullscreen', onTap: () => _setFullscreen(false)),
+              ]),
+            ),
+          ]),
+        ),
+      );
+    }
     final String status;
     if (_ctlError != null) {
       status = _ctlError!;
     } else if (_control && _live != null) {
-      status = 'Tap = click · Hold = right-click · Drag = drag · screen stays on';
-    } else if (_frame == null) {
-      status = 'Your screen stays on while viewing';
+      status = 'Tap = click · Hold = right-click · Drag = drag · Pinch = zoom';
     } else {
-      status = '$_w×$_h · $_count frames · your screen stays on while viewing';
+      status = 'Pinch to zoom · this phone stays on while viewing';
     }
     return Scaffold(
       backgroundColor: Colors.black,
       appBar: AppBar(
         backgroundColor: bg,
         foregroundColor: white,
-        title: Text('${widget.peer.name} — screen'),
+        title: Text(widget.peer.name),
         actions: [
           Text(_ctlBusy ? 'Connecting…' : 'Control', style: const TextStyle(color: white)),
           Switch(
@@ -1360,18 +1541,8 @@ class _ScreenViewPageState extends State<ScreenViewPage> {
       ),
       body: Column(
         children: [
-          Expanded(
-            child: Center(
-              child: _error != null
-                  ? Padding(
-                      padding: const EdgeInsets.all(24),
-                      child: Text(_error!, style: const TextStyle(color: bad), textAlign: TextAlign.center),
-                    )
-                  : _frame == null
-                      ? const Text('Connecting to the screen…', style: TextStyle(color: white))
-                      : _picture(),
-            ),
-          ),
+          _toolbar(),
+          Expanded(child: Center(child: _body())),
           if (_control) _controlBar(),
           Container(
             width: double.infinity,
@@ -1384,6 +1555,189 @@ class _ScreenViewPageState extends State<ScreenViewPage> {
             ),
           ),
         ],
+      ),
+    );
+  }
+}
+
+/// A small round translucent button used over the picture in fullscreen.
+class _RoundIcon extends StatelessWidget {
+  const _RoundIcon({required this.icon, required this.tooltip, required this.onTap, this.active = false});
+
+  final IconData icon;
+  final String tooltip;
+  final VoidCallback? onTap;
+  final bool active;
+
+  @override
+  Widget build(BuildContext context) {
+    return Tooltip(
+      message: tooltip,
+      child: Material(
+        color: (active ? accent : Colors.black).withValues(alpha: 0.6),
+        shape: const CircleBorder(),
+        child: InkWell(
+          customBorder: const CircleBorder(),
+          onTap: onTap,
+          child: Padding(padding: const EdgeInsets.all(10), child: Icon(icon, color: white, size: 22)),
+        ),
+      ),
+    );
+  }
+}
+
+/// Several screens at once: a live tile for every online paired device.
+class ScreenGridPage extends StatefulWidget {
+  const ScreenGridPage({super.key, required this.node});
+
+  final NexusNode node;
+
+  @override
+  State<ScreenGridPage> createState() => _ScreenGridPageState();
+}
+
+class _ScreenGridPageState extends State<ScreenGridPage> {
+  @override
+  void initState() {
+    super.initState();
+    WakelockPlus.enable();
+  }
+
+  @override
+  void dispose() {
+    WakelockPlus.disable();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: Colors.black,
+      appBar: AppBar(backgroundColor: bg, foregroundColor: white, title: const Text('All screens')),
+      body: ListenableBuilder(
+        listenable: widget.node,
+        builder: (context, _) {
+          final peers = widget.node.paired.where((p) {
+            final k = widget.node.statusOf(p).kind;
+            return k == StatusKind.verified || k == StatusKind.checking;
+          }).toList()
+            ..sort((a, b) => a.name.toLowerCase().compareTo(b.name.toLowerCase()));
+          if (peers.isEmpty) {
+            return const Center(child: Text('No devices are online right now', style: TextStyle(color: white)));
+          }
+          return LayoutBuilder(builder: (context, area) {
+            final columns = (area.maxWidth / 340).floor().clamp(1, 4);
+            return GridView.count(
+              crossAxisCount: columns,
+              padding: const EdgeInsets.all(10),
+              mainAxisSpacing: 10,
+              crossAxisSpacing: 10,
+              childAspectRatio: 16 / 11,
+              children: [for (final p in peers) _LiveTile(key: ValueKey(p.id), node: widget.node, peer: p)],
+            );
+          });
+        },
+      ),
+    );
+  }
+}
+
+/// One small live screen in the grid; tap it to open the full viewer.
+class _LiveTile extends StatefulWidget {
+  const _LiveTile({super.key, required this.node, required this.peer});
+
+  final NexusNode node;
+  final PairedPeer peer;
+
+  @override
+  State<_LiveTile> createState() => _LiveTileState();
+}
+
+class _LiveTileState extends State<_LiveTile> {
+  StreamSubscription<ScreenFrame>? _sub;
+  Uint8List? _frame;
+  String? _error;
+
+  @override
+  void initState() {
+    super.initState();
+    _start();
+  }
+
+  void _start() {
+    _sub?.cancel();
+    _sub = widget.node.screenStream(widget.peer, fps: 5, maxW: 960, quality: 60).listen(
+      (f) {
+        if (mounted) setState(() => _frame = f.jpeg);
+      },
+      onError: (Object e) {
+        if (mounted) setState(() => _error = '$e');
+      },
+      cancelOnError: true,
+    );
+  }
+
+  @override
+  void dispose() {
+    _sub?.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onTap: () async {
+        _sub?.cancel(); // free the connection while the big viewer is open
+        await Navigator.of(context).push(
+          MaterialPageRoute<void>(builder: (_) => ScreenViewPage(node: widget.node, peer: widget.peer)),
+        );
+        if (mounted) {
+          setState(() => _error = null);
+          _start();
+        }
+      },
+      child: Container(
+        decoration: BoxDecoration(
+          color: const Color(0xFF050807),
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: _frame != null ? online : line),
+        ),
+        clipBehavior: Clip.antiAlias,
+        child: Stack(children: [
+          Positioned.fill(
+            child: _frame != null
+                ? Image.memory(_frame!, gaplessPlayback: true, fit: BoxFit.contain)
+                : Center(
+                    child: Padding(
+                      padding: const EdgeInsets.all(12),
+                      child: Text(
+                        _error ?? 'Connecting…',
+                        textAlign: TextAlign.center,
+                        style: TextStyle(color: _error != null ? bad : off, fontSize: 12),
+                      ),
+                    ),
+                  ),
+          ),
+          Positioned(
+            left: 0,
+            right: 0,
+            bottom: 0,
+            child: Container(
+              color: Colors.black.withValues(alpha: 0.55),
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+              child: Row(children: [
+                Icon(Icons.circle, size: 9, color: _frame != null ? online : off),
+                const SizedBox(width: 6),
+                Expanded(
+                  child: Text(widget.peer.name,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(color: white, fontWeight: FontWeight.w700)),
+                ),
+                const Icon(Icons.open_in_full, size: 16, color: white),
+              ]),
+            ),
+          ),
+        ]),
       ),
     );
   }

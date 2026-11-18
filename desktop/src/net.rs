@@ -53,7 +53,7 @@ pub const WOL_PORT: u16 = 9;
 /// File data travels in chunks of this many bytes (sent as hex inside a JSON line).
 const FS_CHUNK: usize = 256 * 1024;
 /// The longest JSON line we accept, raised from 64 KiB so a file chunk fits.
-const MAX_LINE: u64 = 2 * 1024 * 1024;
+const MAX_LINE: u64 = 8 * 1024 * 1024;
 
 /// Remote actions a paired device may ask this one to perform.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -599,6 +599,7 @@ pub fn screen_stream<F, G>(
     addr: SocketAddr,
     fps: u64,
     max_w: u32,
+    quality: u8,
     mut on_frame: F,
     keep_going: G,
 ) -> Result<(), String>
@@ -607,7 +608,7 @@ where
     G: Fn() -> bool,
 {
     let mut c = screen_open(me, peer, addr)?;
-    c.send_val(&serde_json::json!({ "op": "start", "fps": fps, "maxw": max_w }))?;
+    c.send_val(&serde_json::json!({ "op": "start", "fps": fps, "maxw": max_w, "quality": quality }))?;
     while keep_going() {
         let v = c.recv_val()?;
         if let Some(e) = fs_err(&v) {

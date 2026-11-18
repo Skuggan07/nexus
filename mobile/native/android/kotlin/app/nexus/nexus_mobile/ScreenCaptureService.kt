@@ -32,7 +32,7 @@ class ScreenCaptureService : Service() {
     companion object {
         const val CHANNEL = "nexus_screen"
         @Volatile var running = false
-        @Volatile var maxWidth = 1280
+        @Volatile var maxWidth = 1920
         @Volatile private var latest: ByteArray? = null
         @Volatile private var latestW = 0
         @Volatile private var latestH = 0
@@ -111,7 +111,7 @@ class ScreenCaptureService : Service() {
                     full.copyPixelsFromBuffer(plane.buffer)
                     val picture = if (rowPadding != 0) Bitmap.createBitmap(full, 0, 0, w, h) else full
                     val out = ByteArrayOutputStream()
-                    picture.compress(Bitmap.CompressFormat.JPEG, 55, out)
+                    picture.compress(Bitmap.CompressFormat.JPEG, 78, out)
                     if (picture !== full) picture.recycle()
                     full.recycle()
                     latest = out.toByteArray()
