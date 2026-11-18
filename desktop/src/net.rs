@@ -59,6 +59,7 @@ const MAX_LINE: u64 = 8 * 1024 * 1024;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Command {
     Lock,
+    Sleep,
     Restart,
     Shutdown,
 }
@@ -67,6 +68,7 @@ impl Command {
     pub fn wire(self) -> &'static str {
         match self {
             Command::Lock => "lock",
+            Command::Sleep => "sleep",
             Command::Restart => "restart",
             Command::Shutdown => "shutdown",
         }
@@ -74,6 +76,7 @@ impl Command {
     fn parse(s: &str) -> Option<Self> {
         match s {
             "lock" => Some(Command::Lock),
+            "sleep" => Some(Command::Sleep),
             "restart" => Some(Command::Restart),
             "shutdown" => Some(Command::Shutdown),
             _ => None,
@@ -82,6 +85,7 @@ impl Command {
     pub fn label(self) -> &'static str {
         match self {
             Command::Lock => "Lock",
+            Command::Sleep => "Sleep",
             Command::Restart => "Restart",
             Command::Shutdown => "Shut down",
         }
@@ -126,7 +130,7 @@ enum Msg {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         stats_mac: Option<String>,
     },
-    /// "Do this" from a paired device: lock, restart or shut down.
+    /// "Do this" from a paired device: lock, sleep, restart or shut down.
     Command {
         id: String,
         nonce: String,
@@ -840,20 +844,42 @@ fn host_command(
 fn run_action(cmd: Command) -> Result<(), String> {
     use std::process::Command as Proc;
     #[cfg(windows)]
+    if cmd == Command::Sleep {
+        use std::os::windows::process::CommandExt;
+        // .NET turns on the shutdown privilege that sleeping needs, and "Suspend" means
+        // sleep (rundll32 SetSuspendState would hibernate). CREATE_NO_WINDOW hides the console.
+        return Proc::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-WindowStyle",
+                "Hidden",
+                "-Command",
+                "Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.Application]::SetSuspendState('Suspend', $false, $false)",
+            ])
+            .creation_flags(0x0800_0000)
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| e.to_string());
+    }
+    #[cfg(windows)]
     let (program, args): (&str, &[&str]) = match cmd {
         Command::Lock => ("rundll32.exe", &["user32.dll,LockWorkStation"]),
+        Command::Sleep => unreachable!("sleep is handled above"),
         Command::Restart => ("shutdown", &["/r", "/t", "0"]),
         Command::Shutdown => ("shutdown", &["/s", "/t", "0"]),
     };
     #[cfg(target_os = "macos")]
     let (program, args): (&str, &[&str]) = match cmd {
         Command::Lock => ("pmset", &["displaysleepnow"]),
+        Command::Sleep => ("pmset", &["sleepnow"]),
         Command::Restart => ("osascript", &["-e", "tell application \"System Events\" to restart"]),
         Command::Shutdown => ("osascript", &["-e", "tell application \"System Events\" to shut down"]),
     };
     #[cfg(all(unix, not(target_os = "macos")))]
     let (program, args): (&str, &[&str]) = match cmd {
         Command::Lock => ("loginctl", &["lock-session"]),
+        Command::Sleep => ("systemctl", &["suspend"]),
         Command::Restart => ("systemctl", &["reboot"]),
         Command::Shutdown => ("systemctl", &["poweroff"]),
     };

@@ -544,7 +544,7 @@ class NexusNode extends ChangeNotifier {
     return port == null ? null : (a.substring(0, i), port);
   }
 
-  /// Asks a paired computer to lock, restart or shut down.
+  /// Asks a paired computer to lock, sleep, restart or shut down.
   Future<void> sendCommand(PairedPeer p, String action) async {
     final addr = _addressFor(p);
     if (addr == null) {

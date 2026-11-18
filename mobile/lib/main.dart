@@ -518,7 +518,7 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
-  /// Lock / Restart / Shut down (when the computer is online) and Wake (when it's offline).
+  /// Lock / Sleep / Restart / Shut down (when the computer is online) and Wake (when it's offline).
   /// Only shown for computers — a phone can't be controlled this way.
   List<Widget> _powerControls(BuildContext context, PairedPeer p, PeerStatus st) {
     if (!p.controllable) return const [];
@@ -528,6 +528,10 @@ class _HomePageState extends State<HomePage> {
         Row(children: [
           Expanded(child: _SecondaryButton(label: 'Lock', onPressed: () => node.sendCommand(p, 'lock'))),
           const SizedBox(width: 8),
+          Expanded(child: _SecondaryButton(label: 'Sleep', onPressed: () => node.sendCommand(p, 'sleep'))),
+        ]),
+        const SizedBox(height: 8),
+        Row(children: [
           Expanded(child: _SecondaryButton(label: 'Restart', onPressed: () => _confirmPower(context, p, 'restart'))),
           const SizedBox(width: 8),
           Expanded(

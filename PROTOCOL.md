@@ -52,11 +52,11 @@ A `pong` may also carry live stats, signed on their own so older versions can ig
 `stats` (compact JSON `{"cpu":…,"ram":…,"battery":…}`, each a percent or null) and
 `stats_mac: HMAC-SHA256(key=X25519(B, PKa), "nexus-stats-v2" ‖ nonce ‖ stats)`. A trusts the stats only if `stats_mac` checks out.
 
-### Remote command (lock / restart / shut down)
+### Remote command (lock / sleep / restart / shut down)
 
 | Step | Message |
 |---|---|
-| A → B | `command {id: A's id, nonce (16 bytes), action: "lock"\|"restart"\|"shutdown", mac: HMAC-SHA256(key=X25519(A, PKb), "nexus-cmd-v2" ‖ nonce ‖ action ‖ B's id ‖ A's id)}` |
+| A → B | `command {id: A's id, nonce (16 bytes), action: "lock"\|"sleep"\|"restart"\|"shutdown", mac: HMAC-SHA256(key=X25519(A, PKb), "nexus-cmd-v2" ‖ nonce ‖ action ‖ B's id ‖ A's id)}` |
 | B → A | `command_ack {ok, message, mac: HMAC-SHA256(key=X25519(B, PKa), "nexus-cmdack-v2" ‖ nonce ‖ message)}` |
 
 B runs the action only if `mac` is valid and A is a paired device, so only a paired device can trigger it. B replies **before** acting, since restart and shut down end its process. Phones can't run these and reply with `ok:false`.

@@ -2119,7 +2119,7 @@ fn pair_action(n: &Near) -> Action {
     })
 }
 
-/// Lock / Restart / Shut down when the device is online; Wake when it is offline and its MAC is known.
+/// Lock / Sleep / Restart / Shut down when the device is online; Wake when it is offline and its MAC is known.
 fn power_controls(ui: &mut egui::Ui, r: &Row, confirm_cmd: Option<&(String, Command)>, actions: &mut Vec<Action>) {
     // Phones can't be locked/restarted/woken remotely, so only offer this for computers.
     if matches!(r.peer.os.as_str(), "Android" | "iOS") {
@@ -2152,6 +2152,9 @@ fn power_controls(ui: &mut egui::Ui, r: &Row, confirm_cmd: Option<&(String, Comm
         ui.horizontal(|ui| {
             if ui.add(secondary("Lock")).clicked() {
                 actions.push(Action::RunCommand(id.clone(), Command::Lock));
+            }
+            if ui.add(secondary("Sleep")).on_hover_text("Put it to sleep. Wake it again with Wake.").clicked() {
+                actions.push(Action::RunCommand(id.clone(), Command::Sleep));
             }
             if ui.add(secondary("Restart")).clicked() {
                 actions.push(Action::AskCommand(id.clone(), Command::Restart));
