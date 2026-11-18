@@ -435,6 +435,9 @@ class _HomePageState extends State<HomePage> {
       context: context,
       backgroundColor: box,
       showDragHandle: true,
+      // Let the sheet grow taller and scroll, so the bottom buttons can always be reached.
+      isScrollControlled: true,
+      useSafeArea: true,
       builder: (ctx) => ListenableBuilder(
         listenable: node,
         builder: (ctx, _) {
@@ -442,8 +445,8 @@ class _HomePageState extends State<HomePage> {
           final st = node.statusOf(p);
           final (color, text) = _statusLine(st);
           final addr = node.addressOf(p);
-          return Padding(
-            padding: const EdgeInsets.fromLTRB(20, 0, 20, 28),
+          return SingleChildScrollView(
+            padding: EdgeInsets.fromLTRB(20, 0, 20, 28 + MediaQuery.of(ctx).padding.bottom),
             child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
               Text(p.name.toUpperCase(), style: const TextStyle(fontSize: 20, fontWeight: FontWeight.w800)),
               const SizedBox(height: 4),
