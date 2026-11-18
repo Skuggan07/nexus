@@ -110,6 +110,8 @@ pub struct Shared {
     pub log: VecDeque<(Instant, String)>,
     /// Whether paired devices may control this PC's mouse and keyboard.
     pub allow_control: bool,
+    /// This PC's automation rules (see automation.rs).
+    pub automations: Vec<crate::automation::Rule>,
     next_session: u64,
 }
 
@@ -123,6 +125,7 @@ impl Shared {
             pair: None,
             log: VecDeque::new(),
             allow_control: true,
+            automations: Vec::new(),
             next_session: 1,
         }
     }

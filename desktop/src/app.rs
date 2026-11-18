@@ -4,6 +4,7 @@
 //! Look: black background, dark green boxes, teal buttons, dark orange gauges, white text.
 
 use crate::{
+    automation,
     identity::{self, Identity},
     net::{self, Command, Entry, PairTarget},
     state::{lock, PairSession, Phase, Role, SharedState, Status},
@@ -174,6 +175,8 @@ pub struct NexusApp {
     fullscreen_on: bool,
     awake_on: bool,
     monitors: Vec<MonitorView>,
+    auto_open: bool,
+    auto_draft: Option<AutoDraft>,
     updates: update::Shared,
     update_hidden: bool,
     detailed: bool,
@@ -211,6 +214,7 @@ enum Action {
     OpenMonitor(String),
     CloseMonitor(String),
     EndApp(String, String),
+    OpenAutomation,
 }
 
 impl NexusApp {
@@ -237,6 +241,8 @@ impl NexusApp {
             fullscreen_on: false,
             awake_on: false,
             monitors: Vec::new(),
+            auto_open: false,
+            auto_draft: None,
             updates: {
                 let u = update::Shared::default();
                 update::check(&u);
@@ -411,6 +417,10 @@ impl NexusApp {
                 }
             }
             Action::OpenMonitor(id) => self.open_monitor(id),
+            Action::OpenAutomation => {
+                self.auto_open = true;
+                self.details = None;
+            }
             Action::CloseMonitor(id) => {
                 if let Some(i) = self.monitors.iter().position(|m| m.peer_id == id) {
                     let mv = self.monitors.remove(i);
@@ -882,6 +892,9 @@ impl eframe::App for NexusApp {
         for i in 0..self.monitors.len() {
             self.monitor_window(ctx, i, &mut actions);
         }
+        if self.auto_open {
+            self.automation_window(ctx);
+        }
         // Keep this PC's display awake while any screen is being watched.
         if !self.screens.is_empty() {
             crate::screen::keep_display_awake(true);
@@ -986,13 +999,14 @@ impl NexusApp {
                 ui.add_space(14.0);
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(format!("{online} of {} devices online", rows.len())));
-                    if online > 0 {
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.add(secondary("Watch all screens")).clicked() {
-                                actions.push(Action::ViewAllScreens);
-                            }
-                        });
-                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.add(secondary("Automation")).clicked() {
+                            actions.push(Action::OpenAutomation);
+                        }
+                        if online > 0 && ui.add(secondary("Watch all screens")).clicked() {
+                            actions.push(Action::ViewAllScreens);
+                        }
+                    });
                 });
                 if rows.is_empty() {
                     box_frame().show(ui, |ui| {
@@ -1084,7 +1098,14 @@ impl NexusApp {
                     actions.push(Action::ViewAllScreens);
                 }
                 ui.add_space(6.0);
-                ui.label(RichText::new("Coming next: Automation · Clipboard · Other networks").size(12.0));
+                if ui.add(secondary("Automation").min_size(Vec2::new(ui.available_width(), 32.0))).clicked() {
+                    actions.push(Action::OpenAutomation);
+                }
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new("Coming next: Clipboard · Other networks · More monitors · Floating screen")
+                        .size(12.0),
+                );
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
                     ui.label(
                         RichText::new(format!("key {}", identity::fingerprint(&self.me.public_hex())))
@@ -2360,5 +2381,391 @@ fn fmt_ago(secs: u64) -> String {
         0..=59 => format!("{secs:>3}s"),
         60..=3599 => format!("{:>3}m", secs / 60),
         _ => format!("{:>3}h", secs / 3600),
+    }
+}
+
+/* ------------------------------------------------------------------ automation */
+
+const AUTO_ACTIONS: [&str; 7] = ["Lock", "Sleep", "Restart", "Shut down", "Wake", "Open…", "End app"];
+
+/// The automation being created or edited, in an easy-to-edit shape.
+#[derive(Clone)]
+struct AutoDraft {
+    /// Position in the list being edited, or None for a new automation.
+    index: Option<usize>,
+    id: u64,
+    name: String,
+    enabled: bool,
+    /// 0 = at a time, 1 = when idle, 2 = when Nexus starts.
+    trigger: u8,
+    hour: String,
+    minute: String,
+    days: [bool; 7],
+    idle: String,
+    /// Index into AUTO_ACTIONS.
+    action: usize,
+    text: String,
+    target: Option<String>,
+    error: Option<String>,
+}
+
+impl AutoDraft {
+    fn new() -> Self {
+        AutoDraft {
+            index: None,
+            id: 0,
+            name: String::new(),
+            enabled: true,
+            trigger: 0,
+            hour: "23".into(),
+            minute: "00".into(),
+            days: [true, true, true, true, true, false, false],
+            idle: "30".into(),
+            action: 1,
+            text: String::new(),
+            target: None,
+            error: None,
+        }
+    }
+
+    fn from_rule(index: usize, r: &automation::Rule) -> Self {
+        let mut d = AutoDraft::new();
+        d.index = Some(index);
+        d.id = r.id;
+        d.name = r.name.clone();
+        d.enabled = r.enabled;
+        d.target = r.target.clone();
+        match &r.when {
+            automation::When::Time { hour, minute, days } => {
+                d.trigger = 0;
+                d.hour = format!("{hour:02}");
+                d.minute = format!("{minute:02}");
+                d.days = [days.is_empty(); 7];
+                for x in days {
+                    if (*x as usize) < 7 {
+                        d.days[*x as usize] = true;
+                    }
+                }
+            }
+            automation::When::Idle { minutes } => {
+                d.trigger = 1;
+                d.idle = minutes.to_string();
+            }
+            automation::When::Startup => d.trigger = 2,
+        }
+        d.action = match &r.action {
+            automation::Act::Lock => 0,
+            automation::Act::Sleep => 1,
+            automation::Act::Restart => 2,
+            automation::Act::Shutdown => 3,
+            automation::Act::Wake => 4,
+            automation::Act::Open { what } => {
+                d.text = what.clone();
+                5
+            }
+            automation::Act::EndApp { name } => {
+                d.text = name.clone();
+                6
+            }
+        };
+        d
+    }
+
+    fn to_rule(&self) -> Result<automation::Rule, String> {
+        let num = |s: &str, what: &str| s.trim().parse::<u32>().map_err(|_| format!("Write a number for {what}"));
+        let when = match self.trigger {
+            0 => {
+                let hour = num(&self.hour, "the hour")?;
+                let minute = num(&self.minute, "the minutes")?;
+                if hour > 23 || minute > 59 {
+                    return Err("The time must be between 00:00 and 23:59".into());
+                }
+                let days: Vec<u8> = (0..7u8).filter(|i| self.days[*i as usize]).collect();
+                if days.is_empty() {
+                    return Err("Pick at least one day".into());
+                }
+                let days = if days.len() == 7 { Vec::new() } else { days };
+                automation::When::Time { hour: hour as u8, minute: minute as u8, days }
+            }
+            1 => automation::When::Idle { minutes: num(&self.idle, "the minutes")? },
+            _ => automation::When::Startup,
+        };
+        let action = match self.action {
+            0 => automation::Act::Lock,
+            1 => automation::Act::Sleep,
+            2 => automation::Act::Restart,
+            3 => automation::Act::Shutdown,
+            4 => automation::Act::Wake,
+            5 => automation::Act::Open { what: self.text.clone() },
+            _ => automation::Act::EndApp { name: self.text.clone() },
+        };
+        let target = if action.can_target() { self.target.clone() } else { None };
+        Ok(automation::Rule { id: self.id, name: self.name.clone(), enabled: self.enabled, when, action, target })
+    }
+}
+
+/// What the automation window asked for this frame.
+enum AutoOp {
+    Toggle(usize, bool),
+    Delete(usize),
+    Run(usize),
+    Save,
+}
+
+impl NexusApp {
+    /// The "Automation" window: this PC's rules, and the editor for one rule.
+    fn automation_window(&mut self, ctx: &egui::Context) {
+        let (rules, peers) = {
+            let s = lock(&self.shared);
+            (s.automations.clone(), s.paired.clone())
+        };
+        let computers: Vec<PairedPeer> =
+            peers.iter().filter(|p| !matches!(p.os.as_str(), "Android" | "iOS")).cloned().collect();
+        let mut open = true;
+        let mut op: Option<AutoOp> = None;
+        let mut close_editor = false;
+        let mut new_draft: Option<AutoDraft> = None;
+        egui::Window::new(RichText::new("Automation").size(17.0).strong())
+            .id(egui::Id::new("automation"))
+            .open(&mut open)
+            .collapsible(false)
+            .default_size(Vec2::new(620.0, 560.0))
+            .default_pos(Pos2::new(240.0, 50.0))
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                    ui.label(
+                        RichText::new(
+                            "Rules this PC runs by itself, as long as Nexus is open. Results show up under Activity.",
+                        )
+                        .color(OFF),
+                    );
+                    ui.add_space(8.0);
+                    if rules.is_empty() && self.auto_draft.is_none() {
+                        box_frame().show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.label(RichText::new("No automations yet").strong());
+                            ui.label("For example: every weekday at 23:00, put this PC to sleep.");
+                        });
+                    }
+                    for (i, r) in rules.iter().enumerate() {
+                        box_frame().show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.horizontal(|ui| {
+                                let mut on = r.enabled;
+                                if ui.checkbox(&mut on, "").on_hover_text("On / off").changed() {
+                                    op = Some(AutoOp::Toggle(i, on));
+                                }
+                                ui.vertical(|ui| {
+                                    ui.label(RichText::new(r.title(&peers)).strong());
+                                    ui.label(
+                                        RichText::new(format!("{} → {}", r.when.describe(), r.describe_action(&peers)))
+                                            .size(13.0)
+                                            .color(OFF),
+                                    );
+                                });
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    if ui.small_button("Delete").clicked() {
+                                        op = Some(AutoOp::Delete(i));
+                                    }
+                                    if ui.small_button("Edit").clicked() {
+                                        new_draft = Some(AutoDraft::from_rule(i, r));
+                                    }
+                                    if ui.small_button("Run now").clicked() {
+                                        op = Some(AutoOp::Run(i));
+                                    }
+                                });
+                            });
+                        });
+                        ui.add_space(4.0);
+                    }
+                    ui.add_space(6.0);
+                    let Some(d) = self.auto_draft.as_mut() else {
+                        if ui.add(primary("+  New automation")).clicked() {
+                            new_draft = Some(AutoDraft::new());
+                        }
+                        return;
+                    };
+                    box_frame().show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.label(
+                            RichText::new(if d.index.is_some() { "EDIT AUTOMATION" } else { "NEW AUTOMATION" })
+                                .size(14.0)
+                                .strong(),
+                        );
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            ui.label("Name");
+                            ui.add(egui::TextEdit::singleline(&mut d.name).hint_text("Optional").desired_width(260.0));
+                        });
+                        ui.add_space(6.0);
+                        ui.label(RichText::new("WHEN").size(12.0).color(ONLINE));
+                        ui.horizontal_wrapped(|ui| {
+                            for (k, label) in
+                                ["At a time", "When nobody uses this PC", "When Nexus starts"].iter().enumerate()
+                            {
+                                if ui.selectable_label(d.trigger == k as u8, *label).clicked() {
+                                    d.trigger = k as u8;
+                                }
+                            }
+                        });
+                        match d.trigger {
+                            0 => {
+                                ui.horizontal(|ui| {
+                                    ui.label("Time");
+                                    ui.add(egui::TextEdit::singleline(&mut d.hour).desired_width(30.0));
+                                    ui.label(":");
+                                    ui.add(egui::TextEdit::singleline(&mut d.minute).desired_width(30.0));
+                                    ui.label(RichText::new("(24-hour clock)").color(OFF));
+                                });
+                                ui.horizontal_wrapped(|ui| {
+                                    for (k, name) in automation::DAY_NAMES.iter().enumerate() {
+                                        if ui.selectable_label(d.days[k], *name).clicked() {
+                                            d.days[k] = !d.days[k];
+                                        }
+                                    }
+                                    ui.add_space(8.0);
+                                    if ui.small_button("Every day").clicked() {
+                                        d.days = [true; 7];
+                                    }
+                                    if ui.small_button("Weekdays").clicked() {
+                                        d.days = [true, true, true, true, true, false, false];
+                                    }
+                                });
+                            }
+                            1 => {
+                                ui.horizontal(|ui| {
+                                    ui.label("After");
+                                    ui.add(egui::TextEdit::singleline(&mut d.idle).desired_width(50.0));
+                                    ui.label("minutes without mouse or keyboard");
+                                });
+                            }
+                            _ => {
+                                ui.label(RichText::new("Runs once each time Nexus starts.").color(OFF));
+                            }
+                        }
+                        ui.add_space(6.0);
+                        ui.label(RichText::new("DO THIS").size(12.0).color(ONLINE));
+                        ui.horizontal_wrapped(|ui| {
+                            for (k, label) in AUTO_ACTIONS.iter().enumerate() {
+                                if ui.selectable_label(d.action == k, *label).clicked() {
+                                    d.action = k;
+                                }
+                            }
+                        });
+                        match d.action {
+                            0..=4 => {
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label("On");
+                                    if d.action != 4 && ui.selectable_label(d.target.is_none(), "This PC").clicked() {
+                                        d.target = None;
+                                    }
+                                    for p in &computers {
+                                        if ui
+                                            .selectable_label(
+                                                d.target.as_deref() == Some(p.id.as_str()),
+                                                p.name.as_str(),
+                                            )
+                                            .clicked()
+                                        {
+                                            d.target = Some(p.id.clone());
+                                        }
+                                    }
+                                });
+                                if d.action == 4 && computers.is_empty() {
+                                    ui.label(
+                                        RichText::new("Pair another computer first — Wake is for other computers.")
+                                            .color(OFF),
+                                    );
+                                }
+                            }
+                            5 => {
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut d.text)
+                                        .hint_text("A program, file, folder or web address, e.g. notepad or https://…")
+                                        .desired_width(f32::INFINITY),
+                                );
+                            }
+                            _ => {
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut d.text)
+                                        .hint_text("App name as in Apps and monitoring, e.g. chrome.exe")
+                                        .desired_width(f32::INFINITY),
+                                );
+                            }
+                        }
+                        if let Some(e) = &d.error {
+                            ui.add_space(4.0);
+                            ui.colored_label(BAD, e);
+                        }
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            if ui.add(primary("Save")).clicked() {
+                                op = Some(AutoOp::Save);
+                            }
+                            if ui.add(secondary("Cancel")).clicked() {
+                                close_editor = true;
+                            }
+                        });
+                    });
+                });
+            });
+        if let Some(d) = new_draft {
+            self.auto_draft = Some(d);
+        }
+        if close_editor {
+            self.auto_draft = None;
+        }
+        if !open {
+            self.auto_open = false;
+            self.auto_draft = None;
+        }
+        let Some(op) = op else { return };
+        let mut list = rules.clone();
+        match op {
+            AutoOp::Run(i) => {
+                if let Some(r) = rules.get(i) {
+                    automation::run_rule(&self.me, &self.shared, r, " (Run now)");
+                }
+                return;
+            }
+            AutoOp::Toggle(i, on) => {
+                if let Some(r) = list.get_mut(i) {
+                    r.enabled = on;
+                }
+            }
+            AutoOp::Delete(i) => {
+                if i < list.len() {
+                    list.remove(i);
+                }
+                // The open editor may point at a moved entry.
+                self.auto_draft = None;
+            }
+            AutoOp::Save => {
+                let Some(d) = self.auto_draft.as_mut() else { return };
+                let rule = match d.to_rule() {
+                    Ok(r) => r,
+                    Err(e) => {
+                        d.error = Some(e);
+                        return;
+                    }
+                };
+                match d.index {
+                    Some(i) if i < list.len() => list[i] = rule,
+                    _ => list.push(rule),
+                }
+            }
+        }
+        let saving = matches!(self.auto_draft, Some(_));
+        match automation::replace(&self.shared, &self.dir, list) {
+            Ok(_) => {
+                if saving {
+                    self.auto_draft = None;
+                }
+            }
+            Err(e) => match self.auto_draft.as_mut() {
+                Some(d) => d.error = Some(e),
+                None => lock(&self.shared).log(format!("Could not save automations: {e}")),
+            },
+        }
     }
 }

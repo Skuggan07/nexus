@@ -30,7 +30,9 @@ windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",        # screen capture (BitBlt / GetDIBits)
     "Win32_UI_WindowsAndMessaging",  # GetSystemMetrics
-    "Win32_UI_Input_KeyboardAndMouse",  # remote control (SendInput)
+    "Win32_UI_Input_KeyboardAndMouse",  # remote control (SendInput) + idle time
+    "Win32_System_SystemInformation",   # automation: local time and tick count
+    "Win32_UI_Shell",                   # automation: open programs, files and web addresses
 ] }
 
 [profile.release]

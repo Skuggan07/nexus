@@ -2,6 +2,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod app;
+mod automation;
 mod discovery;
 mod identity;
 mod input;
@@ -45,6 +46,7 @@ fn main() -> eframe::Result<()> {
     }
     sysstats::start_sampler();
     net::start_status_checker(me.clone(), shared.clone(), dir.clone());
+    automation::start(me.clone(), shared.clone(), dir.clone());
     state::lock(&shared).log(format!("Nexus started as {} (data in {})", me.name, dir.display()));
     let startup_error = (!problems.is_empty()).then(|| problems.join("\n"));
 

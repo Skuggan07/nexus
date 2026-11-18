@@ -311,7 +311,7 @@ pub fn start_server(me: Arc<Identity>, shared: SharedState, dir: PathBuf, prefer
     Ok(port)
 }
 
-fn handle(stream: TcpStream, me: &Identity, shared: &SharedState, dir: &Path) {
+fn handle(stream: TcpStream, me: &Arc<Identity>, shared: &SharedState, dir: &Path) {
     let Ok(mut c) = Conn::new(stream, Duration::from_secs(15)) else { return };
     match c.recv() {
         Ok(Msg::Ping { id, nonce }) => {
@@ -331,7 +331,7 @@ fn handle(stream: TcpStream, me: &Identity, shared: &SharedState, dir: &Path) {
         }
         Ok(Msg::Command { id, nonce, action, mac: tag }) => host_command(c, me, shared, id, nonce, action, tag),
         Ok(Msg::FsHello { id, nonce }) => fs_serve(c, me, shared, id, nonce),
-        Ok(Msg::ScreenHello { id, nonce }) => screen_serve(c, me, shared, id, nonce),
+        Ok(Msg::ScreenHello { id, nonce }) => screen_serve(c, me, shared, dir, id, nonce),
         Ok(Msg::PairHello { v, id, name, os, public_key }) => {
             host_pair(c, me, shared, dir, v, id, name, os, public_key)
         }
@@ -453,7 +453,7 @@ fn screen_auth_host(
 }
 
 /// Streams the primary display to a paired viewer, frame by frame, until it disconnects.
-fn screen_serve(mut c: Conn, me: &Identity, shared: &SharedState, id: String, nonce_c_hex: String) {
+fn screen_serve(mut c: Conn, me: &Arc<Identity>, shared: &SharedState, dir: &Path, id: String, nonce_c_hex: String) {
     if let Err(e) = screen_auth_host(&mut c, me, shared, &id, &nonce_c_hex) {
         let _ = c.send(&Msg::Error { reason: e });
         return;
@@ -467,6 +467,7 @@ fn screen_serve(mut c: Conn, me: &Identity, shared: &SharedState, id: String, no
     match start.get("op").and_then(|o| o.as_str()) {
         Some("control") => return control_serve(c, shared, &id),
         Some("monitor") => return monitor_serve(c, shared, &id),
+        Some("auto") => return auto_serve(c, me, shared, dir, &id),
         _ => {}
     }
     let fps = start.get("fps").and_then(|x| x.as_u64()).unwrap_or(8).clamp(1, 30);
@@ -498,6 +499,64 @@ fn screen_serve(mut c: Conn, me: &Identity, shared: &SharedState, id: String, no
         }
     }
     lock(shared).log(format!("{who} stopped viewing this screen"));
+}
+
+/// The automation list as sent to a paired device.
+fn auto_listing(shared: &SharedState) -> serde_json::Value {
+    let s = lock(shared);
+    let devices: Vec<serde_json::Value> =
+        s.paired.iter().map(|p| serde_json::json!({ "id": p.id, "name": p.name, "os": p.os })).collect();
+    serde_json::json!({
+        "op": "rules",
+        "rules": s.automations,
+        "devices": devices,
+        "can_edit": s.allow_control,
+    })
+}
+
+/// Lets a paired device read, change and test this PC's automations. Changing or
+/// running them needs "Allow remote control", since a rule can open programs.
+fn auto_serve(mut c: Conn, me: &Arc<Identity>, shared: &SharedState, dir: &Path, id: &str) {
+    let who = peer_name(shared, id);
+    lock(shared).log(format!("{who} opened Automation for this PC"));
+    let locked = serde_json::json!({
+        "error": "Changing automations needs \"Allow remote control\" turned on in this PC's Settings"
+    });
+    while let Ok(v) = c.recv_val() {
+        let op = v.get("op").and_then(|o| o.as_str()).unwrap_or("").to_string();
+        let reply = match op.as_str() {
+            "bye" => break,
+            "list" => auto_listing(shared),
+            "save" | "run" if !lock(shared).allow_control => locked.clone(),
+            "save" => {
+                let parsed: Result<Vec<crate::automation::Rule>, String> =
+                    serde_json::from_value(v.get("rules").cloned().unwrap_or_default())
+                        .map_err(|_| "The automations could not be read".to_string());
+                match parsed.and_then(|rules| crate::automation::replace(shared, dir, rules)) {
+                    Ok(_) => {
+                        lock(shared).log(format!("{who} changed the automations"));
+                        auto_listing(shared)
+                    }
+                    Err(e) => serde_json::json!({ "error": e }),
+                }
+            }
+            "run" => {
+                let rid = v.get("id").and_then(|x| x.as_u64()).unwrap_or(0);
+                let rule = lock(shared).automations.iter().find(|r| r.id == rid).cloned();
+                match rule {
+                    Some(r) => {
+                        crate::automation::run_rule(me, shared, &r, &format!(" (run now by {who})"));
+                        serde_json::json!({ "op": "ran", "id": rid })
+                    }
+                    None => serde_json::json!({ "error": "That automation no longer exists" }),
+                }
+            }
+            _ => continue,
+        };
+        if c.send_val(&reply).is_err() {
+            break;
+        }
+    }
 }
 
 /// Answers "snapshot" and "end" requests from a paired viewer's monitor window.
@@ -841,7 +900,7 @@ fn host_command(
 
 /// Carries out a power command on this computer. Spawns and returns at once so
 /// the reply has already been sent; restart and shutdown then take this app down with them.
-fn run_action(cmd: Command) -> Result<(), String> {
+pub(crate) fn run_action(cmd: Command) -> Result<(), String> {
     use std::process::Command as Proc;
     #[cfg(windows)]
     if cmd == Command::Sleep {

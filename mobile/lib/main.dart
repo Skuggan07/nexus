@@ -502,6 +502,21 @@ class _HomePageState extends State<HomePage> {
                     },
                   ),
                 ),
+                if (p.controllable) ...[
+                  const SizedBox(height: 8),
+                  SizedBox(
+                    width: double.infinity,
+                    child: _SecondaryButton(
+                      label: 'Automation',
+                      onPressed: () {
+                        Navigator.pop(ctx);
+                        Navigator.of(context).push(
+                          MaterialPageRoute<void>(builder: (_) => AutomationPage(node: node, peer: p)),
+                        );
+                      },
+                    ),
+                  ),
+                ],
               ],
               const SizedBox(height: 8),
               _SecondaryButton(
@@ -2283,4 +2298,541 @@ class _Spark extends CustomPainter {
 
   @override
   bool shouldRepaint(_Spark old) => true;
+}
+
+/* ------------------------------------------------------------ automation */
+
+const _dayNames = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+const _actionTypes = ['lock', 'sleep', 'restart', 'shutdown', 'wake', 'open', 'end_app'];
+const _actionLabels = ['Lock', 'Sleep', 'Restart', 'Shut down', 'Wake', 'Open…', 'End app'];
+
+String _two(int n) => n.toString().padLeft(2, '0');
+
+String _daysText(List<int> days) {
+  final d = days.where((x) => x >= 0 && x < 7).toSet().toList()..sort();
+  final k = d.join(',');
+  if (d.isEmpty || k == '0,1,2,3,4,5,6') return 'Every day';
+  if (k == '0,1,2,3,4') return 'Weekdays';
+  if (k == '5,6') return 'Weekends';
+  return d.map((i) => _dayNames[i]).join(', ');
+}
+
+/// "Weekdays at 23:00", "After 30 min idle", "When Nexus starts".
+String _whenText(Map<String, dynamic> when) {
+  switch (when['type']) {
+    case 'time':
+      final days = (when['days'] as List? ?? const []).whereType<num>().map((e) => e.toInt()).toList();
+      return '${_daysText(days)} at ${_two((when['hour'] as num?)?.toInt() ?? 0)}:${_two((when['minute'] as num?)?.toInt() ?? 0)}';
+    case 'idle':
+      return 'After ${when['minutes']} min with nobody using the PC';
+    default:
+      return 'When Nexus starts';
+  }
+}
+
+/// "Put this PC to sleep", "Shut down Gaming PC", "Open https://…".
+String _actionText(Map<String, dynamic> rule, String pcName, List<Map<String, dynamic>> devices) {
+  final action = (rule['action'] as Map?)?.cast<String, dynamic>() ?? const {};
+  final tid = rule['target'] as String?;
+  var target = pcName;
+  if (tid != null) {
+    target = 'a removed device';
+    for (final d in devices) {
+      if (d['id'] == tid) target = '${d['name']}';
+    }
+  }
+  switch (action['type']) {
+    case 'lock':
+      return 'Lock $target';
+    case 'sleep':
+      return 'Put $target to sleep';
+    case 'restart':
+      return 'Restart $target';
+    case 'shutdown':
+      return 'Shut down $target';
+    case 'wake':
+      return 'Wake $target';
+    case 'open':
+      return 'Open ${action['what']}';
+    case 'end_app':
+      return 'End ${action['name']}';
+    default:
+      return '${action['type']}';
+  }
+}
+
+/// A computer's automations: rules it runs by itself (at a time, when idle, or when
+/// Nexus starts). They live on the PC, so they keep working when the phone is away.
+class AutomationPage extends StatefulWidget {
+  const AutomationPage({super.key, required this.node, required this.peer});
+
+  final NexusNode node;
+  final PairedPeer peer;
+
+  @override
+  State<AutomationPage> createState() => _AutomationPageState();
+}
+
+class _AutomationPageState extends State<AutomationPage> {
+  AutoLink? _link;
+  List<Map<String, dynamic>> _rules = [];
+  List<Map<String, dynamic>> _devices = [];
+  bool _canEdit = false;
+  bool _loaded = false;
+  String? _error;
+
+  @override
+  void initState() {
+    super.initState();
+    _connect();
+  }
+
+  @override
+  void dispose() {
+    _link?.close();
+    super.dispose();
+  }
+
+  Future<void> _connect() async {
+    try {
+      final link = await widget.node.autoOpen(widget.peer);
+      if (!mounted) {
+        link.close();
+        return;
+      }
+      _link = link;
+      _apply(await link.list());
+    } catch (e) {
+      if (mounted) setState(() => _error = '$e');
+    }
+  }
+
+  void _apply(Map<String, dynamic> v) {
+    if (!mounted) return;
+    setState(() {
+      _rules = (v['rules'] as List? ?? const []).whereType<Map>().map((m) => m.cast<String, dynamic>()).toList();
+      _devices = (v['devices'] as List? ?? const []).whereType<Map>().map((m) => m.cast<String, dynamic>()).toList();
+      _canEdit = v['can_edit'] == true;
+      _loaded = true;
+      _error = null;
+    });
+  }
+
+  /// Sends a new list to the PC. Returns a problem to show, or null when saved.
+  Future<String?> _save(List<Map<String, dynamic>> rules) async {
+    final link = _link;
+    if (link == null) return 'Not connected';
+    try {
+      _apply(await link.save(rules));
+      return null;
+    } catch (e) {
+      return '$e';
+    }
+  }
+
+  void _say(String text) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(text)));
+  }
+
+  Future<void> _edit(int? index) async {
+    final start = index == null ? null : _rules[index];
+    await Navigator.of(context).push(MaterialPageRoute<void>(
+      builder: (_) => AutomationEditor(
+        pcName: widget.peer.name,
+        devices: _devices,
+        rule: start,
+        onSave: (rule) {
+          final list = List<Map<String, dynamic>>.of(_rules);
+          if (index == null) {
+            list.add(rule);
+          } else {
+            list[index] = rule;
+          }
+          return _save(list);
+        },
+      ),
+    ));
+  }
+
+  Future<void> _toggle(int i, bool on) async {
+    final list = _rules.map((r) => Map<String, dynamic>.of(r)).toList();
+    list[i]['enabled'] = on;
+    final err = await _save(list);
+    if (err != null) _say(err);
+  }
+
+  Future<void> _delete(int i) async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: box,
+        title: const Text('Delete this automation?'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+          FilledButton(
+            style: FilledButton.styleFrom(backgroundColor: const Color(0xFFB4413A)),
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Delete'),
+          ),
+        ],
+      ),
+    );
+    if (ok != true) return;
+    final list = List<Map<String, dynamic>>.of(_rules)..removeAt(i);
+    final err = await _save(list);
+    if (err != null) _say(err);
+  }
+
+  Future<void> _run(int i) async {
+    final link = _link;
+    if (link == null) return;
+    try {
+      await link.run((_rules[i]['id'] as num?)?.toInt() ?? 0);
+      _say('Started — see Activity on the PC for the result');
+    } catch (e) {
+      _say('$e');
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final children = <Widget>[];
+    if (_error != null) {
+      children.add(Padding(
+        padding: const EdgeInsets.only(bottom: 10),
+        child: Text(_error!, style: const TextStyle(color: bad)),
+      ));
+    } else if (!_loaded) {
+      children.add(const Padding(
+        padding: EdgeInsets.all(40),
+        child: Center(child: CircularProgressIndicator(color: accent)),
+      ));
+    } else {
+      children.add(Text(
+        'Rules ${widget.peer.name} runs by itself, as long as Nexus is open on it.',
+        style: const TextStyle(color: off),
+      ));
+      if (!_canEdit) {
+        children.add(const Padding(
+          padding: EdgeInsets.only(top: 8),
+          child: Text('To change automations, turn on "Allow remote control" in that PC\'s Settings.',
+              style: TextStyle(color: bad, fontSize: 13)),
+        ));
+      }
+      children.add(const SizedBox(height: 12));
+      if (_rules.isEmpty) {
+        children.add(const _Box(
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Text('No automations yet', style: TextStyle(fontWeight: FontWeight.w700)),
+            SizedBox(height: 4),
+            Text('For example: every weekday at 23:00, put the PC to sleep.', style: TextStyle(color: off)),
+          ]),
+        ));
+      }
+      for (var i = 0; i < _rules.length; i++) {
+        final r = _rules[i];
+        final when = (r['when'] as Map?)?.cast<String, dynamic>() ?? const <String, dynamic>{};
+        final action = _actionText(r, 'this PC', _devices);
+        final name = '${r['name'] ?? ''}'.trim();
+        children.add(Padding(
+          padding: const EdgeInsets.only(bottom: 8),
+          child: _Box(
+            padding: const EdgeInsets.fromLTRB(14, 10, 6, 6),
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Row(children: [
+                Expanded(
+                  child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                    Text(name.isEmpty ? action : name, style: const TextStyle(fontWeight: FontWeight.w700)),
+                    const SizedBox(height: 2),
+                    Text('${_whenText(when)} → $action', style: const TextStyle(color: off, fontSize: 12)),
+                  ]),
+                ),
+                Switch(
+                  value: r['enabled'] != false,
+                  activeColor: online,
+                  onChanged: _canEdit ? (on) => _toggle(i, on) : null,
+                ),
+              ]),
+              if (_canEdit)
+                Row(mainAxisAlignment: MainAxisAlignment.end, children: [
+                  TextButton(onPressed: () => _run(i), child: const Text('Run now', style: TextStyle(color: online))),
+                  TextButton(onPressed: () => _edit(i), child: const Text('Edit', style: TextStyle(color: white))),
+                  TextButton(onPressed: () => _delete(i), child: const Text('Delete', style: TextStyle(color: bad))),
+                ]),
+            ]),
+          ),
+        ));
+      }
+    }
+    return Scaffold(
+      backgroundColor: bg,
+      appBar: AppBar(backgroundColor: bg, foregroundColor: white, title: Text('${widget.peer.name} — automation')),
+      floatingActionButton: _loaded && _canEdit
+          ? FloatingActionButton.extended(
+              backgroundColor: accent,
+              foregroundColor: white,
+              onPressed: () => _edit(null),
+              icon: const Icon(Icons.add),
+              label: const Text('New automation'),
+            )
+          : null,
+      body: ListView(padding: const EdgeInsets.fromLTRB(14, 14, 14, 90), children: children),
+    );
+  }
+}
+
+/// Creates or changes one automation. Saving sends the whole list to the PC, which
+/// checks it; any problem it reports is shown here so nothing typed is lost.
+class AutomationEditor extends StatefulWidget {
+  const AutomationEditor({
+    super.key,
+    required this.pcName,
+    required this.devices,
+    required this.rule,
+    required this.onSave,
+  });
+
+  final String pcName;
+  final List<Map<String, dynamic>> devices;
+  final Map<String, dynamic>? rule;
+  final Future<String?> Function(Map<String, dynamic> rule) onSave;
+
+  @override
+  State<AutomationEditor> createState() => _AutomationEditorState();
+}
+
+class _AutomationEditorState extends State<AutomationEditor> {
+  final _name = TextEditingController();
+  final _idle = TextEditingController(text: '30');
+  final _text = TextEditingController();
+  String _trigger = 'time';
+  TimeOfDay _time = const TimeOfDay(hour: 23, minute: 0);
+  final _days = List<bool>.of([true, true, true, true, true, false, false]);
+  String _action = 'sleep';
+  String? _target;
+  bool _enabled = true;
+  bool _saving = false;
+  String? _error;
+
+  @override
+  void initState() {
+    super.initState();
+    final r = widget.rule;
+    if (r == null) return;
+    _name.text = '${r['name'] ?? ''}';
+    _enabled = r['enabled'] != false;
+    _target = r['target'] as String?;
+    final when = (r['when'] as Map?)?.cast<String, dynamic>() ?? const <String, dynamic>{};
+    _trigger = '${when['type'] ?? 'time'}';
+    if (_trigger == 'time') {
+      _time = TimeOfDay(hour: (when['hour'] as num?)?.toInt() ?? 23, minute: (when['minute'] as num?)?.toInt() ?? 0);
+      final days = (when['days'] as List? ?? const []).whereType<num>().map((e) => e.toInt()).toList();
+      for (var i = 0; i < 7; i++) {
+        _days[i] = days.isEmpty || days.contains(i);
+      }
+    } else if (_trigger == 'idle') {
+      _idle.text = '${when['minutes'] ?? 30}';
+    }
+    final action = (r['action'] as Map?)?.cast<String, dynamic>() ?? const <String, dynamic>{};
+    _action = '${action['type'] ?? 'sleep'}';
+    if (_action == 'open') _text.text = '${action['what'] ?? ''}';
+    if (_action == 'end_app') _text.text = '${action['name'] ?? ''}';
+  }
+
+  @override
+  void dispose() {
+    _name.dispose();
+    _idle.dispose();
+    _text.dispose();
+    super.dispose();
+  }
+
+  bool get _targets => const ['lock', 'sleep', 'restart', 'shutdown', 'wake'].contains(_action);
+
+  List<Map<String, dynamic>> get _computers =>
+      widget.devices.where((d) => d['os'] != 'Android' && d['os'] != 'iOS').toList();
+
+  Future<void> _pickTime() async {
+    final t = await showTimePicker(
+      context: context,
+      initialTime: _time,
+      builder: (ctx, child) => MediaQuery(
+        data: MediaQuery.of(ctx).copyWith(alwaysUse24HourFormat: true),
+        child: child ?? const SizedBox(),
+      ),
+    );
+    if (t != null) setState(() => _time = t);
+  }
+
+  Future<void> _submit() async {
+    Map<String, dynamic> when;
+    if (_trigger == 'time') {
+      final days = [for (var i = 0; i < 7; i++) if (_days[i]) i];
+      if (days.isEmpty) {
+        setState(() => _error = 'Pick at least one day');
+        return;
+      }
+      when = {'type': 'time', 'hour': _time.hour, 'minute': _time.minute, 'days': days.length == 7 ? <int>[] : days};
+    } else if (_trigger == 'idle') {
+      final m = int.tryParse(_idle.text.trim());
+      if (m == null || m < 1) {
+        setState(() => _error = 'Write how many minutes');
+        return;
+      }
+      when = {'type': 'idle', 'minutes': m};
+    } else {
+      when = {'type': 'startup'};
+    }
+    final Map<String, dynamic> action = switch (_action) {
+      'open' => {'type': 'open', 'what': _text.text.trim()},
+      'end_app' => {'type': 'end_app', 'name': _text.text.trim()},
+      _ => {'type': _action},
+    };
+    final rule = <String, dynamic>{
+      'id': (widget.rule?['id'] as num?)?.toInt() ?? 0,
+      'name': _name.text.trim(),
+      'enabled': _enabled,
+      'when': when,
+      'action': action,
+      'target': _targets ? _target : null,
+    };
+    setState(() {
+      _saving = true;
+      _error = null;
+    });
+    final err = await widget.onSave(rule);
+    if (!mounted) return;
+    if (err == null) {
+      Navigator.pop(context);
+    } else {
+      setState(() {
+        _saving = false;
+        _error = err;
+      });
+    }
+  }
+
+  Widget _label(String t) => Padding(
+        padding: const EdgeInsets.only(top: 16, bottom: 6),
+        child: Text(t,
+            style: const TextStyle(color: online, fontSize: 11, letterSpacing: 1.5, fontWeight: FontWeight.w700)),
+      );
+
+  InputDecoration _field(String hint) => InputDecoration(
+        hintText: hint,
+        hintStyle: const TextStyle(color: off),
+        filled: true,
+        fillColor: box,
+        isDense: true,
+        border: OutlineInputBorder(borderRadius: BorderRadius.circular(10), borderSide: BorderSide.none),
+      );
+
+  @override
+  Widget build(BuildContext context) {
+    final computers = _computers;
+    return Scaffold(
+      backgroundColor: bg,
+      appBar: AppBar(
+        backgroundColor: bg,
+        foregroundColor: white,
+        title: Text(widget.rule == null ? 'New automation' : 'Edit automation'),
+      ),
+      body: ListView(padding: const EdgeInsets.all(16), children: [
+        TextField(controller: _name, style: const TextStyle(color: white), decoration: _field('Name (optional)')),
+        _label('WHEN'),
+        Wrap(spacing: 8, runSpacing: 8, children: [
+          for (final (k, label) in const [('time', 'At a time'), ('idle', 'When nobody uses the PC'), ('startup', 'When Nexus starts')])
+            ChoiceChip(label: Text(label), selected: _trigger == k, onSelected: (_) => setState(() => _trigger = k)),
+        ]),
+        const SizedBox(height: 10),
+        if (_trigger == 'time') ...[
+          _SecondaryButton(label: 'Time: ${_two(_time.hour)}:${_two(_time.minute)}', onPressed: _pickTime),
+          const SizedBox(height: 10),
+          Wrap(spacing: 6, runSpacing: 6, children: [
+            for (var i = 0; i < 7; i++)
+              FilterChip(
+                label: Text(_dayNames[i]),
+                selected: _days[i],
+                onSelected: (on) => setState(() => _days[i] = on),
+              ),
+          ]),
+        ],
+        if (_trigger == 'idle')
+          Row(children: [
+            const Text('After '),
+            SizedBox(
+              width: 80,
+              child: TextField(
+                controller: _idle,
+                keyboardType: TextInputType.number,
+                style: const TextStyle(color: white),
+                decoration: _field('30'),
+              ),
+            ),
+            const Expanded(child: Text(' minutes without mouse or keyboard')),
+          ]),
+        if (_trigger == 'startup')
+          const Text('Runs once each time Nexus starts on the PC.', style: TextStyle(color: off)),
+        _label('DO THIS'),
+        Wrap(spacing: 8, runSpacing: 8, children: [
+          for (var i = 0; i < _actionTypes.length; i++)
+            ChoiceChip(
+              label: Text(_actionLabels[i]),
+              selected: _action == _actionTypes[i],
+              onSelected: (_) => setState(() {
+                _action = _actionTypes[i];
+                if (_action == 'wake' && _target == null && computers.isNotEmpty) _target = '${computers.first['id']}';
+              }),
+            ),
+        ]),
+        if (_targets) ...[
+          _label('ON'),
+          Wrap(spacing: 8, runSpacing: 8, children: [
+            if (_action != 'wake')
+              ChoiceChip(
+                label: Text('${widget.pcName} (this PC)'),
+                selected: _target == null,
+                onSelected: (_) => setState(() => _target = null),
+              ),
+            for (final d in computers)
+              ChoiceChip(
+                label: Text('${d['name']}'),
+                selected: _target == d['id'],
+                onSelected: (_) => setState(() => _target = '${d['id']}'),
+              ),
+          ]),
+          if (_action == 'wake' && computers.isEmpty)
+            const Padding(
+              padding: EdgeInsets.only(top: 6),
+              child: Text('Wake is for other computers paired with this PC.', style: TextStyle(color: off)),
+            ),
+        ],
+        if (_action == 'open' || _action == 'end_app') ...[
+          const SizedBox(height: 10),
+          TextField(
+            controller: _text,
+            style: const TextStyle(color: white),
+            decoration: _field(_action == 'open'
+                ? 'A program, file, folder or web address, e.g. notepad or https://…'
+                : 'App name as in Apps and monitoring, e.g. chrome.exe'),
+          ),
+        ],
+        if (_error != null)
+          Padding(
+            padding: const EdgeInsets.only(top: 14),
+            child: Text(_error!, style: const TextStyle(color: bad)),
+          ),
+        const SizedBox(height: 20),
+        SizedBox(
+          height: 48,
+          child: FilledButton(
+            style: FilledButton.styleFrom(backgroundColor: accent, foregroundColor: white),
+            onPressed: _saving ? null : _submit,
+            child: Text(_saving ? 'Saving…' : 'Save'),
+          ),
+        ),
+      ]),
+    );
+  }
 }

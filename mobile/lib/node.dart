@@ -195,6 +195,51 @@ class MonitorLink {
   }
 }
 
+/// An open link to a computer's automations. Requests are answered one at a time.
+class AutoLink {
+  AutoLink._(this._c);
+
+  final Conn _c;
+  Future<void> _queue = Future.value();
+  bool _closed = false;
+
+  Future<Map<String, dynamic>> _ask(Map<String, Object?> m) {
+    final r = _queue.then((_) async {
+      if (_closed) throw NexusError('Automation was closed');
+      _c.send(m);
+      final v = await _c.recv(const Duration(seconds: 15));
+      if (v['error'] != null) throw NexusError('${v['error']}');
+      return v;
+    });
+    _queue = r.then((_) {}, onError: (_) {});
+    return r;
+  }
+
+  /// The computer's rules, its paired devices and whether they may be changed.
+  Future<Map<String, dynamic>> list() async {
+    final v = await _ask({'op': 'list'});
+    if (v['op'] != 'rules') {
+      // An older Nexus on the PC doesn't know about automations.
+      _closed = true;
+      _c.close();
+      throw NexusError('Update Nexus on that PC (build 18 or newer) to use Automation');
+    }
+    return v;
+  }
+
+  Future<Map<String, dynamic>> save(List<Map<String, dynamic>> rules) => _ask({'op': 'save', 'rules': rules});
+  Future<Map<String, dynamic>> run(int id) => _ask({'op': 'run', 'id': id});
+
+  void close() {
+    if (_closed) return;
+    _closed = true;
+    try {
+      _c.send({'op': 'bye'});
+    } catch (_) {}
+    _c.close();
+  }
+}
+
 /// One decoded screen frame: its source size and the JPEG bytes.
 class ScreenFrame {
   ScreenFrame(this.w, this.h, this.jpeg);
@@ -701,6 +746,13 @@ class NexusNode extends ChangeNotifier {
     return MonitorLink._(c);
   }
 
+  /// Opens a link to a paired computer's automations.
+  Future<AutoLink> autoOpen(PairedPeer p) async {
+    final c = await _screenOpen(p);
+    c.send({'op': 'auto'});
+    return AutoLink._(c);
+  }
+
   /// Lists a folder on a paired device.
   Future<List<FsEntry>> fsList(PairedPeer p, String path) async {
     final c = await _fsOpen(p);
@@ -1029,6 +1081,9 @@ class NexusNode extends ChangeNotifier {
       await _controlServe(c, peer.name);
     } else if (first['op'] == 'monitor') {
       await _monitorServe(c, peer.name);
+    } else if (first['op'] == 'auto') {
+      c.send({'error': 'Automations run on computers, not on phones'});
+      c.close();
     } else {
       await _streamServe(c, first, peer.name);
     }
