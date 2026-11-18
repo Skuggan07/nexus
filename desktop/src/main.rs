@@ -4,6 +4,7 @@
 mod app;
 mod discovery;
 mod identity;
+mod input;
 mod net;
 mod screen;
 mod state;
@@ -24,6 +25,7 @@ fn main() -> eframe::Result<()> {
         }
     };
     let shared = Arc::new(Mutex::new(state::Shared::new(store::load_peers(&dir))));
+    state::lock(&shared).allow_control = store::load_allow_control(&dir);
 
     let preferred = std::env::var("NEXUS_TCP_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(net::DEFAULT_TCP_PORT);
     let mut problems = Vec::new();

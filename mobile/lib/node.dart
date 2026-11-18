@@ -121,6 +121,46 @@ class FsEntry {
   }
 }
 
+/// An open remote-control link. Positions are fractions (0..1) of the shared screen.
+class ScreenControl {
+  ScreenControl._(this._c) {
+    _ping = Timer.periodic(const Duration(seconds: 4), (_) => send({'op': 'ping'}));
+  }
+
+  final Conn _c;
+  late final Timer _ping;
+  bool _closed = false;
+
+  bool get isOpen => !_closed;
+
+  void send(Map<String, Object?> m) {
+    if (_closed) return;
+    try {
+      _c.send(m);
+    } catch (_) {
+      close();
+    }
+  }
+
+  void move(double x, double y) => send({'op': 'move', 'x': x, 'y': y});
+  void button(String b, bool down, [double? x, double? y]) =>
+      send({'op': 'button', 'b': b, 'down': down, if (x != null) 'x': x, if (y != null) 'y': y});
+  void click(String b, double x, double y) => send({'op': 'click', 'b': b, 'x': x, 'y': y});
+  void scroll(int dy) => send({'op': 'scroll', 'dy': dy});
+  void text(String s) => send({'op': 'text', 's': s});
+  void key(String k, [List<String> mods = const []]) => send({'op': 'key', 'k': k, 'mods': mods});
+
+  void close() {
+    if (_closed) return;
+    try {
+      _c.send({'op': 'bye'});
+    } catch (_) {}
+    _closed = true;
+    _ping.cancel();
+    _c.close();
+  }
+}
+
 /// One decoded screen frame: its source size and the JPEG bytes.
 class ScreenFrame {
   ScreenFrame(this.w, this.h, this.jpeg);
@@ -602,6 +642,21 @@ class NexusNode extends ChangeNotifier {
         c.send({'op': 'bye'});
       } catch (_) {}
       c.close();
+    }
+  }
+
+  /// Opens a remote-control link to a paired device: mouse and keyboard events
+  /// sent on it are carried out there. Fails if that device has control turned off.
+  Future<ScreenControl> screenControl(PairedPeer p) async {
+    final c = await _screenOpen(p);
+    try {
+      c.send({'op': 'control'});
+      final r = await c.recv(const Duration(seconds: 8));
+      if (r['error'] != null) throw NexusError('${r['error']}');
+      return ScreenControl._(c);
+    } catch (e) {
+      c.close();
+      rethrow;
     }
   }
 

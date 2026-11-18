@@ -58,5 +58,29 @@ pub fn load_detailed(dir: &Path) -> bool {
 }
 
 pub fn save_detailed(dir: &Path, detailed: bool) {
-    let _ = fs::write(dir.join("prefs.json"), serde_json::json!({ "detailed": detailed }).to_string());
+    save_pref(dir, "detailed", serde_json::Value::Bool(detailed));
+}
+
+/// Whether paired devices may move the mouse and type on this PC (on unless turned off).
+pub fn load_allow_control(dir: &Path) -> bool {
+    load_prefs(dir).get("allow_control").and_then(|d| d.as_bool()).unwrap_or(true)
+}
+
+pub fn save_allow_control(dir: &Path, on: bool) {
+    save_pref(dir, "allow_control", serde_json::Value::Bool(on));
+}
+
+fn load_prefs(dir: &Path) -> serde_json::Value {
+    fs::read_to_string(dir.join("prefs.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .filter(|v| v.is_object())
+        .unwrap_or_else(|| serde_json::json!({}))
+}
+
+/// Updates one preference, keeping the others.
+fn save_pref(dir: &Path, key: &str, value: serde_json::Value) {
+    let mut prefs = load_prefs(dir);
+    prefs[key] = value;
+    let _ = fs::write(dir.join("prefs.json"), prefs.to_string());
 }

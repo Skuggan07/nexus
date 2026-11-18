@@ -108,6 +108,8 @@ pub struct Shared {
     pub window: Option<PairWindow>,
     pub pair: Option<PairSession>,
     pub log: VecDeque<(Instant, String)>,
+    /// Whether paired devices may control this PC's mouse and keyboard.
+    pub allow_control: bool,
     next_session: u64,
 }
 
@@ -120,6 +122,7 @@ impl Shared {
             window: None,
             pair: None,
             log: VecDeque::new(),
+            allow_control: true,
             next_session: 1,
         }
     }

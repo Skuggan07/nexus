@@ -1108,6 +1108,18 @@ class _ScreenViewPageState extends State<ScreenViewPage> {
   int _w = 0, _h = 0, _count = 0;
   String? _error;
 
+  // Remote control.
+  bool _control = false;
+  bool _ctlBusy = false;
+  bool _dragging = false;
+  ScreenControl? _ctl;
+  String? _ctlError;
+  final _typed = TextEditingController();
+  final _typeFocus = FocusNode();
+  String _sent = '';
+
+  ScreenControl? get _live => (_ctl?.isOpen ?? false) ? _ctl : null;
+
   @override
   void initState() {
     super.initState();
@@ -1134,18 +1146,213 @@ class _ScreenViewPageState extends State<ScreenViewPage> {
   @override
   void dispose() {
     _sub?.cancel();
+    _ctl?.close();
+    _typed.dispose();
+    _typeFocus.dispose();
     WakelockPlus.disable();
     super.dispose();
   }
 
+  Future<void> _setControl(bool on) async {
+    setState(() {
+      _control = on;
+      _ctlError = null;
+    });
+    if (!on || _live != null || _ctlBusy) return;
+    setState(() => _ctlBusy = true);
+    try {
+      final c = await widget.node.screenControl(widget.peer);
+      if (!mounted) {
+        c.close();
+        return;
+      }
+      setState(() => _ctl = c);
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _ctlError = '$e';
+          _control = false;
+        });
+      }
+    } finally {
+      if (mounted) setState(() => _ctlBusy = false);
+    }
+  }
+
+  (double, double) _norm(Offset p, Size s) =>
+      ((p.dx / s.width).clamp(0.0, 1.0).toDouble(), (p.dy / s.height).clamp(0.0, 1.0).toDouble());
+
+  /// Live typing: sends what was added to the field, or backspaces for what was removed.
+  void _onTyped(String v) {
+    final c = _live;
+    if (c != null) {
+      var same = 0;
+      while (same < v.length && same < _sent.length && v.codeUnitAt(same) == _sent.codeUnitAt(same)) {
+        same++;
+      }
+      for (var i = 0; i < _sent.length - same; i++) {
+        c.key('backspace');
+      }
+      final added = v.substring(same);
+      if (added.isNotEmpty) c.text(added);
+    }
+    _sent = v;
+  }
+
+  void _onSubmit(String _) {
+    _live?.key('enter');
+    _typed.clear();
+    _sent = '';
+    _typeFocus.requestFocus();
+  }
+
+  Widget _picture() {
+    final picture = Image.memory(_frame!, gaplessPlayback: true, filterQuality: FilterQuality.medium, fit: BoxFit.fill);
+    return LayoutBuilder(builder: (ctx, box) {
+      final aspect = (_w > 0 && _h > 0) ? _w / _h : 16 / 9;
+      var dw = box.maxWidth, dh = dw / aspect;
+      if (dh > box.maxHeight) {
+        dh = box.maxHeight;
+        dw = dh * aspect;
+      }
+      final size = Size(dw, dh);
+      final img = SizedBox(width: dw, height: dh, child: picture);
+      final c = _live;
+      if (!_control || c == null) {
+        return InteractiveViewer(maxScale: 5, child: Center(child: img));
+      }
+      return Center(
+        child: GestureDetector(
+          behavior: HitTestBehavior.opaque,
+          onTapUp: (d) {
+            final (x, y) = _norm(d.localPosition, size);
+            c.click('left', x, y);
+          },
+          onLongPressStart: (d) {
+            final (x, y) = _norm(d.localPosition, size);
+            c.click('right', x, y);
+          },
+          onPanStart: (d) {
+            final (x, y) = _norm(d.localPosition, size);
+            _dragging = true;
+            c.button('left', true, x, y);
+          },
+          onPanUpdate: (d) {
+            final (x, y) = _norm(d.localPosition, size);
+            c.move(x, y);
+          },
+          onPanEnd: (_) {
+            if (_dragging) c.button('left', false);
+            _dragging = false;
+          },
+          onPanCancel: () {
+            if (_dragging) c.button('left', false);
+            _dragging = false;
+          },
+          child: DecoratedBox(
+            position: DecorationPosition.foreground,
+            decoration: BoxDecoration(border: Border.all(color: online, width: 1.5)),
+            child: img,
+          ),
+        ),
+      );
+    });
+  }
+
+  Widget _controlBar() {
+    final c = _live;
+    Widget chip(String label, void Function(ScreenControl) act) => Padding(
+          padding: const EdgeInsets.only(right: 6),
+          child: OutlinedButton(
+            style: OutlinedButton.styleFrom(
+              foregroundColor: white,
+              side: const BorderSide(color: line),
+              padding: const EdgeInsets.symmetric(horizontal: 12),
+              minimumSize: const Size(44, 40),
+            ),
+            onPressed: c == null ? null : () => act(c),
+            child: Text(label),
+          ),
+        );
+    return Container(
+      color: bg,
+      padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          TextField(
+            controller: _typed,
+            focusNode: _typeFocus,
+            enabled: c != null,
+            autocorrect: false,
+            enableSuggestions: false,
+            style: const TextStyle(color: white),
+            textInputAction: TextInputAction.send,
+            onChanged: _onTyped,
+            onSubmitted: _onSubmit,
+            decoration: InputDecoration(
+              isDense: true,
+              hintText: 'Type here — it appears on the other screen',
+              hintStyle: const TextStyle(color: off),
+              filled: true,
+              fillColor: box,
+              border: OutlineInputBorder(borderRadius: BorderRadius.circular(10), borderSide: BorderSide.none),
+            ),
+          ),
+          const SizedBox(height: 8),
+          SingleChildScrollView(
+            scrollDirection: Axis.horizontal,
+            child: Row(
+              children: [
+                chip('⌫', (c) => c.key('backspace')),
+                chip('Enter', (c) => c.key('enter')),
+                chip('Tab', (c) => c.key('tab')),
+                chip('Esc', (c) => c.key('escape')),
+                chip('Start', (c) => c.key('win')),
+                chip('←', (c) => c.key('left')),
+                chip('↑', (c) => c.key('up')),
+                chip('↓', (c) => c.key('down')),
+                chip('→', (c) => c.key('right')),
+                chip('Scroll ▲', (c) => c.scroll(3)),
+                chip('Scroll ▼', (c) => c.scroll(-3)),
+                chip('Alt+Tab', (c) => c.key('tab', ['alt'])),
+                chip('Ctrl+C', (c) => c.key('c', ['ctrl'])),
+                chip('Ctrl+V', (c) => c.key('v', ['ctrl'])),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
+    final String status;
+    if (_ctlError != null) {
+      status = _ctlError!;
+    } else if (_control && _live != null) {
+      status = 'Tap = click · Hold = right-click · Drag = drag · screen stays on';
+    } else if (_frame == null) {
+      status = 'Your screen stays on while viewing';
+    } else {
+      status = '$_w×$_h · $_count frames · your screen stays on while viewing';
+    }
     return Scaffold(
       backgroundColor: Colors.black,
       appBar: AppBar(
         backgroundColor: bg,
         foregroundColor: white,
         title: Text('${widget.peer.name} — screen'),
+        actions: [
+          Text(_ctlBusy ? 'Connecting…' : 'Control', style: const TextStyle(color: white)),
+          Switch(
+            value: _control,
+            activeTrackColor: accent,
+            onChanged: (_ctlBusy || _frame == null) ? null : _setControl,
+          ),
+          const SizedBox(width: 8),
+        ],
       ),
       body: Column(
         children: [
@@ -1158,26 +1365,17 @@ class _ScreenViewPageState extends State<ScreenViewPage> {
                     )
                   : _frame == null
                       ? const Text('Connecting to the screen…', style: TextStyle(color: white))
-                      : InteractiveViewer(
-                          maxScale: 5,
-                          child: Image.memory(
-                            _frame!,
-                            gaplessPlayback: true,
-                            filterQuality: FilterQuality.medium,
-                            fit: BoxFit.contain,
-                          ),
-                        ),
+                      : _picture(),
             ),
           ),
+          if (_control) _controlBar(),
           Container(
             width: double.infinity,
             color: bg,
             padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 16),
             child: Text(
-              _frame == null
-                  ? 'Your screen stays on while viewing'
-                  : '$_w×$_h · $_count frames · your screen stays on while viewing',
-              style: const TextStyle(color: off, fontSize: 12),
+              status,
+              style: TextStyle(color: _ctlError != null ? bad : off, fontSize: 12),
               textAlign: TextAlign.center,
             ),
           ),

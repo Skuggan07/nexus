@@ -85,3 +85,12 @@ B refuses the connection unless A is a paired device and `mac` checks out. After
 Any request may be answered with `{error:"…"}`. File transfers are authenticated so only paired devices can reach them; the file bytes themselves are not yet encrypted on the wire (a planned addition). The maximum JSON line is raised to 2 MiB on this connection so a data frame fits.
 
 All binary values on the wire are lowercase hex.
+
+### Screen viewing and remote control
+
+A separate TCP connection authenticated exactly like file transfer, using `screen_hello` / `screen_ready` / `screen_auth` and the label `"nexus-screen-v2"`. After the handshake the viewer's first plain JSON line chooses the purpose:
+
+- `{op:"start", fps, maxw, quality?}` — the host streams `{op:"frame", w, h, seq, data:"<base64 JPEG>"}` of its primary display until the viewer closes the connection.
+- `{op:"control"}` — the host answers `{op:"ready"}` (or `{error}` if "Allow remote control" is off) and then carries out input events from the viewer: `move {x,y}`, `button {b, down, x?, y?}`, `click {b, x, y, n?}`, `scroll {dy?, dx?}`, `text {s}`, `key {k, mods?}`. Positions are fractions 0–1 of the shared screen; `b` is `left`/`right`/`middle`; `mods` may contain `ctrl`, `alt`, `shift`, `win`. The viewer sends `{op:"ping"}` every few seconds while idle and `{op:"bye"}` when done.
+
+Like file transfer, these connections are authenticated but not yet encrypted on the wire.

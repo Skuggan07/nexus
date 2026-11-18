@@ -47,6 +47,8 @@ struct ScreenInner {
     frames: u64,
     error: Option<String>,
     stop: bool,
+    control_ready: bool,
+    control_error: Option<String>,
 }
 
 /// The open screen viewer: which device, the latest frame, and its GPU texture.
@@ -56,6 +58,14 @@ struct ScreenView {
     inner: Arc<Mutex<ScreenInner>>,
     tex: Option<egui::TextureHandle>,
     shown_seq: u64,
+    /// Sends mouse/keyboard events to the other device while "Control" is on.
+    control: Option<std::sync::mpsc::Sender<serde_json::Value>>,
+    control_on: bool,
+    /// True after clicking inside the picture: keystrokes then go to the other device.
+    typing: bool,
+    pressed: bool,
+    last_move: Option<(f32, f32)>,
+    scroll_acc: f32,
 }
 
 const BG: Color32 = Color32::from_rgb(0, 0, 0);
@@ -299,11 +309,36 @@ impl NexusApp {
             inner: inner.clone(),
             tex: None,
             shown_seq: u64::MAX,
+            control: None,
+            control_on: true,
+            typing: false,
+            pressed: false,
+            last_move: None,
+            scroll_acc: 0.0,
         });
         let (Some(addr), Some(peer)) = (self.addr_of(&id), self.peer_of(&id)) else {
             inner.lock().unwrap().error = Some("That device is not reachable right now".into());
             return;
         };
+        let status = inner.clone();
+        let tx = net::control_session(self.me.clone(), peer.clone(), addr, move |r| {
+            let mut g = status.lock().unwrap_or_else(|e| e.into_inner());
+            match r {
+                Ok(()) => {
+                    g.control_ready = true;
+                    g.control_error = None;
+                }
+                Err(e) => {
+                    g.control_ready = false;
+                    if !g.stop {
+                        g.control_error = Some(e);
+                    }
+                }
+            }
+        });
+        if let Some(s) = self.screen.as_mut() {
+            s.control = Some(tx);
+        }
         let me = self.me.clone();
         let (frames_ref, stop_ref, err_ref) = (inner.clone(), inner.clone(), inner.clone());
         std::thread::spawn(move || {
@@ -967,10 +1002,19 @@ impl NexusApp {
         box_frame().show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.label(RichText::new("PRIVACY AND SECURITY").size(14.0).strong());
+            let mut allow = lock(&self.shared).allow_control;
+            if ui
+                .checkbox(&mut allow, "Allow remote control — paired devices can use this PC's mouse and keyboard")
+                .changed()
+            {
+                lock(&self.shared).allow_control = allow;
+                store::save_allow_control(&self.dir, allow);
+            }
+            ui.add_space(4.0);
             ui.label(
                 "Only devices you paired by comparing the 6-digit number are trusted. Status checks and remote \
                  commands are signed so only the real device can issue them. File browsing opens a separate \
-                 connection that both sides authenticate before any file is listed or sent.",
+                 connection that both sides authenticate before any file is listed or sent. Screen viewing and remote control use the same kind of authenticated connection.",
             );
         });
     }
@@ -1110,13 +1154,14 @@ impl NexusApp {
     }
 
     /// The live screen viewer window. Decodes the newest frame into a texture and
-    /// scales it to fit; the viewing machine is kept awake while this is open.
+    /// scales it to fit; the viewing machine is kept awake while this is open. With
+    /// "Control this screen" on, the mouse, wheel and keyboard drive the other device.
     fn screen_window(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
         let Some(sv) = self.screen.as_mut() else { return };
-        let (new_jpeg, dims, error, frames, cur_seq) = {
+        let (new_jpeg, dims, error, frames, cur_seq, ctl_ready, ctl_error) = {
             let g = sv.inner.lock().unwrap_or_else(|e| e.into_inner());
             let nj = if g.jpeg.is_some() && g.seq != sv.shown_seq { g.jpeg.clone() } else { None };
-            (nj, g.dims, g.error.clone(), g.frames, g.seq)
+            (nj, g.dims, g.error.clone(), g.frames, g.seq, g.control_ready, g.control_error.clone())
         };
         if let Some(bytes) = new_jpeg {
             if let Ok(decoded) = image::load_from_memory(&bytes) {
@@ -1130,31 +1175,67 @@ impl NexusApp {
                 sv.shown_seq = cur_seq;
             }
         }
+        let mut out: Vec<serde_json::Value> = Vec::new();
+        let mut img_rect: Option<egui::Rect> = None;
         let mut open = true;
         egui::Window::new(RichText::new(format!("{} — screen", sv.peer_name)).size(17.0).strong())
             .open(&mut open)
             .collapsible(false)
-            .default_size(Vec2::new(900.0, 560.0))
+            .default_size(Vec2::new(900.0, 600.0))
             .show(ctx, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    if ui.checkbox(&mut sv.control_on, "Control this screen").changed() && !sv.control_on {
+                        sv.typing = false;
+                    }
+                    if sv.control_on {
+                        let shortcuts: [(&str, &str, &[&str]); 4] = [
+                            ("Start", "win", &[]),
+                            ("Alt+Tab", "tab", &["alt"]),
+                            ("Task Manager", "escape", &["ctrl", "shift"]),
+                            ("Esc", "escape", &[]),
+                        ];
+                        for (label, key, mods) in shortcuts {
+                            if ui.add(secondary(label)).clicked() {
+                                out.push(serde_json::json!({ "op": "key", "k": key, "mods": mods }));
+                            }
+                        }
+                        let status = if let Some(e) = &ctl_error {
+                            RichText::new(e.as_str()).color(BAD)
+                        } else if !ctl_ready {
+                            RichText::new("Connecting control…").color(OFF)
+                        } else if sv.typing {
+                            RichText::new("Your typing goes to this screen").color(ONLINE)
+                        } else {
+                            RichText::new("Click the screen to type into it").color(OFF)
+                        };
+                        ui.label(status.size(12.0));
+                    }
+                });
                 if let Some(e) = &error {
                     ui.colored_label(BAD, e);
-                    ui.add_space(4.0);
                 }
+                let avail = ui.available_size();
+                let (area, _) =
+                    ui.allocate_exact_size(Vec2::new(avail.x, (avail.y - 24.0).max(80.0)), Sense::click_and_drag());
                 if let Some(tex) = &sv.tex {
-                    let avail = ui.available_size();
                     let [tw, th] = tex.size();
                     let (tw, th) = (tw as f32, th as f32);
-                    let scale = (avail.x / tw).min((avail.y - 28.0) / th).clamp(0.05, 2.0);
-                    ui.centered_and_justified(|ui| {
-                        ui.add(egui::Image::new(egui::load::SizedTexture::new(
-                            tex.id(),
-                            Vec2::new(tw * scale, th * scale),
-                        )));
-                    });
+                    let scale = (area.width() / tw).min(area.height() / th).clamp(0.05, 2.0);
+                    let rect = egui::Rect::from_center_size(area.center(), Vec2::new(tw * scale, th * scale));
+                    egui::Image::new(egui::load::SizedTexture::new(tex.id(), rect.size())).paint_at(ui, rect);
+                    if sv.control_on && sv.typing {
+                        ui.painter().rect_stroke(rect.expand(1.0), 2.0, Stroke::new(2.0, ONLINE));
+                    }
+                    img_rect = Some(rect);
                 } else if error.is_none() {
-                    ui.centered_and_justified(|ui| ui.label("Connecting to the screen…"));
+                    ui.painter().text(
+                        area.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "Connecting to the screen…",
+                        FontId::proportional(15.0),
+                        OFF,
+                    );
                 }
-                ui.add_space(6.0);
                 ui.label(
                     RichText::new(format!(
                         "{}×{} · {} frames · this screen stays awake while viewing",
@@ -1164,10 +1245,146 @@ impl NexusApp {
                     .color(OFF),
                 );
             });
+
+        if sv.control_on {
+            if let Some(rect) = img_rect {
+                let norm = |p: Pos2| {
+                    (
+                        ((p.x - rect.min.x) / rect.width()).clamp(0.0, 1.0),
+                        ((p.y - rect.min.y) / rect.height()).clamp(0.0, 1.0),
+                    )
+                };
+                let (events, hover, scroll) =
+                    ctx.input(|i| (i.events.clone(), i.pointer.hover_pos(), i.raw_scroll_delta));
+                for ev in events {
+                    match ev {
+                        egui::Event::PointerMoved(p) => {
+                            if rect.contains(p) || sv.pressed {
+                                let n = norm(p);
+                                if sv.last_move != Some(n) {
+                                    sv.last_move = Some(n);
+                                    out.push(serde_json::json!({ "op": "move", "x": n.0, "y": n.1 }));
+                                }
+                            }
+                        }
+                        egui::Event::PointerButton { pos, button, pressed, .. } => {
+                            if pressed && !rect.contains(pos) {
+                                if button == egui::PointerButton::Primary {
+                                    sv.typing = false;
+                                }
+                                continue;
+                            }
+                            if !pressed && !sv.pressed {
+                                continue;
+                            }
+                            let b = match button {
+                                egui::PointerButton::Primary => "left",
+                                egui::PointerButton::Secondary => "right",
+                                egui::PointerButton::Middle => "middle",
+                                _ => continue,
+                            };
+                            if pressed {
+                                sv.typing = true;
+                            }
+                            sv.pressed = pressed;
+                            let n = norm(pos);
+                            out.push(
+                                serde_json::json!({ "op": "button", "b": b, "down": pressed, "x": n.0, "y": n.1 }),
+                            );
+                        }
+                        egui::Event::Text(t) if sv.typing => out.push(serde_json::json!({ "op": "text", "s": t })),
+                        egui::Event::Paste(t) if sv.typing => out.push(serde_json::json!({ "op": "text", "s": t })),
+                        egui::Event::Copy if sv.typing => {
+                            out.push(serde_json::json!({ "op": "key", "k": "c", "mods": ["ctrl"] }))
+                        }
+                        egui::Event::Cut if sv.typing => {
+                            out.push(serde_json::json!({ "op": "key", "k": "x", "mods": ["ctrl"] }))
+                        }
+                        egui::Event::Key { key, pressed: true, modifiers, .. } if sv.typing => {
+                            if let Some(name) = remote_key_name(key, modifiers) {
+                                let mut mods = Vec::new();
+                                if modifiers.ctrl {
+                                    mods.push("ctrl");
+                                }
+                                if modifiers.alt {
+                                    mods.push("alt");
+                                }
+                                if modifiers.shift {
+                                    mods.push("shift");
+                                }
+                                out.push(serde_json::json!({ "op": "key", "k": name, "mods": mods }));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if hover.is_some_and(|p| rect.contains(p)) && scroll.y != 0.0 {
+                    sv.scroll_acc += scroll.y;
+                    let notches = (sv.scroll_acc / 40.0).trunc();
+                    if notches != 0.0 {
+                        sv.scroll_acc -= notches * 40.0;
+                        out.push(serde_json::json!({ "op": "scroll", "dy": notches }));
+                    }
+                }
+            }
+        }
+        if let Some(tx) = &sv.control {
+            for v in out {
+                let _ = tx.send(v);
+            }
+        }
         if !open {
             actions.push(Action::CloseScreen);
         }
     }
+}
+
+/// Name of a key to forward to the other device. Plain letters and digits are
+/// skipped (they arrive as typed text) unless Ctrl or Alt is held; Ctrl+C/X/V are
+/// skipped because they arrive as Copy/Cut/Paste.
+fn remote_key_name(key: egui::Key, m: egui::Modifiers) -> Option<String> {
+    use egui::Key as K;
+    let special = match key {
+        K::Enter => "enter",
+        K::Backspace => "backspace",
+        K::Tab => "tab",
+        K::Escape => "escape",
+        K::ArrowLeft => "left",
+        K::ArrowRight => "right",
+        K::ArrowUp => "up",
+        K::ArrowDown => "down",
+        K::Delete => "delete",
+        K::Insert => "insert",
+        K::Home => "home",
+        K::End => "end",
+        K::PageUp => "pageup",
+        K::PageDown => "pagedown",
+        _ => "",
+    };
+    if !special.is_empty() {
+        return Some(special.into());
+    }
+    let name = format!("{key:?}");
+    if name.len() > 1 && name.starts_with('F') && name[1..].chars().all(|c| c.is_ascii_digit()) {
+        return Some(name.to_ascii_lowercase());
+    }
+    if !(m.ctrl || m.alt) {
+        return None;
+    }
+    if name.len() == 1 && name.chars().all(|c| c.is_ascii_alphabetic()) {
+        let l = name.to_ascii_lowercase();
+        if m.ctrl && !m.alt && matches!(l.as_str(), "c" | "x" | "v") {
+            return None;
+        }
+        return Some(l);
+    }
+    if let Some(d) = name.strip_prefix("Num").filter(|d| d.len() == 1) {
+        return Some(d.into());
+    }
+    if key == K::Space {
+        return Some("space".into());
+    }
+    None
 }
 
 fn human_size(bytes: u64) -> String {

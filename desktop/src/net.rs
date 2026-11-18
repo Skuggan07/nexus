@@ -454,11 +454,16 @@ fn screen_serve(mut c: Conn, me: &Identity, shared: &SharedState, id: String, no
         let _ = c.send(&Msg::Error { reason: e });
         return;
     }
-    // The viewer sends one "start" line with its preferred frame rate and size.
+    // The viewer's first line says what it wants: a picture stream ("start", with its
+    // preferred frame rate and size) or a remote-control link ("control").
     let start = match c.recv_val() {
         Ok(v) => v,
         Err(_) => return,
     };
+    if start.get("op").and_then(|o| o.as_str()) == Some("control") {
+        control_serve(c, shared, &id);
+        return;
+    }
     let fps = start.get("fps").and_then(|x| x.as_u64()).unwrap_or(8).clamp(1, 30);
     let max_w = start.get("maxw").and_then(|x| x.as_u64()).unwrap_or(1280).clamp(320, 3840) as u32;
     let quality = start.get("quality").and_then(|x| x.as_u64()).unwrap_or(55).clamp(20, 90) as u8;
@@ -488,6 +493,76 @@ fn screen_serve(mut c: Conn, me: &Identity, shared: &SharedState, id: String, no
         }
     }
     lock(shared).log(format!("{who} stopped viewing this screen"));
+}
+
+/// Applies mouse and keyboard events from a paired viewer until it disconnects.
+/// The viewer pings every few seconds so the link stays open while idle.
+fn control_serve(mut c: Conn, shared: &SharedState, id: &str) {
+    if !lock(shared).allow_control {
+        let _ = c.send_val(&serde_json::json!({
+            "error": "Remote control is turned off on this PC (Settings → Allow remote control)"
+        }));
+        return;
+    }
+    if c.send_val(&serde_json::json!({ "op": "ready" })).is_err() {
+        return;
+    }
+    let who = peer_name(shared, id);
+    lock(shared).log(format!("{who} is controlling this PC"));
+    while let Ok(v) = c.recv_val() {
+        match v.get("op").and_then(|o| o.as_str()) {
+            Some("bye") => break,
+            Some("ping") | None => {}
+            Some(_) => {
+                if !lock(shared).allow_control {
+                    break; // turned off mid-session
+                }
+                crate::input::apply(&v);
+            }
+        }
+    }
+    lock(shared).log(format!("{who} stopped controlling this PC"));
+}
+
+/// Opens a remote-control link to a paired device on its own thread and returns a
+/// sender for input events (see `input.rs` for their shape). `on_status` reports
+/// when the link is ready, or why it failed. Dropping the sender closes the link.
+pub fn control_session<S>(
+    me: Arc<Identity>,
+    peer: PairedPeer,
+    addr: SocketAddr,
+    on_status: S,
+) -> std::sync::mpsc::Sender<serde_json::Value>
+where
+    S: Fn(Result<(), String>) + Send + 'static,
+{
+    use std::sync::mpsc::{channel, RecvTimeoutError};
+    let (tx, rx) = channel::<serde_json::Value>();
+    thread::spawn(move || {
+        let run = || -> Result<(), String> {
+            let mut c = screen_open(&me, &peer, addr)?;
+            c.send_val(&serde_json::json!({ "op": "control" }))?;
+            let answer = c.recv_val()?;
+            if let Some(e) = fs_err(&answer) {
+                return Err(e);
+            }
+            on_status(Ok(()));
+            loop {
+                match rx.recv_timeout(Duration::from_secs(4)) {
+                    Ok(v) => c.send_val(&v)?,
+                    Err(RecvTimeoutError::Timeout) => c.send_val(&serde_json::json!({ "op": "ping" }))?,
+                    Err(RecvTimeoutError::Disconnected) => {
+                        let _ = c.send_val(&serde_json::json!({ "op": "bye" }));
+                        return Ok(());
+                    }
+                }
+            }
+        };
+        if let Err(e) = run() {
+            on_status(Err(e));
+        }
+    });
+    tx
 }
 
 /// Opens an authenticated screen connection to a paired device (we are the viewer).
