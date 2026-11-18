@@ -5,6 +5,7 @@ mod app;
 mod discovery;
 mod identity;
 mod input;
+mod monitor;
 mod net;
 mod screen;
 mod state;

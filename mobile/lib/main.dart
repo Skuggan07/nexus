@@ -486,6 +486,19 @@ class _HomePageState extends State<HomePage> {
                     },
                   ),
                 ),
+                const SizedBox(height: 8),
+                SizedBox(
+                  width: double.infinity,
+                  child: _SecondaryButton(
+                    label: 'Apps and monitoring',
+                    onPressed: () {
+                      Navigator.pop(ctx);
+                      Navigator.of(context).push(
+                        MaterialPageRoute<void>(builder: (_) => MonitorPage(node: node, peer: p)),
+                      );
+                    },
+                  ),
+                ),
               ],
               const SizedBox(height: 8),
               _SecondaryButton(
@@ -1949,4 +1962,318 @@ class _VersionLine extends StatelessWidget {
       },
     );
   }
+}
+
+/// "Apps and monitoring" for one device: live CPU and memory graphs, disks, uptime,
+/// battery and the running apps, with the option to end an app.
+class MonitorPage extends StatefulWidget {
+  const MonitorPage({super.key, required this.node, required this.peer});
+
+  final NexusNode node;
+  final PairedPeer peer;
+
+  @override
+  State<MonitorPage> createState() => _MonitorPageState();
+}
+
+class _MonitorPageState extends State<MonitorPage> {
+  static const _history = 90;
+  MonitorLink? _link;
+  Timer? _timer;
+  Map<String, dynamic>? _snap;
+  String? _error;
+  String? _notice;
+  final _cpu = <double>[];
+  final _ram = <double>[];
+  String _search = '';
+  bool _byCpu = false;
+  bool _busy = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _connect();
+  }
+
+  Future<void> _connect() async {
+    try {
+      final link = await widget.node.monitorOpen(widget.peer);
+      if (!mounted) {
+        link.close();
+        return;
+      }
+      _link = link;
+      await _refresh();
+      _timer = Timer.periodic(const Duration(seconds: 2), (_) => _refresh());
+    } catch (e) {
+      if (mounted) setState(() => _error = '$e');
+    }
+  }
+
+  Future<void> _refresh() async {
+    final link = _link;
+    if (link == null || _busy) return;
+    _busy = true;
+    try {
+      final s = await link.snapshot();
+      if (!mounted) return;
+      setState(() {
+        _snap = s;
+        _error = null;
+        final cpu = (s['cpu'] as num?)?.toDouble();
+        if (cpu != null) _cpu.add(cpu);
+        final used = (s['ram_used'] as num?)?.toDouble() ?? 0;
+        final total = (s['ram_total'] as num?)?.toDouble() ?? 0;
+        if (total > 0) _ram.add(used / total * 100);
+        while (_cpu.length > _history) {
+          _cpu.removeAt(0);
+        }
+        while (_ram.length > _history) {
+          _ram.removeAt(0);
+        }
+      });
+    } catch (e) {
+      if (mounted) setState(() => _error = '$e');
+    } finally {
+      _busy = false;
+    }
+  }
+
+  Future<void> _end(String name) async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: box,
+        title: const Text('End this app?'),
+        content: Text('End $name on ${widget.peer.name}? Anything unsaved in it will be lost.'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+          FilledButton(
+            style: FilledButton.styleFrom(backgroundColor: accent),
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('End app'),
+          ),
+        ],
+      ),
+    );
+    if (ok != true || _link == null) return;
+    setState(() => _notice = 'Ending $name…');
+    try {
+      final r = await _link!.endApp(name);
+      final n = (r['count'] as num?)?.toInt() ?? 0;
+      if (mounted) setState(() => _notice = 'Ended $name ($n process${n == 1 ? '' : 'es'})');
+      await _refresh();
+    } catch (e) {
+      if (mounted) setState(() => _notice = '$e');
+    }
+  }
+
+  @override
+  void dispose() {
+    _timer?.cancel();
+    _link?.close();
+    super.dispose();
+  }
+
+  static String _uptime(int secs) {
+    final d = secs ~/ 86400, h = secs ~/ 3600 % 24, m = secs ~/ 60 % 60;
+    if (d > 0) return '$d d $h h';
+    if (h > 0) return '$h h $m min';
+    return '$m min';
+  }
+
+  Widget _card(String title, String value, List<double> hist, Color color) {
+    return Expanded(
+      child: _Box(
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Text(title, style: const TextStyle(color: off, fontSize: 12)),
+          const SizedBox(height: 2),
+          Text(value, style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w700)),
+          const SizedBox(height: 8),
+          SizedBox(
+            height: 44,
+            width: double.infinity,
+            child: CustomPaint(painter: _Spark(List.of(hist), color, _history)),
+          ),
+        ]),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final s = _snap;
+    final children = <Widget>[];
+    if (_error != null) {
+      children.add(Padding(
+        padding: const EdgeInsets.only(bottom: 10),
+        child: Text(_error!, style: const TextStyle(color: bad)),
+      ));
+    }
+    if (s == null) {
+      if (_error == null) {
+        children.add(const Padding(
+          padding: EdgeInsets.all(40),
+          child: Center(child: CircularProgressIndicator(color: accent)),
+        ));
+      }
+    } else {
+      final cpu = (s['cpu'] as num?)?.toDouble();
+      final used = (s['ram_used'] as num?)?.toInt() ?? 0;
+      final total = (s['ram_total'] as num?)?.toInt() ?? 0;
+      children.add(Row(children: [
+        if (cpu != null) _card('CPU', '${cpu.toStringAsFixed(0)}%', _cpu, online),
+        if (cpu != null && total > 0) const SizedBox(width: 10),
+        if (total > 0) _card('Memory', '${_humanSize(used)} of ${_humanSize(total)}', _ram, ring),
+      ]));
+      final facts = <String>[
+        if (s['uptime'] is num) 'On for ${_uptime((s['uptime'] as num).toInt())}',
+        if (s['battery'] is num) 'Battery ${(s['battery'] as num).toStringAsFixed(0)}%',
+        if (s['cores'] is num) '${s['cores']} CPU cores',
+      ];
+      if (facts.isNotEmpty) {
+        children.add(Padding(
+          padding: const EdgeInsets.symmetric(vertical: 10),
+          child: Text(facts.join(' · '), style: const TextStyle(color: off)),
+        ));
+      }
+      for (final d in (s['disks'] as List? ?? const [])) {
+        if (d is! Map) continue;
+        final t = (d['total'] as num?)?.toInt() ?? 0;
+        final f = (d['free'] as num?)?.toInt() ?? 0;
+        if (t <= 0) continue;
+        children.add(Padding(
+          padding: const EdgeInsets.only(bottom: 8),
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Text('Disk ${d['name']} · ${_humanSize(f)} free of ${_humanSize(t)}', style: const TextStyle(fontSize: 13)),
+            const SizedBox(height: 4),
+            LinearProgressIndicator(value: 1 - f / t, color: online, backgroundColor: line, minHeight: 6),
+          ]),
+        ));
+      }
+      if (s['note'] is String) {
+        children.add(Padding(
+          padding: const EdgeInsets.symmetric(vertical: 8),
+          child: Text(s['note'] as String, style: const TextStyle(color: off)),
+        ));
+      }
+      final apps = (s['apps'] as List? ?? const []).whereType<Map>().toList();
+      if (apps.isNotEmpty) {
+        final canEnd = s['can_end'] == true;
+        final needle = _search.toLowerCase();
+        final shown = apps.where((a) => needle.isEmpty || '${a['name']}'.toLowerCase().contains(needle)).toList()
+          ..sort((a, b) => ((b[_byCpu ? 'cpu' : 'mem'] as num?) ?? 0).compareTo((a[_byCpu ? 'cpu' : 'mem'] as num?) ?? 0));
+        children.addAll([
+          const SizedBox(height: 8),
+          Text('RUNNING APPS (${apps.length})',
+              style: const TextStyle(color: online, fontSize: 11, letterSpacing: 1.5, fontWeight: FontWeight.w700)),
+          const SizedBox(height: 6),
+          Row(children: [
+            Expanded(
+              child: TextField(
+                onChanged: (v) => setState(() => _search = v),
+                style: const TextStyle(color: white),
+                decoration: InputDecoration(
+                  isDense: true,
+                  prefixIcon: const Icon(Icons.search, color: off),
+                  hintText: 'Search apps',
+                  hintStyle: const TextStyle(color: off),
+                  filled: true,
+                  fillColor: box,
+                  border: OutlineInputBorder(borderRadius: BorderRadius.circular(10), borderSide: BorderSide.none),
+                ),
+              ),
+            ),
+            const SizedBox(width: 8),
+            ChoiceChip(label: const Text('Memory'), selected: !_byCpu, onSelected: (_) => setState(() => _byCpu = false)),
+            const SizedBox(width: 6),
+            ChoiceChip(label: const Text('CPU'), selected: _byCpu, onSelected: (_) => setState(() => _byCpu = true)),
+          ]),
+          if (_notice != null)
+            Padding(
+              padding: const EdgeInsets.only(top: 8),
+              child: Text(_notice!, style: const TextStyle(color: online)),
+            ),
+          if (!canEnd)
+            const Padding(
+              padding: EdgeInsets.only(top: 8),
+              child: Text('Ending apps is off — turn on "Allow remote control" in that PC\'s Settings.',
+                  style: TextStyle(color: off, fontSize: 12)),
+            ),
+          const SizedBox(height: 6),
+          for (final a in shown)
+            Container(
+              margin: const EdgeInsets.only(bottom: 6),
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+              decoration: BoxDecoration(color: box, borderRadius: BorderRadius.circular(10)),
+              child: Row(children: [
+                Expanded(
+                  child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                    Text(
+                      ((a['count'] as num?) ?? 1) > 1 ? '${a['name']}  ×${a['count']}' : '${a['name']}',
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(fontWeight: FontWeight.w700),
+                    ),
+                    Text(
+                      'CPU ${((a['cpu'] as num?) ?? 0).toStringAsFixed(1)}% · ${_humanSize(((a['mem'] as num?) ?? 0).toInt())}',
+                      style: const TextStyle(color: off, fontSize: 12),
+                    ),
+                  ]),
+                ),
+                if (canEnd && a['protected'] != true)
+                  TextButton(
+                    onPressed: () => _end('${a['name']}'),
+                    child: const Text('End', style: TextStyle(color: bad)),
+                  ),
+              ]),
+            ),
+        ]);
+      }
+    }
+    return Scaffold(
+      backgroundColor: bg,
+      appBar: AppBar(
+        backgroundColor: bg,
+        foregroundColor: white,
+        title: Text('${widget.peer.name} — apps'),
+      ),
+      body: ListView(padding: const EdgeInsets.all(14), children: children),
+    );
+  }
+}
+
+/// A tiny line graph of recent values (0–100).
+class _Spark extends CustomPainter {
+  _Spark(this.values, this.color, this.capacity);
+
+  final List<double> values;
+  final Color color;
+  final int capacity;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final bgPaint = Paint()..color = const Color(0xFF060A08);
+    canvas.drawRRect(RRect.fromRectAndRadius(Offset.zero & size, const Radius.circular(4)), bgPaint);
+    if (values.length < 2) return;
+    final path = Path();
+    for (var i = 0; i < values.length; i++) {
+      final x = size.width - (values.length - 1 - i) / (capacity - 1) * size.width;
+      final y = size.height - 2 - values[i].clamp(0, 100) / 100 * (size.height - 4);
+      if (i == 0) {
+        path.moveTo(x, y);
+      } else {
+        path.lineTo(x, y);
+      }
+    }
+    canvas.drawPath(
+      path,
+      Paint()
+        ..color = color
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 1.5,
+    );
+  }
+
+  @override
+  bool shouldRepaint(_Spark old) => true;
 }

@@ -460,9 +460,10 @@ fn screen_serve(mut c: Conn, me: &Identity, shared: &SharedState, id: String, no
         Ok(v) => v,
         Err(_) => return,
     };
-    if start.get("op").and_then(|o| o.as_str()) == Some("control") {
-        control_serve(c, shared, &id);
-        return;
+    match start.get("op").and_then(|o| o.as_str()) {
+        Some("control") => return control_serve(c, shared, &id),
+        Some("monitor") => return monitor_serve(c, shared, &id),
+        _ => {}
     }
     let fps = start.get("fps").and_then(|x| x.as_u64()).unwrap_or(8).clamp(1, 30);
     let max_w = start.get("maxw").and_then(|x| x.as_u64()).unwrap_or(1280).clamp(320, 3840) as u32;
@@ -493,6 +494,92 @@ fn screen_serve(mut c: Conn, me: &Identity, shared: &SharedState, id: String, no
         }
     }
     lock(shared).log(format!("{who} stopped viewing this screen"));
+}
+
+/// Answers "snapshot" and "end" requests from a paired viewer's monitor window.
+fn monitor_serve(mut c: Conn, shared: &SharedState, id: &str) {
+    let who = peer_name(shared, id);
+    lock(shared).log(format!("{who} opened the monitor for this PC"));
+    let mut mon = crate::monitor::Monitor::new();
+    while let Ok(v) = c.recv_val() {
+        let reply = match v.get("op").and_then(|o| o.as_str()) {
+            Some("bye") => break,
+            Some("snapshot") => mon.snapshot(lock(shared).allow_control),
+            Some("end") => {
+                let name = v.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                if !lock(shared).allow_control {
+                    serde_json::json!({
+                        "error": "Ending apps needs \"Allow remote control\" turned on in this PC's Settings"
+                    })
+                } else {
+                    match mon.end_app(name) {
+                        Ok(n) => {
+                            lock(shared).log(format!("{who} ended {name}"));
+                            serde_json::json!({ "op": "ended", "name": name, "count": n })
+                        }
+                        Err(e) => serde_json::json!({ "error": e }),
+                    }
+                }
+            }
+            _ => continue,
+        };
+        if c.send_val(&reply).is_err() {
+            break;
+        }
+    }
+    lock(shared).log(format!("{who} closed the monitor"));
+}
+
+/// Opens a monitor link to a paired device on its own thread. It asks for a fresh
+/// snapshot every 2 seconds and passes each answer (or error) to `on_update`. Send
+/// `{"op":"end","name":…}` on the returned sender to end an app; drop it to close.
+pub fn monitor_session<U>(
+    me: Arc<Identity>,
+    peer: PairedPeer,
+    addr: SocketAddr,
+    on_update: U,
+) -> std::sync::mpsc::Sender<serde_json::Value>
+where
+    U: Fn(Result<serde_json::Value, String>) + Send + 'static,
+{
+    use std::sync::mpsc::{channel, RecvTimeoutError};
+    let (tx, rx) = channel::<serde_json::Value>();
+    thread::spawn(move || {
+        let run = || -> Result<(), String> {
+            let mut c = screen_open(&me, &peer, addr)?;
+            c.send_val(&serde_json::json!({ "op": "monitor" }))?;
+            // Snapshot errors replace the picture; answers to commands (such as a
+            // failed "end") are passed on as they are, so they show as a notice.
+            let ask = |c: &mut Conn, v: &serde_json::Value, raw: bool| -> Result<(), String> {
+                c.send_val(v)?;
+                let answer = c.recv_val()?;
+                on_update(match fs_err(&answer) {
+                    Some(e) if !raw => Err(e),
+                    _ => Ok(answer),
+                });
+                Ok(())
+            };
+            let snapshot = serde_json::json!({ "op": "snapshot" });
+            ask(&mut c, &snapshot, false)?;
+            loop {
+                match rx.recv_timeout(Duration::from_secs(2)) {
+                    Ok(cmd) => {
+                        ask(&mut c, &cmd, true)?;
+                        ask(&mut c, &snapshot, false)?;
+                    }
+                    Err(RecvTimeoutError::Timeout) => ask(&mut c, &snapshot, false)?,
+                    Err(RecvTimeoutError::Disconnected) => {
+                        let _ = c.send_val(&serde_json::json!({ "op": "bye" }));
+                        return Ok(());
+                    }
+                }
+            }
+        };
+        if let Err(e) = run() {
+            on_update(Err(e));
+        }
+    });
+    tx
 }
 
 /// Applies mouse and keyboard events from a paired viewer until it disconnects.

@@ -53,7 +53,7 @@ fn round1(v: f32) -> f32 {
 }
 
 #[cfg(windows)]
-fn battery_percent() -> Option<f32> {
+pub fn battery_percent() -> Option<f32> {
     use windows_sys::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
     let mut st: SYSTEM_POWER_STATUS = unsafe { std::mem::zeroed() };
     if unsafe { GetSystemPowerStatus(&mut st) } == 0 {
@@ -68,6 +68,6 @@ fn battery_percent() -> Option<f32> {
 }
 
 #[cfg(not(windows))]
-fn battery_percent() -> Option<f32> {
+pub fn battery_percent() -> Option<f32> {
     None
 }

@@ -162,6 +162,39 @@ class ScreenControl {
   }
 }
 
+/// An open "apps and monitoring" link. Requests are answered one at a time.
+class MonitorLink {
+  MonitorLink._(this._c);
+
+  final Conn _c;
+  Future<void> _queue = Future.value();
+  bool _closed = false;
+
+  Future<Map<String, dynamic>> _ask(Map<String, Object?> m) {
+    final r = _queue.then((_) async {
+      if (_closed) throw NexusError('The monitor was closed');
+      _c.send(m);
+      final v = await _c.recv(const Duration(seconds: 15));
+      if (v['error'] != null) throw NexusError('${v['error']}');
+      return v;
+    });
+    _queue = r.then((_) {}, onError: (_) {});
+    return r;
+  }
+
+  Future<Map<String, dynamic>> snapshot() => _ask({'op': 'snapshot'});
+  Future<Map<String, dynamic>> endApp(String name) => _ask({'op': 'end', 'name': name});
+
+  void close() {
+    if (_closed) return;
+    _closed = true;
+    try {
+      _c.send({'op': 'bye'});
+    } catch (_) {}
+    _c.close();
+  }
+}
+
 /// One decoded screen frame: its source size and the JPEG bytes.
 class ScreenFrame {
   ScreenFrame(this.w, this.h, this.jpeg);
@@ -661,6 +694,13 @@ class NexusNode extends ChangeNotifier {
     }
   }
 
+  /// Opens an "apps and monitoring" link to a paired device.
+  Future<MonitorLink> monitorOpen(PairedPeer p) async {
+    final c = await _screenOpen(p);
+    c.send({'op': 'monitor'});
+    return MonitorLink._(c);
+  }
+
   /// Lists a folder on a paired device.
   Future<List<FsEntry>> fsList(PairedPeer p, String path) async {
     final c = await _fsOpen(p);
@@ -987,6 +1027,8 @@ class NexusNode extends ChangeNotifier {
     final first = await c.recv();
     if (first['op'] == 'control') {
       await _controlServe(c, peer.name);
+    } else if (first['op'] == 'monitor') {
+      await _monitorServe(c, peer.name);
     } else {
       await _streamServe(c, first, peer.name);
     }
@@ -1029,6 +1071,34 @@ class NexusNode extends ChangeNotifier {
     }
     addLog('$who stopped viewing this phone\'s screen');
     notifyListeners();
+  }
+
+  /// A paired device opened "apps and monitoring" for this phone. Android does not
+  /// let apps see which other apps are running, so the battery is all we can share.
+  Future<void> _monitorServe(Conn c, String who) async {
+    addLog('$who opened the monitor for this phone');
+    notifyListeners();
+    while (true) {
+      final v = await c
+          .recv(const Duration(seconds: 30))
+          .then<Map<String, dynamic>?>((x) => x, onError: (Object _) => null);
+      if (v == null || v['op'] == 'bye') break;
+      if (v['op'] == 'snapshot') {
+        double? battery;
+        try {
+          battery = (await _battery.batteryLevel).toDouble();
+        } catch (_) {}
+        c.send({
+          'op': 'snapshot',
+          'battery': battery,
+          'apps': <Object>[],
+          'can_end': false,
+          'note': "Android doesn't let apps see which other apps are running, so only the battery is shown for a phone.",
+        });
+      } else if (v['op'] == 'end') {
+        c.send({'error': "Apps on a phone can't be ended from Nexus"});
+      }
+    }
   }
 
   Future<void> _controlServe(Conn c, String who) async {

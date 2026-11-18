@@ -93,4 +93,6 @@ A separate TCP connection authenticated exactly like file transfer, using `scree
 - `{op:"start", fps, maxw, quality?}` — the host streams `{op:"frame", w, h, seq, data:"<base64 JPEG>"}` of its primary display until the viewer closes the connection.
 - `{op:"control"}` — the host answers `{op:"ready"}` (or `{error}` if "Allow remote control" is off) and then carries out input events from the viewer: `move {x,y}`, `button {b, down, x?, y?}`, `click {b, x, y, n?}`, `scroll {dy?, dx?}`, `text {s}`, `key {k, mods?}`. Positions are fractions 0–1 of the shared screen; `b` is `left`/`right`/`middle`; `mods` may contain `ctrl`, `alt`, `shift`, `win`. The viewer sends `{op:"ping"}` every few seconds while idle and `{op:"bye"}` when done.
 
+- `{op:"monitor"}` — "apps and monitoring". The viewer sends `{op:"snapshot"}` (every ~2 s) and gets `{op:"snapshot", cpu?, ram_used?, ram_total?, uptime?, battery?, cores?, disks:[{name,total,free}], apps:[{name,cpu,mem,count,protected}], can_end, note?}`; `{op:"end", name}` ends every process of that program (only while "Allow remote control" is on; core Windows programs are refused) and is answered `{op:"ended", name, count}` or `{error}`. A phone answers with its battery only, because Android does not let apps see other running apps.
+
 Like file transfer, these connections are authenticated but not yet encrypted on the wire.

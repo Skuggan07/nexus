@@ -114,6 +114,31 @@ struct ScreenView {
     last_frame_at: Option<Instant>,
 }
 
+/// Live state of a monitor window, filled by its background link.
+#[derive(Default)]
+struct MonitorInner {
+    snap: Option<serde_json::Value>,
+    cpu_hist: std::collections::VecDeque<f32>,
+    ram_hist: std::collections::VecDeque<f32>,
+    error: Option<String>,
+    notice: Option<String>,
+    closed: bool,
+}
+
+/// One open "app list and monitoring" window.
+struct MonitorView {
+    peer_id: String,
+    peer_name: String,
+    inner: Arc<Mutex<MonitorInner>>,
+    /// Sends "end app" requests; dropping it closes the link.
+    tx: Option<std::sync::mpsc::Sender<serde_json::Value>>,
+    search: String,
+    by_cpu: bool,
+    confirm_end: Option<String>,
+}
+
+const HISTORY: usize = 90;
+
 const BG: Color32 = Color32::from_rgb(0, 0, 0);
 const SIDEBAR: Color32 = Color32::from_rgb(10, 10, 10);
 const BOX: Color32 = Color32::from_rgb(14, 58, 42);
@@ -148,6 +173,7 @@ pub struct NexusApp {
     screens: Vec<ScreenView>,
     fullscreen_on: bool,
     awake_on: bool,
+    monitors: Vec<MonitorView>,
     updates: update::Shared,
     update_hidden: bool,
     detailed: bool,
@@ -182,6 +208,9 @@ enum Action {
     CloseScreen(String),
     SetQuality(String, Quality),
     SetFullscreen(String, bool),
+    OpenMonitor(String),
+    CloseMonitor(String),
+    EndApp(String, String),
 }
 
 impl NexusApp {
@@ -207,6 +236,7 @@ impl NexusApp {
             screens: Vec::new(),
             fullscreen_on: false,
             awake_on: false,
+            monitors: Vec::new(),
             updates: {
                 let u = update::Shared::default();
                 update::check(&u);
@@ -380,7 +410,87 @@ impl NexusApp {
                     sv.fullscreen = on && sv.peer_id == id;
                 }
             }
+            Action::OpenMonitor(id) => self.open_monitor(id),
+            Action::CloseMonitor(id) => {
+                if let Some(i) = self.monitors.iter().position(|m| m.peer_id == id) {
+                    let mv = self.monitors.remove(i);
+                    mv.inner.lock().unwrap_or_else(|e| e.into_inner()).closed = true;
+                }
+            }
+            Action::EndApp(id, name) => {
+                if let Some(mv) = self.monitors.iter().find(|m| m.peer_id == id) {
+                    if let Some(tx) = &mv.tx {
+                        let _ = tx.send(serde_json::json!({ "op": "end", "name": name }));
+                    }
+                    mv.inner.lock().unwrap_or_else(|e| e.into_inner()).notice = Some(format!("Ending {name}…"));
+                }
+            }
         }
+    }
+
+    /// Opens the app list and monitoring window for a paired device.
+    fn open_monitor(&mut self, id: String) {
+        if self.monitors.iter().any(|m| m.peer_id == id) {
+            return;
+        }
+        let name = self.peer_of(&id).map(|p| p.name).unwrap_or_else(|| "Device".into());
+        let inner = Arc::new(Mutex::new(MonitorInner::default()));
+        let tx = match (self.addr_of(&id), self.peer_of(&id)) {
+            (Some(addr), Some(peer)) => {
+                let st = inner.clone();
+                Some(net::monitor_session(self.me.clone(), peer, addr, move |r| {
+                    let mut g = st.lock().unwrap_or_else(|e| e.into_inner());
+                    match r {
+                        Ok(v) => {
+                            if let Some(e) = v.get("error").and_then(|e| e.as_str()) {
+                                g.notice = Some(e.to_string());
+                            } else if v.get("op").and_then(|o| o.as_str()) == Some("ended") {
+                                let n = v.get("count").and_then(|c| c.as_u64()).unwrap_or(0);
+                                let app = v.get("name").and_then(|a| a.as_str()).unwrap_or("the app");
+                                g.notice = Some(format!("Ended {app} ({n} process{})", if n == 1 { "" } else { "es" }));
+                            } else {
+                                if let Some(c) = v.get("cpu").and_then(|c| c.as_f64()) {
+                                    g.cpu_hist.push_back(c as f32);
+                                }
+                                let used = v.get("ram_used").and_then(|x| x.as_f64()).unwrap_or(0.0);
+                                let total = v.get("ram_total").and_then(|x| x.as_f64()).unwrap_or(0.0);
+                                if total > 0.0 {
+                                    g.ram_hist.push_back((used / total * 100.0) as f32);
+                                }
+                                while g.cpu_hist.len() > HISTORY {
+                                    g.cpu_hist.pop_front();
+                                }
+                                while g.ram_hist.len() > HISTORY {
+                                    g.ram_hist.pop_front();
+                                }
+                                g.snap = Some(v);
+                                g.error = None;
+                            }
+                        }
+                        Err(e) => {
+                            if !g.closed {
+                                g.error = Some(e);
+                            }
+                        }
+                    }
+                }))
+            }
+            _ => {
+                inner.lock().unwrap_or_else(|e| e.into_inner()).error =
+                    Some("That device is not reachable right now".into());
+                None
+            }
+        };
+        self.details = None;
+        self.monitors.push(MonitorView {
+            peer_id: id,
+            peer_name: name,
+            inner,
+            tx,
+            search: String::new(),
+            by_cpu: false,
+            confirm_end: None,
+        });
     }
 
     /// Opens a live screen view of a paired device (if it is not open already) and
@@ -769,6 +879,9 @@ impl eframe::App for NexusApp {
         for i in 0..self.screens.len() {
             self.screen_view(ctx, i, &mut actions);
         }
+        for i in 0..self.monitors.len() {
+            self.monitor_window(ctx, i, &mut actions);
+        }
         // Keep this PC's display awake while any screen is being watched.
         if !self.screens.is_empty() {
             crate::screen::keep_display_awake(true);
@@ -787,7 +900,8 @@ impl eframe::App for NexusApp {
             self.fullscreen_on = full;
         }
         let viewing = !self.screens.is_empty();
-        let fast = session.is_some() || window.is_some() || self.browser.is_some() || viewing;
+        let fast =
+            session.is_some() || window.is_some() || self.browser.is_some() || viewing || !self.monitors.is_empty();
         let ms = if viewing {
             80
         } else if fast {
@@ -970,7 +1084,7 @@ impl NexusApp {
                     actions.push(Action::ViewAllScreens);
                 }
                 ui.add_space(6.0);
-                ui.label(RichText::new("Coming next: Monitoring · Automation · Clipboard").size(12.0));
+                ui.label(RichText::new("Coming next: Automation · Clipboard · Other networks").size(12.0));
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
                     ui.label(
                         RichText::new(format!("key {}", identity::fingerprint(&self.me.public_hex())))
@@ -1240,6 +1354,10 @@ impl NexusApp {
                     if ui.add(secondary("View screen").min_size(Vec2::new(0.0, 36.0))).clicked() {
                         actions.push(Action::ViewScreen(r.peer.id.clone()));
                     }
+                    ui.add_space(2.0);
+                    if ui.add(secondary("Apps and monitoring").min_size(Vec2::new(0.0, 36.0))).clicked() {
+                        actions.push(Action::OpenMonitor(r.peer.id.clone()));
+                    }
                 }
                 ui.add_space(2.0);
                 remove_controls(ui, r, self.confirm_remove.as_deref(), actions);
@@ -1415,6 +1533,217 @@ impl NexusApp {
                 let _ = tx.send(v);
             }
         }
+    }
+}
+
+impl NexusApp {
+    /// The "app list and monitoring" window for one device.
+    fn monitor_window(&mut self, ctx: &egui::Context, i: usize, actions: &mut Vec<Action>) {
+        let mv = &mut self.monitors[i];
+        let (snap, cpu_hist, ram_hist, error, notice) = {
+            let g = mv.inner.lock().unwrap_or_else(|e| e.into_inner());
+            (g.snap.clone(), g.cpu_hist.clone(), g.ram_hist.clone(), g.error.clone(), g.notice.clone())
+        };
+        let mut open = true;
+        egui::Window::new(RichText::new(format!("{} — apps and monitoring", mv.peer_name)).size(16.0).strong())
+            .id(egui::Id::new(("monitor", mv.peer_id.clone())))
+            .open(&mut open)
+            .collapsible(false)
+            .default_size(Vec2::new(640.0, 660.0))
+            .default_pos(Pos2::new(260.0 + 30.0 * i as f32, 60.0 + 30.0 * i as f32))
+            .show(ctx, |ui| {
+                if let Some(e) = &error {
+                    ui.colored_label(BAD, e);
+                }
+                let Some(s) = &snap else {
+                    if error.is_none() {
+                        ui.label(RichText::new("Connecting…").color(OFF));
+                    }
+                    return;
+                };
+                ui.horizontal_wrapped(|ui| {
+                    if let Some(cpu) = s.get("cpu").and_then(|v| v.as_f64()) {
+                        stat_card(ui, "CPU", format!("{cpu:.0}%"), &cpu_hist, ONLINE);
+                    }
+                    let used = s.get("ram_used").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let total = s.get("ram_total").and_then(|v| v.as_u64()).unwrap_or(0);
+                    if total > 0 {
+                        stat_card(
+                            ui,
+                            "Memory",
+                            format!("{} of {}", human_size(used), human_size(total)),
+                            &ram_hist,
+                            RING,
+                        );
+                    }
+                });
+                ui.horizontal_wrapped(|ui| {
+                    if let Some(up) = s.get("uptime").and_then(|v| v.as_u64()) {
+                        ui.label(RichText::new(format!("On for {}", uptime_text(up))).color(OFF));
+                    }
+                    if let Some(b) = s.get("battery").and_then(|v| v.as_f64()) {
+                        ui.label(RichText::new(format!("· Battery {b:.0}%")).color(OFF));
+                    }
+                    if let Some(n) = s.get("cores").and_then(|v| v.as_u64()) {
+                        ui.label(RichText::new(format!("· {n} CPU cores")).color(OFF));
+                    }
+                });
+                if let Some(disks) = s.get("disks").and_then(|v| v.as_array()) {
+                    for d in disks {
+                        let total = d.get("total").and_then(|v| v.as_u64()).unwrap_or(0);
+                        let free = d.get("free").and_then(|v| v.as_u64()).unwrap_or(0);
+                        if total == 0 {
+                            continue;
+                        }
+                        let name = d.get("name").and_then(|v| v.as_str()).unwrap_or("Disk");
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(format!("Disk {name}")).strong());
+                            ui.add(
+                                egui::ProgressBar::new(1.0 - free as f32 / total as f32)
+                                    .desired_width(220.0)
+                                    .text(format!("{} free of {}", human_size(free), human_size(total))),
+                            );
+                        });
+                    }
+                }
+                if let Some(note) = s.get("note").and_then(|v| v.as_str()) {
+                    ui.add_space(6.0);
+                    ui.label(RichText::new(note).color(OFF));
+                }
+                let apps: Vec<&serde_json::Value> =
+                    s.get("apps").and_then(|v| v.as_array()).map(|a| a.iter().collect()).unwrap_or_default();
+                if apps.is_empty() {
+                    return;
+                }
+                ui.add_space(8.0);
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(format!("RUNNING APPS ({})", apps.len())).size(14.0).strong());
+                    ui.add(egui::TextEdit::singleline(&mut mv.search).hint_text("Search").desired_width(160.0));
+                    ui.label(RichText::new("Sort by").color(OFF));
+                    if ui.selectable_label(!mv.by_cpu, "Memory").clicked() {
+                        mv.by_cpu = false;
+                    }
+                    if ui.selectable_label(mv.by_cpu, "CPU").clicked() {
+                        mv.by_cpu = true;
+                    }
+                });
+                if let Some(n) = &notice {
+                    ui.label(RichText::new(n).color(ONLINE));
+                }
+                let can_end = s.get("can_end").and_then(|v| v.as_bool()).unwrap_or(false);
+                if !can_end {
+                    ui.label(
+                        RichText::new("Ending apps is off — turn on \"Allow remote control\" in that PC's Settings.")
+                            .size(12.0)
+                            .color(OFF),
+                    );
+                }
+                let needle = mv.search.to_lowercase();
+                let mut shown: Vec<&serde_json::Value> = apps
+                    .into_iter()
+                    .filter(|a| {
+                        needle.is_empty()
+                            || a.get("name")
+                                .and_then(|n| n.as_str())
+                                .is_some_and(|n| n.to_lowercase().contains(&needle))
+                    })
+                    .collect();
+                let key = |a: &serde_json::Value, k: &str| a.get(k).and_then(|v| v.as_f64()).unwrap_or(0.0);
+                if mv.by_cpu {
+                    shown.sort_by(|a, b| key(b, "cpu").total_cmp(&key(a, "cpu")));
+                } else {
+                    shown.sort_by(|a, b| key(b, "mem").total_cmp(&key(a, "mem")));
+                }
+                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                    egui::Grid::new(("apps", mv.peer_id.clone()))
+                        .num_columns(4)
+                        .striped(true)
+                        .spacing([18.0, 6.0])
+                        .show(ui, |ui| {
+                            ui.label(RichText::new("App").color(OFF));
+                            ui.label(RichText::new("CPU").color(OFF));
+                            ui.label(RichText::new("Memory").color(OFF));
+                            ui.label("");
+                            ui.end_row();
+                            for a in shown {
+                                let name = a.get("name").and_then(|n| n.as_str()).unwrap_or("?");
+                                let count = a.get("count").and_then(|c| c.as_u64()).unwrap_or(1);
+                                let label = if count > 1 { format!("{name}  ×{count}") } else { name.to_string() };
+                                ui.label(RichText::new(label).strong());
+                                ui.label(format!("{:.1}%", key(a, "cpu")));
+                                ui.label(human_size(key(a, "mem") as u64));
+                                let protected = a.get("protected").and_then(|p| p.as_bool()).unwrap_or(false);
+                                if can_end && !protected {
+                                    if ui.small_button("End").clicked() {
+                                        mv.confirm_end = Some(name.to_string());
+                                    }
+                                } else {
+                                    ui.label("");
+                                }
+                                ui.end_row();
+                            }
+                        });
+                });
+            });
+        if let Some(name) = mv.confirm_end.clone() {
+            egui::Window::new("End this app?")
+                .id(egui::Id::new(("end-app", mv.peer_id.clone())))
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.label(format!("End {name} on {}? Anything unsaved in it will be lost.", mv.peer_name));
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.add(primary("End app")).clicked() {
+                            actions.push(Action::EndApp(mv.peer_id.clone(), name.clone()));
+                            mv.confirm_end = None;
+                        }
+                        if ui.add(secondary("Cancel")).clicked() {
+                            mv.confirm_end = None;
+                        }
+                    });
+                });
+        }
+        if !open {
+            actions.push(Action::CloseMonitor(mv.peer_id.clone()));
+        }
+    }
+}
+
+/// A small box with a big number and a line graph of the last few minutes.
+fn stat_card(ui: &mut egui::Ui, title: &str, value: String, hist: &std::collections::VecDeque<f32>, color: Color32) {
+    box_frame().show(ui, |ui| {
+        ui.set_width(250.0);
+        ui.label(RichText::new(title).size(12.0).color(OFF));
+        ui.label(RichText::new(value).size(20.0).strong());
+        let (rect, _) = ui.allocate_exact_size(Vec2::new(250.0, 46.0), Sense::hover());
+        ui.painter().rect_filled(rect, 4.0, Color32::from_rgb(6, 10, 8));
+        if hist.len() >= 2 {
+            let n = hist.len();
+            let points: Vec<Pos2> = hist
+                .iter()
+                .enumerate()
+                .map(|(k, v)| {
+                    let x = rect.right() - (n - 1 - k) as f32 / (HISTORY - 1) as f32 * rect.width();
+                    let y = rect.bottom() - 2.0 - v.clamp(0.0, 100.0) / 100.0 * (rect.height() - 4.0);
+                    Pos2::new(x, y)
+                })
+                .collect();
+            ui.painter().add(egui::Shape::line(points, Stroke::new(1.5, color)));
+        }
+    });
+}
+
+fn uptime_text(secs: u64) -> String {
+    let (d, h, m) = (secs / 86_400, secs / 3600 % 24, secs / 60 % 60);
+    if d > 0 {
+        format!("{d} d {h} h")
+    } else if h > 0 {
+        format!("{h} h {m} min")
+    } else {
+        format!("{m} min")
     }
 }
 
@@ -1913,6 +2242,9 @@ fn device_card(
         }
         if online && ui.add(secondary("View screen")).clicked() {
             actions.push(Action::ViewScreen(r.peer.id.clone()));
+        }
+        if online && ui.add(secondary("Monitor")).clicked() {
+            actions.push(Action::OpenMonitor(r.peer.id.clone()));
         }
         remove_controls(ui, r, confirm, actions);
     });
