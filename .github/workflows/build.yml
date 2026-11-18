@@ -67,6 +67,8 @@ jobs:
           flutter create --platforms=android --org app.nexus --project-name nexus_mobile .
           rm -f test/widget_test.dart
           python3 ../.github/patch_manifest.py android/app/src/main/AndroidManifest.xml
+          # Native Android parts: screen sharing service and the remote-control Accessibility service.
+          cp -r native/android/. android/app/src/main/
           # file_picker's transitive deps require compiling against Android API 36.
           # Also pin the NDK to one already installed on the runner so Gradle does
           # not try to download it mid-build (that download sometimes corrupts).
@@ -79,6 +81,8 @@ jobs:
             if [ -f "$f" ]; then
               sed -i -E 's/compileSdk(Version)?[ =]+flutter\.compileSdkVersion/compileSdk = 36/' "$f"
               sed -i -E 's/targetSdk(Version)?[ =]+flutter\.targetSdkVersion/targetSdk = 36/' "$f"
+              # Gestures for remote control need Android 7.0 (API 24) or newer.
+              sed -i -E 's/minSdk(Version)?[ =]+flutter\.minSdkVersion/minSdk = 24/' "$f"
               if [ -n "$NDK_VER" ]; then
                 sed -i -E "s/ndkVersion[ =]+flutter\.ndkVersion/ndkVersion = \"$NDK_VER\"/" "$f"
               fi

@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="nexus_accessibility_description">Lets devices you paired with Nexus tap, swipe, go Back or Home and type on this phone while they view its screen. Nexus only looks at the screen to find the text box you are typing into, and does not collect or store what is on screen. Turn this off at any time to stop remote control.</string>
+</resources>

@@ -9,6 +9,7 @@ import 'dart:typed_data';
 import 'package:battery_plus/battery_plus.dart';
 import 'package:cryptography/cryptography.dart';
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
 import 'package:path_provider/path_provider.dart';
 
 import 'protocol.dart';
@@ -873,7 +874,7 @@ class NexusNode extends ChangeNotifier {
         case 'fs_hello':
           await _fsServe(c, m);
         case 'screen_hello':
-          c.send({'t': 'error', 'reason': 'Viewing an Android screen isn\'t supported yet'});
+          await _screenServe(c, m);
         case 'pair_hello':
           await _hostPair(c, m);
       }
@@ -937,6 +938,123 @@ class NexusNode extends ChangeNotifier {
   }
 
   /// Serves file requests to a paired device over one authenticated connection.
+  /* ---------------------------------------------- sharing this phone */
+
+  static const _screenChannel = MethodChannel('nexus/screen');
+
+  Future<Object?> _native(String method, [Object? args]) async {
+    try {
+      return await _screenChannel.invokeMethod<Object?>(method, args);
+    } catch (_) {
+      return null; // not on Android, or the native side is unavailable
+    }
+  }
+
+  /// Asks Android for permission to share this phone's screen (shows the system prompt).
+  Future<bool> startScreenShare() async => await _native('startCapture', {'maxw': 1280}) == true;
+  Future<void> stopScreenShare() async => _native('stopCapture');
+  Future<bool> isScreenShared() async => await _native('isCapturing') == true;
+
+  /// Whether the Nexus Accessibility service is on, so paired devices can tap and type here.
+  Future<bool> controlEnabled() async => await _native('accessibilityEnabled') == true;
+  Future<void> openControlSettings() async => _native('openAccessibilitySettings');
+
+  /// A paired device wants to view or control this phone's screen.
+  Future<void> _screenServe(Conn c, Map<String, dynamic> m) async {
+    final requester = _str(m, 'id');
+    PairedPeer? peer;
+    for (final p in paired) {
+      if (p.id == requester) peer = p;
+    }
+    if (peer == null) {
+      c.send({'t': 'error', 'reason': '$name no longer trusts this device. Pair again.'});
+      return;
+    }
+    final nonceC = fromHex(_str(m, 'nonce'));
+    final ss = await sharedSecret(_keyPair, fromHex(peer.publicKey, 32));
+    final nonceS = randomBytes(16);
+    c.send({
+      't': 'screen_ready',
+      'nonce': toHex(nonceS),
+      'mac': toHex(await screenMac(ss, nonceC, nonceS, id, requester)),
+    });
+    final auth = await c.recv();
+    if (auth['t'] != 'screen_auth' ||
+        !sameBytes(await screenMac(ss, nonceS, nonceC, requester, id), fromHex(_str(auth, 'mac')))) {
+      c.send({'t': 'error', 'reason': 'Screen-sharing security check failed'});
+      return;
+    }
+    final first = await c.recv();
+    if (first['op'] == 'control') {
+      await _controlServe(c, peer.name);
+    } else {
+      await _streamServe(c, first, peer.name);
+    }
+  }
+
+  Future<void> _streamServe(Conn c, Map<String, dynamic> start, String who) async {
+    if (!await isScreenShared()) {
+      c.send({
+        'error': 'Screen sharing is off on $name. On the phone, open Nexus and turn on "Share this phone\'s screen".'
+      });
+      return;
+    }
+    final fps = ((start['fps'] as num?)?.toInt() ?? 8).clamp(1, 15);
+    var closed = false;
+    // The viewer sends nothing more; any line or a closed socket ends the stream.
+    unawaited(c.recv(const Duration(days: 1)).then((_) {}, onError: (_) {}).whenComplete(() => closed = true));
+    addLog('$who is viewing this phone\'s screen');
+    notifyListeners();
+    var lastSeq = -1;
+    var lastSent = DateTime.fromMillisecondsSinceEpoch(0);
+    while (!closed) {
+      final f = await _native('frame');
+      if (f is Map) {
+        final seq = (f['seq'] as num?)?.toInt() ?? 0;
+        final now = DateTime.now();
+        // Re-send the same picture every 2 s while nothing changes so the viewer stays connected.
+        if (seq != lastSeq || now.difference(lastSent).inMilliseconds >= 2000) {
+          final jpeg = f['jpeg'];
+          if (jpeg is Uint8List) {
+            c.send({'op': 'frame', 'w': f['w'], 'h': f['h'], 'seq': seq, 'data': base64Encode(jpeg)});
+            lastSeq = seq;
+            lastSent = now;
+          }
+        }
+      } else if (!await isScreenShared()) {
+        c.send({'error': 'Screen sharing was turned off on $name'});
+        break;
+      }
+      await Future<void>.delayed(Duration(milliseconds: 1000 ~/ fps));
+    }
+    addLog('$who stopped viewing this phone\'s screen');
+    notifyListeners();
+  }
+
+  Future<void> _controlServe(Conn c, String who) async {
+    if (!await controlEnabled()) {
+      c.send({
+        'error': 'Remote control is off on $name. On the phone, open Nexus and turn on "Let paired devices control this phone".'
+      });
+      return;
+    }
+    c.send({'op': 'ready'});
+    addLog('$who is controlling this phone');
+    notifyListeners();
+    while (true) {
+      final v = await c
+          .recv(const Duration(seconds: 20))
+          .then<Map<String, dynamic>?>((x) => x, onError: (Object _) => null);
+      if (v == null) break;
+      final op = v['op'];
+      if (op == 'bye') break;
+      if (op == null || op == 'ping') continue;
+      await _native('inject', v);
+    }
+    addLog('$who stopped controlling this phone');
+    notifyListeners();
+  }
+
   Future<void> _fsServe(Conn c, Map<String, dynamic> m) async {
     final requester = _str(m, 'id');
     PairedPeer? peer;

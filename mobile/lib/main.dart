@@ -213,6 +213,8 @@ class _HomePageState extends State<HomePage> {
         const SizedBox(height: 6),
         _NearbyBox(name: s.name, sub: '${s.os} · ${s.addr.address}', onPair: node.pair == null ? () => _pair(s) : null),
       ],
+      const SizedBox(height: 16),
+      _PhoneSharingBox(node: node),
       const SizedBox(height: 24),
       Center(
         child: TextButton(
@@ -256,6 +258,8 @@ class _HomePageState extends State<HomePage> {
       _pairByIp(context),
       const SizedBox(height: 18),
       _activity(),
+      const SizedBox(height: 12),
+      _PhoneSharingBox(node: node),
       const SizedBox(height: 12),
       _Box(
         child: Row(children: [
@@ -1381,6 +1385,112 @@ class _ScreenViewPageState extends State<ScreenViewPage> {
           ),
         ],
       ),
+    );
+  }
+}
+
+/// Lets paired devices see and control this phone. Screen sharing needs Android's
+/// "start casting" prompt each time; control needs the Nexus Accessibility service.
+class _PhoneSharingBox extends StatefulWidget {
+  const _PhoneSharingBox({required this.node});
+
+  final NexusNode node;
+
+  @override
+  State<_PhoneSharingBox> createState() => _PhoneSharingBoxState();
+}
+
+class _PhoneSharingBoxState extends State<_PhoneSharingBox> with WidgetsBindingObserver {
+  bool _sharing = false;
+  bool _control = false;
+  bool _busy = false;
+  Timer? _poll;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    _refresh();
+    // Sharing can also be stopped from the notification, so check now and then.
+    _poll = Timer.periodic(const Duration(seconds: 3), (_) => _refresh());
+  }
+
+  @override
+  void dispose() {
+    _poll?.cancel();
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) _refresh();
+  }
+
+  Future<void> _refresh() async {
+    final sharing = await widget.node.isScreenShared();
+    final control = await widget.node.controlEnabled();
+    if (mounted && (sharing != _sharing || control != _control)) {
+      setState(() {
+        _sharing = sharing;
+        _control = control;
+      });
+    }
+  }
+
+  Future<void> _toggleSharing(bool on) async {
+    setState(() => _busy = true);
+    if (on) {
+      final ok = await widget.node.startScreenShare();
+      if (!ok && mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Screen sharing was not allowed')),
+        );
+      }
+    } else {
+      await widget.node.stopScreenShare();
+    }
+    await Future<void>.delayed(const Duration(milliseconds: 400));
+    await _refresh();
+    if (mounted) setState(() => _busy = false);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return _Box(
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        const Text('SHARE THIS PHONE', style: TextStyle(color: online, fontSize: 11, letterSpacing: 1.5)),
+        const SizedBox(height: 6),
+        Row(children: [
+          const Expanded(
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Text("Share this phone's screen", style: TextStyle(fontWeight: FontWeight.w700, fontSize: 15)),
+              Text('Paired devices can see it. Android asks first and shows a notification while sharing.',
+                  style: TextStyle(fontSize: 12)),
+            ]),
+          ),
+          Switch(value: _sharing, activeTrackColor: accent, onChanged: _busy ? null : _toggleSharing),
+        ]),
+        const SizedBox(height: 10),
+        Row(children: [
+          Expanded(
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              const Text('Let paired devices control this phone',
+                  style: TextStyle(fontWeight: FontWeight.w700, fontSize: 15)),
+              Text(
+                _control
+                    ? 'On — paired devices can tap, swipe and type while viewing.'
+                    : 'Off — turn on "Nexus remote control" in Accessibility settings.',
+                style: TextStyle(fontSize: 12, color: _control ? online : off),
+              ),
+            ]),
+          ),
+          _SecondaryButton(
+            label: _control ? 'Settings' : 'Turn on',
+            onPressed: () => widget.node.openControlSettings(),
+          ),
+        ]),
+      ]),
     );
   }
 }
