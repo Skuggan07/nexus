@@ -16,6 +16,7 @@ perms = [
     "POST_NOTIFICATIONS",
     "REQUEST_INSTALL_PACKAGES",
     "RECORD_AUDIO",
+    "FOREGROUND_SERVICE_MICROPHONE",
 ]
 add = "".join(
     f'\n    <uses-permission android:name="android.permission.{p}"/>'
@@ -30,7 +31,7 @@ services = """
         <service
             android:name=".ScreenCaptureService"
             android:exported="false"
-            android:foregroundServiceType="mediaProjection" />
+            android:foregroundServiceType="mediaProjection|microphone" />
         <!-- Lets paired devices tap and type on this phone once the user turns it on in Accessibility settings. -->
         <service
             android:name=".NexusAccessibilityService"

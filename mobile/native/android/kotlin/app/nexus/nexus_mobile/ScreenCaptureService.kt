@@ -75,6 +75,21 @@ class ScreenCaptureService : Service() {
     private var lastFrameAt = 0L
     private var recorder: AudioRecord? = null
     private var listeners = 0
+    /** True once the service also runs as a "microphone" service, which Android needs
+     *  before it hands over real sound while Nexus is in the background. */
+    private var soundReady = false
+
+    private fun soundPermitted() = Build.VERSION.SDK_INT >= 29 &&
+        checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+
+    /** Called right after the user allows sound (Nexus is on screen then, which Android requires). */
+    fun enableSound() {
+        if (soundReady || !soundPermitted()) return
+        try {
+            startAsForeground()
+        } catch (e: Exception) {
+        }
+    }
 
     /**
      * Starts recording what this phone plays (Android 10+, needs the screen to be
@@ -88,6 +103,9 @@ class ScreenCaptureService : Service() {
             return "On the phone, open Nexus and tap Allow next to \"Let paired devices hear this phone\""
         }
         val mp = projection ?: return "Screen sharing is off on the phone"
+        if (!soundReady && Build.VERSION.SDK_INT >= 30) {
+            return "On the phone, turn \"Share this phone's screen\" off and on again, then turn on sound"
+        }
         if (recorder == null) {
             val cfg = AudioPlaybackCaptureConfiguration.Builder(mp)
                 .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
@@ -256,6 +274,20 @@ class ScreenCaptureService : Service() {
             .setOngoing(true)
             .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Stop", stop)
             .build()
+        if (Build.VERSION.SDK_INT >= 30 && soundPermitted()) {
+            // Also a "microphone" service, so Android gives Nexus the real sound (not
+            // silence) while another app is in front.
+            try {
+                startForeground(
+                    1, notification,
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE,
+                )
+                soundReady = true
+                return
+            } catch (e: Exception) {
+                // Fall back to screen only.
+            }
+        }
         if (Build.VERSION.SDK_INT >= 29) {
             startForeground(1, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
         } else {

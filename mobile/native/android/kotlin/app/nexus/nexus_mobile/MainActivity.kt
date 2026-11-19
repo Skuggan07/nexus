@@ -217,6 +217,14 @@ class MainActivity : FlutterActivity() {
         }
     }
 
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == 7301 && grantResults.firstOrNull() == PackageManager.PERMISSION_GRANTED) {
+            // If the screen is already shared, let it share sound too.
+            ScreenCaptureService.instance?.enableSound()
+        }
+    }
+
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         if (intent.action != INSTALL_STATUS) return
