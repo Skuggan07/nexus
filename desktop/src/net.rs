@@ -48,6 +48,9 @@ pub const LABEL_CMD: &[u8] = b"nexus-cmd-v2";
 pub const LABEL_CMDACK: &[u8] = b"nexus-cmdack-v2";
 pub const LABEL_FS: &[u8] = b"nexus-fs-v2";
 pub const LABEL_SCREEN: &[u8] = b"nexus-screen-v2";
+/// Keys for the encrypted part of file and screen links, one per direction.
+pub const LABEL_LINK_C2S: &[u8] = b"nexus-link-c2s-v1";
+pub const LABEL_LINK_S2C: &[u8] = b"nexus-link-s2c-v1";
 /// UDP port the Wake-on-LAN magic packet is sent to (9 = the usual "discard" port).
 pub const WOL_PORT: u16 = 9;
 /// File data travels in chunks of this many bytes (sent as hex inside a JSON line).
@@ -231,10 +234,52 @@ fn unexpected() -> String {
 
 /* --------------------------------------------------------------- wire */
 
-/// Newline-delimited JSON over TCP.
+/// One direction of an encrypted link: ChaCha20-Poly1305 with a message counter as nonce.
+struct Sealer {
+    cipher: chacha20poly1305::ChaCha20Poly1305,
+    counter: u64,
+}
+
+impl Sealer {
+    fn new(key: &[u8]) -> Self {
+        use chacha20poly1305::KeyInit;
+        Sealer {
+            cipher: chacha20poly1305::ChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(&key[..32])),
+            counter: 0,
+        }
+    }
+    fn nonce(&mut self) -> [u8; 12] {
+        let mut n = [0u8; 12];
+        n[4..].copy_from_slice(&self.counter.to_le_bytes());
+        self.counter += 1;
+        n
+    }
+    fn seal(&mut self, plain: &[u8]) -> Result<Vec<u8>, String> {
+        use chacha20poly1305::aead::Aead;
+        let n = self.nonce();
+        self.cipher.encrypt(chacha20poly1305::Nonce::from_slice(&n), plain).map_err(|_| "Could not encrypt".to_string())
+    }
+    fn open(&mut self, sealed: &[u8]) -> Result<Vec<u8>, String> {
+        use chacha20poly1305::aead::Aead;
+        let n = self.nonce();
+        self.cipher
+            .decrypt(chacha20poly1305::Nonce::from_slice(&n), sealed)
+            .map_err(|_| "A message failed its security check (it was changed on the way)".to_string())
+    }
+}
+
+/// The two directional keys of a link, from the shared secret and both nonces.
+fn link_keys(ss: &[u8], nonce_c: &[u8], nonce_s: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    (mac(ss, &[LABEL_LINK_C2S, nonce_c, nonce_s]), mac(ss, &[LABEL_LINK_S2C, nonce_c, nonce_s]))
+}
+
+/// Newline-delimited JSON over TCP. After a file or screen handshake, every line is
+/// encrypted: `{"x":"<base64 ciphertext+tag>"}`.
 struct Conn {
     reader: BufReader<TcpStream>,
     writer: TcpStream,
+    tx: Option<Sealer>,
+    rx: Option<Sealer>,
 }
 
 impl Conn {
@@ -243,21 +288,25 @@ impl Conn {
         s.set_write_timeout(Some(Duration::from_secs(10))).map_err(|e| e.to_string())?;
         let _ = s.set_nodelay(true);
         let writer = s.try_clone().map_err(|e| e.to_string())?;
-        Ok(Self { reader: BufReader::new(s), writer })
+        Ok(Self { reader: BufReader::new(s), writer, tx: None, rx: None })
     }
-    fn send(&mut self, m: &Msg) -> Result<(), String> {
-        send_msg(&mut self.writer, m)
+    /// From now on every line in both directions is encrypted.
+    fn secure(&mut self, send_key: &[u8], recv_key: &[u8]) {
+        self.tx = Some(Sealer::new(send_key));
+        self.rx = Some(Sealer::new(recv_key));
     }
-    fn recv(&mut self) -> Result<Msg, String> {
-        read_msg(&mut self.reader)
-    }
-    /// A plain JSON line, used for file-transfer frames after both sides have authenticated.
-    fn send_val(&mut self, v: &serde_json::Value) -> Result<(), String> {
-        let mut line = v.to_string();
+    fn write_line(&mut self, text: String) -> Result<(), String> {
+        let mut line = match &mut self.tx {
+            Some(tx) => {
+                let sealed = tx.seal(text.as_bytes())?;
+                serde_json::json!({ "x": base64::engine::general_purpose::STANDARD.encode(sealed) }).to_string()
+            }
+            None => text,
+        };
         line.push('\n');
         self.writer.write_all(line.as_bytes()).map_err(|_| "Connection lost".to_string())
     }
-    fn recv_val(&mut self) -> Result<serde_json::Value, String> {
+    fn read_line(&mut self) -> Result<String, String> {
         let mut line = String::new();
         let n = self
             .reader
@@ -268,6 +317,38 @@ impl Conn {
         if n == 0 {
             return Err("The other device closed the connection".into());
         }
+        let Some(rx) = &mut self.rx else { return Ok(line) };
+        let v: serde_json::Value = serde_json::from_str(&line).map_err(|_| "Garbled message".to_string())?;
+        // The handshake's own refusal (e.g. a failed security check) arrives unencrypted.
+        if v.get("t").and_then(|t| t.as_str()) == Some("error") {
+            return Ok(line);
+        }
+        let Some(x) = v.get("x").and_then(|x| x.as_str()) else {
+            return Err(
+                "The other device doesn't encrypt yet — update Nexus on both devices to the newest build".into()
+            );
+        };
+        let sealed = base64::engine::general_purpose::STANDARD.decode(x).map_err(|_| "Garbled message".to_string())?;
+        String::from_utf8(rx.open(&sealed)?).map_err(|_| "Garbled message".to_string())
+    }
+    fn send(&mut self, m: &Msg) -> Result<(), String> {
+        let text = serde_json::to_string(m).map_err(|e| e.to_string())?;
+        self.write_line(text)
+    }
+    /// Reads one message. An `error` message from the other side becomes `Err(reason)`.
+    fn recv(&mut self) -> Result<Msg, String> {
+        let line = self.read_line()?;
+        match serde_json::from_str(&line).map_err(|_| "Garbled message".to_string())? {
+            Msg::Error { reason } => Err(reason),
+            m => Ok(m),
+        }
+    }
+    /// A JSON line (requests, file data, frames) after both sides have authenticated.
+    fn send_val(&mut self, v: &serde_json::Value) -> Result<(), String> {
+        self.write_line(v.to_string())
+    }
+    fn recv_val(&mut self) -> Result<serde_json::Value, String> {
+        let line = self.read_line()?;
         serde_json::from_str(&line).map_err(|_| "Garbled message".to_string())
     }
 }
@@ -396,6 +477,8 @@ fn fs_serve(mut c: Conn, me: &Identity, shared: &SharedState, id: String, nonce_
         if !mac_ok(&ss, &[LABEL_FS, &nonce_s, &nonce_c, id.as_bytes(), me.id.as_bytes()], &mac_c) {
             return Err("The other device failed the file-transfer security check".into());
         }
+        let (c2s, s2c) = link_keys(&ss, &nonce_c, &nonce_s);
+        c.secure(&s2c, &c2s);
         Ok(())
     })();
     if let Err(e) = setup {
@@ -449,6 +532,8 @@ fn screen_auth_host(
     if !mac_ok(&ss, &[LABEL_SCREEN, &nonce_s, &nonce_c, id.as_bytes(), me.id.as_bytes()], &mac_c) {
         return Err("The other device failed the screen-sharing security check".into());
     }
+    let (c2s, s2c) = link_keys(&ss, &nonce_c, &nonce_s);
+    c.secure(&s2c, &c2s);
     Ok(())
 }
 
@@ -975,6 +1060,8 @@ fn screen_open(me: &Identity, peer: &PairedPeer, addr: SocketAddr) -> Result<Con
     }
     let mac_c = mac(&ss, &[LABEL_SCREEN, &nonce_s, &nonce_c, me.id.as_bytes(), peer.id.as_bytes()]);
     c.send(&Msg::ScreenAuth { mac: hex::encode(mac_c) })?;
+    let (c2s, s2c) = link_keys(&ss, &nonce_c, &nonce_s);
+    c.secure(&c2s, &s2c);
     Ok(c)
 }
 
@@ -1297,7 +1384,7 @@ fn host_pair(
 
 /// Shows the code, then waits for both users to confirm. Returns the peer's IP.
 fn agree(shared: &SharedState, sid: u64, c: Conn, code: String, peer_name: &str) -> Result<std::net::IpAddr, String> {
-    let Conn { reader, mut writer } = c;
+    let Conn { reader, mut writer, .. } = c;
     let peer_ip = writer.peer_addr().map_err(|e| e.to_string())?.ip();
     let _ = reader.get_ref().set_read_timeout(Some(DECIDE_TIMEOUT + Duration::from_secs(10)));
     let closer = writer.try_clone().map_err(|e| e.to_string())?;
@@ -1534,6 +1621,8 @@ fn fs_open(me: &Identity, peer: &PairedPeer, addr: SocketAddr) -> Result<Conn, S
     }
     let mac_c = mac(&ss, &[LABEL_FS, &nonce_s, &nonce_c, me.id.as_bytes(), peer.id.as_bytes()]);
     c.send(&Msg::FsAuth { mac: hex::encode(mac_c) })?;
+    let (c2s, s2c) = link_keys(&ss, &nonce_c, &nonce_s);
+    c.secure(&c2s, &s2c);
     Ok(c)
 }
 
@@ -1740,6 +1829,20 @@ pub fn start_status_checker(me: Arc<Identity>, shared: SharedState, dir: PathBuf
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sealed_lines_match_the_standard_and_reject_changes() {
+        let key = [7u8; 32];
+        let (mut a, mut b) = (Sealer::new(&key), Sealer::new(&key));
+        // ChaCha20-Poly1305 of "hello" with counters 0 and 1 (checked against Python's cryptography).
+        let first = a.seal(b"hello").unwrap();
+        assert_eq!(hex::encode(&first), "5fe145600f713b52169600ba59cc38ed54e2412b48");
+        let mut second = a.seal(b"hello").unwrap();
+        assert_eq!(hex::encode(&second), "d2365c0c4a4837e572827d7cdd6e098edd6fe6a85f");
+        assert_eq!(b.open(&first).unwrap(), b"hello");
+        second[0] ^= 1;
+        assert!(b.open(&second).is_err());
+    }
     use crate::state::Shared;
     use std::sync::Mutex;
     use x25519_dalek::{PublicKey, StaticSecret};
