@@ -125,6 +125,8 @@ struct ScreenView {
     /// Centre of the visible part, in fractions (0..1) of the picture.
     center: Pos2,
     fullscreen: bool,
+    /// Shown in its own always-on-top window outside the Nexus window.
+    floating: bool,
     fps: f32,
     fps_frames: u64,
     fps_at: Instant,
@@ -231,6 +233,8 @@ enum Action {
     SwitchMonitor(String, usize),
     /// Turn the other PC's sound on or off for a view (by key).
     SetSound(String, bool),
+    /// Pop a view out into its own floating window, or put it back (by key).
+    SetFloating(String, bool),
     ViewAllScreens,
     CloseScreen(String),
     SetQuality(String, Quality),
@@ -419,6 +423,12 @@ impl NexusApp {
                         Some(sv) => sv.open_rest = true,
                         None => self.open_screen(id, 0, true),
                     },
+                }
+            }
+            Action::SetFloating(key, on) => {
+                if let Some(sv) = self.screens.iter_mut().find(|s| s.key == key) {
+                    sv.floating = on;
+                    sv.fullscreen = false;
                 }
             }
             Action::SetSound(key, on) => {
@@ -626,6 +636,7 @@ impl NexusApp {
             zoom: 1.0,
             center: Pos2::new(0.5, 0.5),
             fullscreen: false,
+            floating: false,
             fps: 0.0,
             fps_frames: 0,
             fps_at: Instant::now(),
@@ -1636,7 +1647,47 @@ impl NexusApp {
 
         let mut out: Vec<serde_json::Value> = Vec::new();
         let mut pic: Option<(egui::Rect, egui::LayerId)> = None;
-        if sv.fullscreen {
+        if sv.floating {
+            // Its own always-on-top window. Closing it puts the screen back into Nexus.
+            let title = if sv.mons > 1 {
+                format!("{} — monitor {} · Nexus", sv.peer_name, sv.monitor + 1)
+            } else {
+                format!("{} · Nexus", sv.peer_name)
+            };
+            let want_full = sv.fullscreen;
+            let mut close = false;
+            ctx.show_viewport_immediate(
+                egui::ViewportId::from_hash_of(("float", sv.key.clone())),
+                egui::ViewportBuilder::default()
+                    .with_title(title)
+                    .with_inner_size([800.0, 500.0])
+                    .with_min_inner_size([260.0, 160.0])
+                    .with_window_level(egui::viewport::WindowLevel::AlwaysOnTop),
+                |vctx, _class| {
+                    if vctx.input(|i| i.viewport().close_requested()) {
+                        close = true;
+                    }
+                    let is_full = vctx.input(|i| i.viewport().fullscreen);
+                    if is_full.unwrap_or(false) != want_full {
+                        vctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(want_full));
+                    }
+                    let mut here: Option<(egui::Rect, egui::LayerId)> = None;
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::none().fill(Color32::BLACK).inner_margin(Margin::same(6.0)))
+                        .show(vctx, |ui| {
+                            screen_toolbar(ui, sv, live, dims, ctl_ready, &ctl_error, &mut out, actions);
+                            let h = (ui.available_height() - 2.0).max(60.0);
+                            here = screen_picture(ui, sv, &error, h).map(|r| (r, ui.layer_id()));
+                        });
+                    if let Some((rect, layer)) = here {
+                        screen_input(vctx, sv, rect, layer, &mut out, actions);
+                    }
+                },
+            );
+            if close {
+                actions.push(Action::SetFloating(sv.key.clone(), false));
+            }
+        } else if sv.fullscreen {
             let screen = ctx.screen_rect();
             egui::Area::new(egui::Id::new(("screen-full", sv.key.clone())))
                 .order(egui::Order::Foreground)
@@ -2013,6 +2064,14 @@ fn screen_toolbar(
         let label = if sv.fullscreen { "Exit fullscreen" } else { "Fullscreen" };
         if ui.add(secondary(label)).clicked() {
             actions.push(Action::SetFullscreen(sv.key.clone(), !sv.fullscreen));
+        }
+        let (float_label, float_tip) = if sv.floating {
+            ("Back into Nexus", "Put this screen back inside the Nexus window")
+        } else {
+            ("Pop out", "Its own window that stays on top of everything — move it and resize it")
+        };
+        if ui.add(secondary(float_label)).on_hover_text(float_tip).clicked() {
+            actions.push(Action::SetFloating(sv.key.clone(), !sv.floating));
         }
         if sv.mons > 1 {
             ui.separator();

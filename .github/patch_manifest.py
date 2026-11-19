@@ -46,6 +46,10 @@ services = """
                 android:resource="@xml/nexus_accessibility" />
         </service>
 """
+# Lets a viewed screen shrink into a small floating window (picture-in-picture).
+if "supportsPictureInPicture" not in s:
+    s = s.replace("<activity", '<activity\n            android:supportsPictureInPicture="true"', 1)
+
 if "ScreenCaptureService" not in s:
     s = s.replace("</application>", services + "    </application>", 1)
 

@@ -383,7 +383,17 @@ class NexusNode extends ChangeNotifier {
 
   /* ------------------------------------------------------------ startup */
 
+  /// True while Nexus is shrunk into Android's floating picture-in-picture window.
+  final pip = ValueNotifier<bool>(false);
+
+  /// Shrinks Nexus into a floating window shaped like a [w]×[h] picture. False if the phone can't.
+  Future<bool> enterPip(int w, int h) async => await _native('enterPip', {'w': w, 'h': h}) == true;
+
   Future<void> start() async {
+    _screenChannel.setMethodCallHandler((call) async {
+      if (call.method == 'pip') pip.value = call.arguments == true;
+      return null;
+    });
     try {
       _dir = await getApplicationSupportDirectory();
       await _loadIdentity();

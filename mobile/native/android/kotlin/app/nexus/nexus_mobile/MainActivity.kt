@@ -3,11 +3,13 @@ package app.nexus.nexus_mobile
 import android.Manifest
 import android.app.Activity
 import android.app.PendingIntent
+import android.app.PictureInPictureParams
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageInstaller
 import android.content.pm.PackageManager
+import android.content.res.Configuration
 import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioTrack
@@ -15,6 +17,7 @@ import android.media.projection.MediaProjectionManager
 import android.net.Uri
 import android.os.Build
 import android.provider.Settings
+import android.util.Rational
 import android.widget.Toast
 import java.io.File
 import io.flutter.embedding.android.FlutterActivity
@@ -46,9 +49,19 @@ class MainActivity : FlutterActivity() {
         soundTrack = null
     }
 
+    private var channel: MethodChannel? = null
+
+    /** Tells the Dart side when the app goes into or out of the floating picture-in-picture window. */
+    override fun onPictureInPictureModeChanged(isInPictureInPictureMode: Boolean, newConfig: Configuration) {
+        super.onPictureInPictureModeChanged(isInPictureInPictureMode, newConfig)
+        channel?.invokeMethod("pip", isInPictureInPictureMode)
+    }
+
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
-        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "nexus/screen").setMethodCallHandler { call, result ->
+        val ch = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "nexus/screen")
+        channel = ch
+        ch.setMethodCallHandler { call, result ->
             when (call.method) {
                 "startCapture" -> {
                     if (ScreenCaptureService.running) {
@@ -159,6 +172,27 @@ class MainActivity : FlutterActivity() {
                 "audioStop" -> {
                     soundThread.execute { soundStopNow() }
                     result.success(null)
+                }
+                // Shrinks Nexus into a small floating window over other apps (Android 8+).
+                "enterPip" -> {
+                    if (Build.VERSION.SDK_INT >= 26) {
+                        val w = call.argument<Int>("w") ?: 0
+                        val h = call.argument<Int>("h") ?: 0
+                        // Android only allows shapes between 1:2.39 and 2.39:1.
+                        val shape = if (w > 0 && h > 0) (w.toDouble() / h).coerceIn(0.43, 2.38) else 16.0 / 9.0
+                        val ok = try {
+                            enterPictureInPictureMode(
+                                PictureInPictureParams.Builder()
+                                    .setAspectRatio(Rational((shape * 1000).toInt(), 1000))
+                                    .build()
+                            )
+                        } catch (e: Exception) {
+                            false
+                        }
+                        result.success(ok)
+                    } else {
+                        result.success(false)
+                    }
                 }
                 "installApk" -> {
                     val path = call.argument<String>("path")

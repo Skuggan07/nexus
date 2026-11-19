@@ -1543,6 +1543,11 @@ class _ScreenViewPageState extends State<ScreenViewPage> {
             onPressed: () => _zoom.value = Matrix4.identity(),
           ),
         IconButton(
+          tooltip: 'Pop out — a small floating window over your other apps',
+          icon: const Icon(Icons.picture_in_picture_alt, color: white),
+          onPressed: _popOut,
+        ),
+        IconButton(
           tooltip: 'Fullscreen',
           icon: const Icon(Icons.fullscreen, color: white),
           onPressed: () => _setFullscreen(true),
@@ -1635,8 +1640,38 @@ class _ScreenViewPageState extends State<ScreenViewPage> {
     return _picture();
   }
 
+  /// Shrinks Nexus into a floating window showing just this screen. Drag it around,
+  /// pinch to resize, tap it to go back to the full app.
+  Future<void> _popOut() async {
+    if (_fullscreen) _setFullscreen(false);
+    final ok = await widget.node.enterPip(_w, _h);
+    if (!ok && mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('This phone can\'t show a floating window — turn on "Picture-in-picture" for Nexus in Android settings')),
+      );
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
+    return ValueListenableBuilder<bool>(
+      valueListenable: widget.node.pip,
+      builder: (context, floating, _) {
+        if (!floating) return _page(context);
+        // In the floating window: only the picture.
+        return Scaffold(
+          backgroundColor: Colors.black,
+          body: Center(
+            child: _frame != null
+                ? Image.memory(_frame!, gaplessPlayback: true, fit: BoxFit.contain)
+                : const CircularProgressIndicator(color: accent),
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _page(BuildContext context) {
     if (_fullscreen) {
       return PopScope(
         canPop: false,
