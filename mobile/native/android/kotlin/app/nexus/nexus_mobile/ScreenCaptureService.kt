@@ -24,6 +24,8 @@ import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.IBinder
+import android.os.PowerManager
+import android.net.wifi.WifiManager
 import android.os.SystemClock
 import android.util.DisplayMetrics
 import android.view.Display
@@ -44,6 +46,9 @@ class ScreenCaptureService : Service() {
         @Volatile private var latestW = 0
         @Volatile private var latestH = 0
         @Volatile private var seq = 0L
+
+        /** Set when the user turns sharing off, so Nexus knows any other stop came from Android. */
+        @Volatile var stoppedByUser = false
 
         /** The running service, while the screen is shared. */
         @Volatile var instance: ScreenCaptureService? = null
@@ -191,6 +196,7 @@ class ScreenCaptureService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == "stop") {
+            stoppedByUser = true
             stopSelf()
             return START_NOT_STICKY
         }
@@ -216,6 +222,7 @@ class ScreenCaptureService : Service() {
         }
         projection = mp
         activeProjection = mp
+        stoppedByUser = false
         instance = this
         val thread = HandlerThread("nexus-capture").also { it.start() }
         worker = thread
@@ -267,6 +274,7 @@ class ScreenCaptureService : Service() {
             DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, r.surface, null, handler,
         )
         running = true
+        keepRunning()
         return START_NOT_STICKY
     }
 
@@ -319,7 +327,64 @@ class ScreenCaptureService : Service() {
         }
     }
 
+    private var wake: PowerManager.WakeLock? = null
+    private var wifi: WifiManager.WifiLock? = null
+
+    /** Keeps the phone's processor and Wi-Fi awake while sharing, so it doesn't stop
+     *  when the screen turns off or the phone is locked. */
+    private fun keepRunning() {
+        try {
+            val pm = getSystemService(POWER_SERVICE) as PowerManager
+            wake = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "nexus:sharing").also {
+                it.setReferenceCounted(false)
+                it.acquire()
+            }
+        } catch (e: Exception) {
+        }
+        try {
+            val wm = applicationContext.getSystemService(WIFI_SERVICE) as WifiManager
+            @Suppress("DEPRECATION")
+            wifi = wm.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "nexus:sharing").also {
+                it.setReferenceCounted(false)
+                it.acquire()
+            }
+        } catch (e: Exception) {
+        }
+    }
+
+    /** If Android ended sharing (not the user), say so and offer a one-tap way back. */
+    private fun tellStopped() {
+        try {
+            val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+            val open = PendingIntent.getActivity(
+                this, 2, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE,
+            )
+            val builder = if (Build.VERSION.SDK_INT >= 26) {
+                Notification.Builder(this, CHANNEL)
+            } else {
+                @Suppress("DEPRECATION")
+                Notification.Builder(this)
+            }
+            nm.notify(
+                2,
+                builder
+                    .setContentTitle("Screen sharing stopped")
+                    .setContentText("Android stopped it. Tap to open Nexus and turn it back on.")
+                    .setSmallIcon(android.R.drawable.ic_menu_view)
+                    .setContentIntent(open)
+                    .setAutoCancel(true)
+                    .build(),
+            )
+        } catch (e: Exception) {
+        }
+    }
+
     override fun onDestroy() {
+        if (running && !stoppedByUser) tellStopped()
+        try { wake?.release() } catch (e: Exception) {}
+        try { wifi?.release() } catch (e: Exception) {}
+        wake = null
+        wifi = null
         running = false
         latest = null
         // Only forget the recording if it is still ours (a new one may have started already).

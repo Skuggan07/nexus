@@ -479,8 +479,11 @@ fn screen_serve(mut c: Conn, me: &Arc<Identity>, shared: &SharedState, dir: &Pat
     let monitor = start.get("monitor").and_then(|x| x.as_u64()).unwrap_or(0).min(16) as usize;
     let who = peer_name(shared, &id);
     lock(shared).log(format!("{who} is viewing this screen"));
+    // Don't let this PC go to sleep (or its screen turn off) while someone is watching it.
+    crate::screen::keep_display_awake(true);
     let gap = Duration::from_millis(1000 / fps);
     let mut seq: u64 = 0;
+    let mut waiting_since: Option<Instant> = None;
     loop {
         let started = Instant::now();
         match crate::screen::capture_jpeg(monitor, max_w, quality) {
@@ -493,10 +496,18 @@ fn screen_serve(mut c: Conn, me: &Arc<Identity>, shared: &SharedState, dir: &Pat
                     break; // viewer closed the window
                 }
                 seq += 1;
+                waiting_since = None;
             }
             Err(e) => {
-                let _ = c.send_val(&serde_json::json!({ "error": e }));
-                break;
+                // The screen can't be read for a moment (the lock screen, a UAC prompt, a
+                // monitor waking up). Keep the link open and try again instead of stopping.
+                if waiting_since.map_or(true, |t| t.elapsed() >= Duration::from_secs(1)) {
+                    if c.send_val(&serde_json::json!({ "op": "wait", "why": e })).is_err() {
+                        break;
+                    }
+                    waiting_since = Some(Instant::now());
+                }
+                thread::sleep(Duration::from_millis(300));
             }
         }
         let spent = started.elapsed();
@@ -504,6 +515,7 @@ fn screen_serve(mut c: Conn, me: &Arc<Identity>, shared: &SharedState, dir: &Pat
             thread::sleep(gap - spent);
         }
     }
+    crate::screen::keep_display_awake(false);
     lock(shared).log(format!("{who} stopped viewing this screen"));
 }
 

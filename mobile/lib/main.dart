@@ -1258,7 +1258,20 @@ class _ScreenViewPageState extends State<ScreenViewPage> {
     _listen();
   }
 
+  /// Tries the picture again a few seconds after the link drops.
+  Timer? _retry;
+
+  void _reconnectSoon(String why) {
+    if (!mounted) return;
+    setState(() => _error = '$why — reconnecting…');
+    _retry?.cancel();
+    _retry = Timer(const Duration(seconds: 3), () {
+      if (mounted) _listen();
+    });
+  }
+
   void _listen() {
+    _retry?.cancel();
     _sub?.cancel();
     _sub = widget.node
         .screenStream(widget.peer,
@@ -1276,10 +1289,8 @@ class _ScreenViewPageState extends State<ScreenViewPage> {
           _error = null;
         });
       },
-      onError: (Object e) {
-        if (!mounted) return;
-        setState(() => _error = '$e');
-      },
+      onError: (Object e) => _reconnectSoon('$e'),
+      onDone: () => _reconnectSoon('The connection ended'),
       cancelOnError: true,
     );
   }
@@ -1345,6 +1356,7 @@ class _ScreenViewPageState extends State<ScreenViewPage> {
 
   @override
   void dispose() {
+    _retry?.cancel();
     _sub?.cancel();
     if (_soundSub != null) {
       _soundSub!.cancel();
@@ -1895,7 +1907,19 @@ class _LiveTileState extends State<_LiveTile> {
     _start();
   }
 
+  Timer? _retry;
+
+  void _again(String why) {
+    if (!mounted) return;
+    setState(() => _error = '$why — reconnecting…');
+    _retry?.cancel();
+    _retry = Timer(const Duration(seconds: 3), () {
+      if (mounted) _start();
+    });
+  }
+
   void _start() {
+    _retry?.cancel();
     _sub?.cancel();
     _sub = widget.node.screenStream(widget.peer, fps: 5, maxW: 960, quality: 60, monitor: _monitor).listen(
       (f) {
@@ -1906,15 +1930,15 @@ class _LiveTileState extends State<_LiveTile> {
           _mons = f.mons;
         });
       },
-      onError: (Object e) {
-        if (mounted) setState(() => _error = '$e');
-      },
+      onError: (Object e) => _again('$e'),
+      onDone: () => _again('The connection ended'),
       cancelOnError: true,
     );
   }
 
   @override
   void dispose() {
+    _retry?.cancel();
     _sub?.cancel();
     super.dispose();
   }
@@ -1923,6 +1947,7 @@ class _LiveTileState extends State<_LiveTile> {
   Widget build(BuildContext context) {
     return GestureDetector(
       onTap: () async {
+        _retry?.cancel();
         _sub?.cancel(); // free the connection while the big viewer is open
         await Navigator.of(context).push(
           MaterialPageRoute<void>(
@@ -2016,6 +2041,7 @@ class _PhoneSharingBoxState extends State<_PhoneSharingBox> with WidgetsBindingO
   bool _sharing = false;
   bool _control = false;
   bool _sound = false;
+  bool _battery = true;
   bool _busy = false;
   Timer? _poll;
 
@@ -2044,11 +2070,13 @@ class _PhoneSharingBoxState extends State<_PhoneSharingBox> with WidgetsBindingO
     final sharing = await widget.node.isScreenShared();
     final control = await widget.node.controlEnabled();
     final sound = await widget.node.soundAllowed();
-    if (mounted && (sharing != _sharing || control != _control || sound != _sound)) {
+    final battery = await widget.node.batteryFree();
+    if (mounted && (sharing != _sharing || control != _control || sound != _sound || battery != _battery)) {
       setState(() {
         _sharing = sharing;
         _control = control;
         _sound = sound;
+        _battery = battery;
       });
     }
   }
@@ -2127,6 +2155,26 @@ class _PhoneSharingBoxState extends State<_PhoneSharingBox> with WidgetsBindingO
                 await Future<void>.delayed(const Duration(seconds: 1));
                 await _refresh();
               },
+            ),
+        ]),
+        const SizedBox(height: 10),
+        Row(children: [
+          Expanded(
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              const Text('Keep sharing when the phone is locked',
+                  style: TextStyle(fontWeight: FontWeight.w700, fontSize: 15)),
+              Text(
+                _battery
+                    ? 'On — Android won\'t stop Nexus to save battery.'
+                    : 'Android may stop sharing to save battery. Tap Allow, then choose "Allow".',
+                style: TextStyle(fontSize: 12, color: _battery ? online : off),
+              ),
+            ]),
+          ),
+          if (!_battery)
+            _SecondaryButton(
+              label: 'Allow',
+              onPressed: () => widget.node.askBatteryFree(),
             ),
         ]),
       ]),

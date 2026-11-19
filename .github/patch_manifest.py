@@ -17,6 +17,7 @@ perms = [
     "REQUEST_INSTALL_PACKAGES",
     "RECORD_AUDIO",
     "FOREGROUND_SERVICE_MICROPHONE",
+    "REQUEST_IGNORE_BATTERY_OPTIMIZATIONS",
 ]
 add = "".join(
     f'\n    <uses-permission android:name="android.permission.{p}"/>'

@@ -22,6 +22,8 @@ import android.widget.Toast
 import java.io.File
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
+import io.flutter.embedding.engine.FlutterEngineCache
+import io.flutter.embedding.engine.dart.DartExecutor
 import io.flutter.plugin.common.MethodChannel
 
 /** Bridges the Dart side to screen sharing (MediaProjection) and remote control (Accessibility). */
@@ -51,6 +53,22 @@ class MainActivity : FlutterActivity() {
 
     private var channel: MethodChannel? = null
 
+    /**
+     * One Nexus engine for the whole app run. Closing the Nexus screen (or swiping it
+     * away) then doesn't stop Nexus, so screen sharing, sound and the clipboard keep
+     * working in the background while sharing is on.
+     */
+    override fun provideFlutterEngine(context: Context): FlutterEngine? {
+        val cache = FlutterEngineCache.getInstance()
+        cache.get("nexus")?.let { return it }
+        val engine = FlutterEngine(context.applicationContext)
+        engine.dartExecutor.executeDartEntrypoint(DartExecutor.DartEntrypoint.createDefault())
+        cache.put("nexus", engine)
+        return engine
+    }
+
+    override fun shouldDestroyEngineWithHost(): Boolean = false
+
     /** Tells the Dart side when the app goes into or out of the floating picture-in-picture window. */
     override fun onPictureInPictureModeChanged(isInPictureInPictureMode: Boolean, newConfig: Configuration) {
         super.onPictureInPictureModeChanged(isInPictureInPictureMode, newConfig)
@@ -76,6 +94,7 @@ class MainActivity : FlutterActivity() {
                     }
                 }
                 "stopCapture" -> {
+                    ScreenCaptureService.stoppedByUser = true
                     stopService(Intent(this, ScreenCaptureService::class.java))
                     result.success(true)
                 }
@@ -193,6 +212,25 @@ class MainActivity : FlutterActivity() {
                     } else {
                         result.success(false)
                     }
+                }
+                // Asks Android not to put Nexus to sleep to save battery (keeps sharing going).
+                "batteryFree" -> {
+                    val pm = getSystemService(POWER_SERVICE) as android.os.PowerManager
+                    result.success(pm.isIgnoringBatteryOptimizations(packageName))
+                }
+                "askBatteryFree" -> {
+                    try {
+                        @Suppress("BatteryLife")
+                        startActivity(
+                            Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:$packageName"))
+                        )
+                    } catch (e: Exception) {
+                        try {
+                            startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+                        } catch (e2: Exception) {
+                        }
+                    }
+                    result.success(null)
                 }
                 "installApk" -> {
                     val path = call.argument<String>("path")

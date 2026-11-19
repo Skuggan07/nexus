@@ -1963,34 +1963,42 @@ fn spawn_stream(
 ) {
     let (fps, max_w, q) = quality.params();
     std::thread::spawn(move || {
-        let frames = inner.clone();
-        let keep = stop.clone();
-        let res = net::screen_stream(
-            &me,
-            &peer,
-            addr,
-            monitor,
-            fps,
-            max_w,
-            q,
-            move |f| {
-                let mut g = frames.lock().unwrap_or_else(|e| e.into_inner());
-                g.mons = f.mons;
-                g.jpeg = Some(f.jpeg);
-                g.seq = f.seq;
-                g.dims = (f.w, f.h);
-                g.frames += 1;
-                g.error = None;
-            },
-            move || !keep.load(Ordering::Relaxed),
-        );
-        if let Err(e) = res {
-            if !stop.load(Ordering::Relaxed) {
-                let mut g = inner.lock().unwrap_or_else(|e| e.into_inner());
-                if !g.closed {
-                    g.error = Some(e);
-                }
+        // Keep the picture coming: if the link drops, try again every few seconds
+        // until the viewer is closed or the quality/monitor changes.
+        while !stop.load(Ordering::Relaxed) {
+            let frames = inner.clone();
+            let keep = stop.clone();
+            let res = net::screen_stream(
+                &me,
+                &peer,
+                addr,
+                monitor,
+                fps,
+                max_w,
+                q,
+                move |f| {
+                    let mut g = frames.lock().unwrap_or_else(|e| e.into_inner());
+                    g.mons = f.mons;
+                    g.jpeg = Some(f.jpeg);
+                    g.seq = f.seq;
+                    g.dims = (f.w, f.h);
+                    g.frames += 1;
+                    g.error = None;
+                },
+                move || !keep.load(Ordering::Relaxed),
+            );
+            if stop.load(Ordering::Relaxed) {
+                break;
             }
+            {
+                let mut g = inner.lock().unwrap_or_else(|e| e.into_inner());
+                if g.closed {
+                    break;
+                }
+                let why = res.err().unwrap_or_else(|| "The connection ended".into());
+                g.error = Some(format!("{why} — reconnecting…"));
+            }
+            std::thread::sleep(Duration::from_secs(3));
         }
     });
 }

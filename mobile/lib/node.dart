@@ -1293,6 +1293,10 @@ class NexusNode extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// Whether Android lets Nexus keep running in the background without battery limits.
+  Future<bool> batteryFree() async => await _native('batteryFree') == true;
+  Future<void> askBatteryFree() async => _native('askBatteryFree');
+
   /// Whether this phone may share its sound (Android's "record audio" permission).
   Future<bool> soundAllowed() async => await _native('soundAllowed') == true;
   Future<void> allowSound() async => _native('allowSound');
