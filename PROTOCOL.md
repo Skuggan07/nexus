@@ -75,20 +75,20 @@ A separate TCP connection carries file browsing and transfer. It opens with a th
 | B → A | `fs_ready {nonce: Nb, mac: HMAC-SHA256(key=X25519(B, PKa), "nexus-fs-v2" ‖ Na ‖ Nb ‖ B's id ‖ A's id)}` |
 | A → B | `fs_auth {mac: HMAC-SHA256(key=X25519(A, PKb), "nexus-fs-v2" ‖ Nb ‖ Na ‖ A's id ‖ B's id)}` |
 
-B refuses the connection unless A is a paired device and `mac` checks out. After the handshake, the connection is trusted and requests flow as plain JSON lines (no `t` field):
+B refuses the connection unless A is a paired device and `mac` checks out. After the handshake the connection is trusted and **encrypted**: every further line in either direction is `{"x":"<base64 of ciphertext ‖ 16-byte tag>"}`, sealed with ChaCha20-Poly1305. A → B uses the key `HMAC-SHA256(ss, "nexus-link-c2s-v1" ‖ Na ‖ Nb)`, B → A uses `HMAC-SHA256(ss, "nexus-link-s2c-v1" ‖ Na ‖ Nb)` (same length-prefixed HMAC as above, ss = X25519 shared secret), and the 12-byte nonce is four zero bytes followed by a per-direction message counter (64-bit little-endian, starting at 0). A line that fails to decrypt ends the connection. Inside, requests are JSON lines (no `t` field):
 
 - `{op:"list", path}` → `{entries:[{name, dir, size}]}` — `path` is relative to the device's shared root (its home folder on a PC); `..` is refused.
 - `{op:"get", path}` → `{size}`, then repeated `{data:"<hex>"}` frames (up to 256 KiB each) ending with `{eof:true}`.
 - `{op:"put", name}` → `{ok:true}`; A then sends `{data:"<hex>"}` frames ending with `{end:true}`; B replies `{saved}`. Uploads land in a "Nexus Inbox" folder under the shared root.
 - `{op:"bye"}` closes the connection.
 
-Any request may be answered with `{error:"…"}`. File transfers are authenticated so only paired devices can reach them; the file bytes themselves are not yet encrypted on the wire (a planned addition). The maximum JSON line is raised to 8 MiB so a data frame (or a sharp screen frame) fits.
+Any request may be answered with `{error:"…"}`. File transfers are authenticated so only paired devices can reach them, and everything after the handshake is encrypted as described above. The maximum JSON line is raised to 8 MiB so a data frame (or a sharp screen frame) fits.
 
 All binary values on the wire are lowercase hex.
 
 ### Screen viewing and remote control
 
-A separate TCP connection authenticated exactly like file transfer, using `screen_hello` / `screen_ready` / `screen_auth` and the label `"nexus-screen-v2"`. After the handshake the viewer's first plain JSON line chooses the purpose:
+A separate TCP connection authenticated and encrypted exactly like file transfer, using `screen_hello` / `screen_ready` / `screen_auth` and the label `"nexus-screen-v2"` (the link keys use the same `nexus-link-…` labels). After the handshake the viewer's first (encrypted) JSON line chooses the purpose:
 
 - `{op:"start", fps, maxw, quality?, monitor?}` — the host streams `{op:"frame", w, h, seq, data:"<base64 JPEG>", mon, mons}` of monitor number `monitor` (0 = the main monitor, then the others from left to right; a missing monitor falls back to 0) until the viewer closes the connection. `mon` is the monitor shown and `mons` how many the host has. Control events may carry `m`, the monitor their `x`/`y` fractions refer to (default 0).
 - `{op:"control"}` — the host answers `{op:"ready"}` (or `{error}` if "Allow remote control" is off) and then carries out input events from the viewer: `move {x,y}`, `button {b, down, x?, y?}`, `click {b, x, y, n?}`, `scroll {dy?, dx?}`, `text {s}`, `key {k, mods?}`. Positions are fractions 0–1 of the shared screen; `b` is `left`/`right`/`middle`; `mods` may contain `ctrl`, `alt`, `shift`, `win`. The viewer sends `{op:"ping"}` every few seconds while idle and `{op:"bye"}` when done.
