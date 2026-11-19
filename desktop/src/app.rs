@@ -1597,6 +1597,12 @@ impl NexusApp {
             let nj = if g.jpeg.is_some() && g.seq != sv.shown_seq { g.jpeg.clone() } else { None };
             (nj, g.dims, g.error.clone(), g.frames, g.seq, g.control_ready, g.control_error.clone())
         };
+        // Sound that failed turns itself off, so the box unticks and the reason stays shown.
+        if sv.sound_stop.is_some() && sv.inner.lock().unwrap_or_else(|e| e.into_inner()).sound_error.is_some() {
+            if let Some(stop) = sv.sound_stop.take() {
+                stop.store(true, Ordering::Relaxed);
+            }
+        }
         // "All monitors": once we know how many there are, open the others too.
         if sv.open_rest && frames > 0 {
             sv.open_rest = false;

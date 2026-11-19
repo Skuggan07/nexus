@@ -48,6 +48,111 @@ class ScreenCaptureService : Service() {
         /** The running service, while the screen is shared. */
         @Volatile var instance: ScreenCaptureService? = null
 
+        /** The screen recording Android gave us; sound is recorded from it too. */
+        @Volatile var activeProjection: MediaProjection? = null
+
+        /** True while the service also runs as a "microphone" service. Android hands
+         *  over silence instead of the real sound while Nexus is in the background otherwise. */
+        @Volatile var micMode = false
+
+        private val soundLock = Any()
+        private var recorder: AudioRecord? = null
+        private var listeners = 0
+
+        fun soundPermitted(ctx: android.content.Context) = Build.VERSION.SDK_INT >= 29 &&
+            ctx.checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+
+        /**
+         * Starts recording what this phone plays (Android 10+, needs the screen to be
+         * shared and the "record audio" permission). Returns a problem, or null when it
+         * works. Several listeners share one recording.
+         */
+        @android.annotation.SuppressLint("NewApi") // checked at the top
+        fun startSound(ctx: android.content.Context): String? {
+          synchronized(soundLock) {
+            if (Build.VERSION.SDK_INT < 29) return "Sharing the phone's sound needs Android 10 or newer"
+            if (!soundPermitted(ctx)) {
+                return "On the phone, open Nexus and tap Allow next to \"Let paired devices hear this phone\""
+            }
+            val mp = activeProjection ?: return if (running) {
+                "The phone shares its screen but Android gave Nexus no recording (A). On the phone, turn screen sharing off and on again"
+            } else {
+                "Screen sharing is off on the phone (B)"
+            }
+            if (!micMode && Build.VERSION.SDK_INT >= 30) {
+                return "On the phone, turn \"Share this phone's screen\" off and on again, then turn on sound (C)"
+            }
+            if (recorder == null) {
+                val cfg = AudioPlaybackCaptureConfiguration.Builder(mp)
+                    .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
+                    .addMatchingUsage(AudioAttributes.USAGE_GAME)
+                    .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
+                    .build()
+                val format = AudioFormat.Builder()
+                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                    .setSampleRate(48000)
+                    .setChannelMask(AudioFormat.CHANNEL_IN_STEREO)
+                    .build()
+                val rec = try {
+                    AudioRecord.Builder()
+                        .setAudioFormat(format)
+                        .setBufferSizeInBytes(48000 * 4 / 5)
+                        .setAudioPlaybackCaptureConfig(cfg)
+                        .build()
+                } catch (e: Throwable) {
+                    return "Could not record the phone's sound (D): ${e.message}"
+                }
+                if (rec.state != AudioRecord.STATE_INITIALIZED) {
+                    rec.release()
+                    return "Android would not let Nexus record the phone's sound (E)"
+                }
+                try {
+                    rec.startRecording()
+                } catch (e: Throwable) {
+                    rec.release()
+                    return "Could not record the phone's sound (F): ${e.message}"
+                }
+                sound.clear()
+                recorder = rec
+                Thread {
+                    val buf = ByteArray(48000 * 4 / 25) // 40 ms
+                    while (recorder === rec) {
+                        val n = try { rec.read(buf, 0, buf.size) } catch (e: Throwable) { -1 }
+                        if (n < 0) break
+                        if (n > 0) {
+                            sound.add(buf.copyOf(n))
+                            while (sound.size > 25) sound.poll() // keep it close to live
+                        }
+                    }
+                }.start()
+            }
+            listeners++
+            return null
+          }
+        }
+
+        fun stopSound() {
+            synchronized(soundLock) {
+                listeners = (listeners - 1).coerceAtLeast(0)
+                if (listeners == 0) stopRecorder()
+            }
+        }
+
+        private fun stopRecorder() {
+            val rec = recorder ?: return
+            recorder = null
+            try { rec.stop() } catch (e: Throwable) {}
+            rec.release()
+            sound.clear()
+        }
+
+        fun stopAllSound() {
+            synchronized(soundLock) {
+                listeners = 0
+                stopRecorder()
+            }
+        }
+
         /** Recorded sound (16-bit stereo, 48 kHz) waiting to be sent. */
         private val sound = ConcurrentLinkedQueue<ByteArray>()
 
@@ -73,95 +178,13 @@ class ScreenCaptureService : Service() {
     private var reader: ImageReader? = null
     private var worker: HandlerThread? = null
     private var lastFrameAt = 0L
-    private var recorder: AudioRecord? = null
-    private var listeners = 0
-    /** True once the service also runs as a "microphone" service, which Android needs
-     *  before it hands over real sound while Nexus is in the background. */
-    private var soundReady = false
-
-    private fun soundPermitted() = Build.VERSION.SDK_INT >= 29 &&
-        checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
-
     /** Called right after the user allows sound (Nexus is on screen then, which Android requires). */
     fun enableSound() {
-        if (soundReady || !soundPermitted()) return
+        if (micMode || !soundPermitted(this)) return
         try {
             startAsForeground()
         } catch (e: Exception) {
         }
-    }
-
-    /**
-     * Starts recording what this phone plays (Android 10+, needs the screen to be
-     * shared and the "record audio" permission). Returns a problem, or null when it works.
-     * Several listeners share one recording.
-     */
-    @Synchronized
-    fun startSound(): String? {
-        if (Build.VERSION.SDK_INT < 29) return "Sharing the phone's sound needs Android 10 or newer"
-        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
-            return "On the phone, open Nexus and tap Allow next to \"Let paired devices hear this phone\""
-        }
-        val mp = projection ?: return "Screen sharing is off on the phone"
-        if (!soundReady && Build.VERSION.SDK_INT >= 30) {
-            return "On the phone, turn \"Share this phone's screen\" off and on again, then turn on sound"
-        }
-        if (recorder == null) {
-            val cfg = AudioPlaybackCaptureConfiguration.Builder(mp)
-                .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
-                .addMatchingUsage(AudioAttributes.USAGE_GAME)
-                .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
-                .build()
-            val format = AudioFormat.Builder()
-                .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                .setSampleRate(48000)
-                .setChannelMask(AudioFormat.CHANNEL_IN_STEREO)
-                .build()
-            val rec = try {
-                AudioRecord.Builder()
-                    .setAudioFormat(format)
-                    .setBufferSizeInBytes(48000 * 4 / 5)
-                    .setAudioPlaybackCaptureConfig(cfg)
-                    .build()
-            } catch (e: Exception) {
-                return "Could not record the phone's sound: ${e.message}"
-            }
-            try {
-                rec.startRecording()
-            } catch (e: Exception) {
-                rec.release()
-                return "Could not record the phone's sound: ${e.message}"
-            }
-            sound.clear()
-            recorder = rec
-            Thread {
-                val buf = ByteArray(48000 * 4 / 25) // 40 ms
-                while (recorder === rec) {
-                    val n = try { rec.read(buf, 0, buf.size) } catch (e: Exception) { -1 }
-                    if (n < 0) break
-                    if (n > 0) {
-                        sound.add(buf.copyOf(n))
-                        while (sound.size > 25) sound.poll() // keep it close to live
-                    }
-                }
-            }.start()
-        }
-        listeners++
-        return null
-    }
-
-    @Synchronized
-    fun stopSound() {
-        listeners = (listeners - 1).coerceAtLeast(0)
-        if (listeners == 0) stopRecorder()
-    }
-
-    private fun stopRecorder() {
-        val rec = recorder ?: return
-        recorder = null
-        try { rec.stop() } catch (e: Exception) {}
-        rec.release()
-        sound.clear()
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -192,6 +215,7 @@ class ScreenCaptureService : Service() {
             return START_NOT_STICKY
         }
         projection = mp
+        activeProjection = mp
         instance = this
         val thread = HandlerThread("nexus-capture").also { it.start() }
         worker = thread
@@ -274,7 +298,7 @@ class ScreenCaptureService : Service() {
             .setOngoing(true)
             .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Stop", stop)
             .build()
-        if (Build.VERSION.SDK_INT >= 30 && soundPermitted()) {
+        if (Build.VERSION.SDK_INT >= 30 && soundPermitted(this)) {
             // Also a "microphone" service, so Android gives Nexus the real sound (not
             // silence) while another app is in front.
             try {
@@ -282,7 +306,7 @@ class ScreenCaptureService : Service() {
                     1, notification,
                     ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE,
                 )
-                soundReady = true
+                micMode = true
                 return
             } catch (e: Exception) {
                 // Fall back to screen only.
@@ -298,11 +322,13 @@ class ScreenCaptureService : Service() {
     override fun onDestroy() {
         running = false
         latest = null
-        instance = null
-        synchronized(this) {
-            listeners = 0
-            stopRecorder()
+        // Only forget the recording if it is still ours (a new one may have started already).
+        if (activeProjection === projection) {
+            activeProjection = null
+            micMode = false
+            stopAllSound()
         }
+        if (instance === this) instance = null
         try { display?.release() } catch (e: Exception) {}
         try { reader?.close() } catch (e: Exception) {}
         try { projection?.stop() } catch (e: Exception) {}

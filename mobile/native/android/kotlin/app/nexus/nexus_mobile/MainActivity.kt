@@ -97,11 +97,10 @@ class MainActivity : FlutterActivity() {
                     )
                 }
                 // Sharing this phone's sound (see ScreenCaptureService.startSound).
-                "soundCaptureStart" ->
-                    result.success(ScreenCaptureService.instance?.startSound() ?: "Screen sharing is off on the phone")
+                "soundCaptureStart" -> result.success(ScreenCaptureService.startSound(this))
                 "soundCaptureRead" -> result.success(ScreenCaptureService.readSound())
                 "soundCaptureStop" -> {
-                    ScreenCaptureService.instance?.stopSound()
+                    ScreenCaptureService.stopSound()
                     result.success(null)
                 }
                 "soundAllowed" -> result.success(
