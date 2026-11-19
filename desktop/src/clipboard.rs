@@ -87,12 +87,15 @@ pub fn receive(shared: &SharedState, text: &str) -> Result<(), String> {
 
 #[cfg(windows)]
 mod sys {
-    use windows_sys::Win32::System::{
-        DataExchange::{
-            CloseClipboard, EmptyClipboard, GetClipboardData, GetClipboardSequenceNumber, IsClipboardFormatAvailable,
-            OpenClipboard, SetClipboardData,
+    use windows_sys::Win32::{
+        Foundation::GlobalFree,
+        System::{
+            DataExchange::{
+                CloseClipboard, EmptyClipboard, GetClipboardData, GetClipboardSequenceNumber,
+                IsClipboardFormatAvailable, OpenClipboard, SetClipboardData,
+            },
+            Memory::{GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE},
         },
-        Memory::{GlobalAlloc, GlobalFree, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE},
     };
 
     const CF_UNICODETEXT: u32 = 13;
