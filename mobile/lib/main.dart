@@ -2225,9 +2225,10 @@ class _PhoneSharingBoxState extends State<_PhoneSharingBox> with WidgetsBindingO
   }
 }
 
-/// Shared clipboard: on/off, "Send clipboard now", and the last text that arrived.
-/// Android only lets the app in front read the clipboard, so new text is sent when
-/// Nexus is opened (or with the button). Text from other devices arrives any time.
+/// Shared clipboard: on/off, "Send clipboard now", "Send photos & files", and the last
+/// thing that arrived. Android only lets the app in front read the clipboard, so new
+/// text or pictures are sent when Nexus is opened (or with the button). Things from
+/// other devices arrive any time. "Share → Nexus" in any app sends photos and files too.
 class _ClipboardBox extends StatefulWidget {
   const _ClipboardBox({required this.node});
   final NexusNode node;
@@ -2244,6 +2245,7 @@ class _ClipboardBoxState extends State<_ClipboardBox> with WidgetsBindingObserve
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     widget.node.checkClipboard();
+    widget.node.takeShared();
   }
 
   @override
@@ -2254,7 +2256,22 @@ class _ClipboardBoxState extends State<_ClipboardBox> with WidgetsBindingObserve
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state == AppLifecycleState.resumed) widget.node.checkClipboard();
+    if (state == AppLifecycleState.resumed) {
+      widget.node.takeShared();
+      widget.node.checkClipboard();
+    }
+  }
+
+  Future<void> _sendFiles() async {
+    final picked = await FilePicker.platform.pickFiles(allowMultiple: true);
+    if (picked == null) return;
+    final files = [
+      for (final f in picked.files)
+        if (f.path != null) {'path': f.path, 'name': f.name, 'size': f.size}
+    ];
+    setState(() => _sending = true);
+    await widget.node.sendFiles(files, wait: false);
+    if (mounted) setState(() => _sending = false);
   }
 
   Future<void> _send() async {
@@ -2281,7 +2298,9 @@ class _ClipboardBoxState extends State<_ClipboardBox> with WidgetsBindingObserve
               const Text('Copy here, paste on your PC', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 15)),
               Text(
                 node.shareClipboard
-                    ? 'Text copied on your PC lands here. Text you copy here is sent when you open Nexus.'
+                    ? 'Text and files copied on your PC land here (pictures in the Gallery, other files in '
+                        'Downloads › Nexus). Text or a picture you copy here is sent when you open Nexus. '
+                        'To send photos or files, tap Share in any app and pick Nexus.'
                     : 'Off — nothing is sent or received.',
                 style: TextStyle(fontSize: 12, color: node.shareClipboard ? white : off),
               ),
@@ -2297,6 +2316,28 @@ class _ClipboardBoxState extends State<_ClipboardBox> with WidgetsBindingObserve
               label: _sending ? 'Sending…' : 'Send clipboard now',
               onPressed: _sending ? null : _send,
             ),
+          ),
+          const SizedBox(height: 8),
+          SizedBox(
+            width: double.infinity,
+            child: _SecondaryButton(
+              label: 'Send photos & files to PC',
+              onPressed: _sending ? null : _sendFiles,
+            ),
+          ),
+          ValueListenableBuilder<String?>(
+            valueListenable: node.fileStatus,
+            builder: (context, status, _) => status == null
+                ? const SizedBox.shrink()
+                : Padding(
+                    padding: const EdgeInsets.only(top: 8),
+                    child: Row(children: [
+                      const SizedBox(
+                          width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2, color: accent)),
+                      const SizedBox(width: 8),
+                      Expanded(child: Text(status, style: const TextStyle(fontSize: 12))),
+                    ]),
+                  ),
           ),
         ],
         if (last != null) ...[

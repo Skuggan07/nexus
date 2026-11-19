@@ -430,6 +430,13 @@ class Conn {
     return m;
   }
 
+  /// Waits until everything queued so far is on its way, so big transfers don't pile up in memory.
+  Future<void> drain() async {
+    await _out;
+    if (_dead) throw NexusError('Connection lost');
+    await socket.flush();
+  }
+
   /// Closes the link once everything queued has been sent.
   void close() {
     _out.whenComplete(() {
@@ -485,6 +492,7 @@ class NexusNode extends ChangeNotifier {
   Future<void> start() async {
     _screenChannel.setMethodCallHandler((call) async {
       if (call.method == 'pip') pip.value = call.arguments == true;
+      if (call.method == 'shared') unawaited(takeShared());
       return null;
     });
     try {
@@ -649,6 +657,11 @@ class NexusNode extends ChangeNotifier {
   /// Sends this phone's clipboard text to the paired devices that are online.
   /// Returns how many took it.
   Future<int> sendClipboard({bool auto = false}) async {
+    // A picture or file on the clipboard (e.g. "Copy image") goes to the PCs as a file.
+    final clipFiles = await _native('clipFiles');
+    if (clipFiles is List && clipFiles.isNotEmpty) {
+      return sendFiles(clipFiles.whereType<Map>().map((m) => m.cast<String, dynamic>()).toList(), wait: false);
+    }
     String text = '';
     try {
       text = (await Clipboard.getData(Clipboard.kTextPlain))?.text ?? '';
@@ -661,6 +674,11 @@ class NexusNode extends ChangeNotifier {
       return 0;
     }
     if (auto && text == _clipLast) return 0;
+    return sendText(text, auto: auto);
+  }
+
+  /// Sends text to the clipboards of the paired devices that are online.
+  Future<int> sendText(String text, {bool auto = false}) async {
     _clipLast = text;
     final names = <String>[];
     for (final p in paired) {
@@ -713,6 +731,202 @@ class NexusNode extends ChangeNotifier {
       }
     }
     c.close();
+  }
+
+  /* ---------------------------------------------- copying files and pictures */
+
+  /// What's happening with copied files right now, for the home screen ("Sending 3 files…").
+  final fileStatus = ValueNotifier<String?>(null);
+
+  static const _maxFilesBytes = 4 * 1024 * 1024 * 1024;
+  static const _maxFilesCount = 10000;
+
+  /// Accepts a path from another device only if it stays inside the folder.
+  static String? _safeRel(String rel) {
+    final parts = rel.split(RegExp(r'[/\\]')).where((p) => p.isNotEmpty && p != '.').toList();
+    if (parts.isEmpty || parts.any((p) => p == '..' || p.contains(':'))) return null;
+    return parts.join('/');
+  }
+
+  Future<void> toast(String text) async => _native('toast', text);
+
+  /// Picks up photos, files or text shared to Nexus from another app and sends them to the PCs.
+  Future<void> takeShared() async {
+    final got = await _native('takeShared');
+    if (got is! Map) return;
+    final files = (got['files'] as List?)?.whereType<Map>().map((m) => m.cast<String, dynamic>()).toList() ?? [];
+    final text = got['text'];
+    if (files.isNotEmpty) {
+      await sendFiles(files);
+    } else if (text is String && text.trim().isNotEmpty) {
+      final n = await sendText(text);
+      await toast(n > 0 ? 'Nexus: sent — paste it on your PC with Ctrl+V' : 'Nexus: no computer is online');
+    }
+  }
+
+  /// Paired PCs that are online. Right after Nexus starts their status isn't known yet,
+  /// so with [wait] this gives it a few seconds.
+  Future<List<PairedPeer>> _onlinePcs({bool wait = true}) async {
+    for (var i = 0; i < (wait ? 16 : 1); i++) {
+      final pcs = paired.where((p) {
+        final k = statusOf(p).kind;
+        return p.controllable && (k == StatusKind.verified || k == StatusKind.checking);
+      }).toList();
+      if (pcs.isNotEmpty || !wait) return pcs;
+      await Future<void>.delayed(const Duration(milliseconds: 500));
+    }
+    return [];
+  }
+
+  /// Sends files ([{path, name, size}]) to the PCs that are online and puts them on their
+  /// clipboards, so Ctrl+V pastes them. Returns how many PCs took them.
+  Future<int> sendFiles(List<Map<String, dynamic>> files, {bool wait = true}) async {
+    if (files.isEmpty) return 0;
+    final count = files.length;
+    final what = '$count file${count == 1 ? '' : 's'}';
+    final pcs = await _onlinePcs(wait: wait);
+    if (pcs.isEmpty) {
+      addLog('No computer is online to send the files to');
+      await toast('Nexus: no computer is online');
+      notifyListeners();
+      return 0;
+    }
+    final items = [
+      for (final f in files) {'path': '${f['name']}', 'size': (f['size'] as num?)?.toInt() ?? 0, 'dir': false}
+    ];
+    final names = <String>[];
+    for (final p in pcs) {
+      fileStatus.value = 'Sending $what to ${p.name}…';
+      Conn? c;
+      try {
+        c = await _screenOpen(p);
+        c.send({'op': 'clipfiles', 'items': items});
+        final ready = await c.recv(const Duration(seconds: 30));
+        if (ready['error'] != null) throw NexusError('${ready['error']}');
+        var sent = 0;
+        for (final f in files) {
+          final raf = await File('${f['path']}').open();
+          try {
+            while (true) {
+              final chunk = await raf.read(256 * 1024);
+              if (chunk.isEmpty) break;
+              c.send({'data': base64Encode(chunk)});
+              if (++sent % 8 == 0) await c.drain();
+            }
+          } finally {
+            await raf.close();
+          }
+          c.send({'next': true});
+        }
+        c.send({'done': true});
+        final done = await c.recv(const Duration(minutes: 2));
+        if (done['error'] != null) throw NexusError('${done['error']}');
+        names.add(p.name);
+      } catch (e) {
+        addLog('Could not send the files to ${p.name}: $e');
+      } finally {
+        c?.close();
+      }
+    }
+    fileStatus.value = null;
+    // The copies Nexus made in its cache are no longer needed.
+    for (final f in files) {
+      final path = '${f['path']}';
+      if (path.contains('/cache/')) {
+        try {
+          await File(path).delete();
+        } catch (_) {}
+      }
+    }
+    if (names.isNotEmpty) {
+      addLog('$what sent to ${names.join(', ')} — paste with Ctrl+V');
+      await toast('Nexus: $what sent to ${names.join(', ')} — paste with Ctrl+V');
+    } else {
+      await toast('Nexus: the files were not sent — see Activity');
+    }
+    notifyListeners();
+    return names.length;
+  }
+
+  /// A paired device sent copied files: save them (pictures to the Gallery, other files
+  /// to Downloads › Nexus) and put them on this phone's clipboard.
+  Future<void> _clipFilesServe(Conn c, Map<String, dynamic> m, String who) async {
+    Directory? stage;
+    try {
+      if (!shareClipboard) throw NexusError('Shared clipboard is turned off on $name');
+      final items = (m['items'] as List?) ?? const [];
+      final files = <String>[];
+      var total = 0;
+      for (final it in items) {
+        if (it is! Map) continue;
+        final rel = _safeRel('${it['path'] ?? ''}');
+        if (rel == null) throw NexusError('A file name was not allowed');
+        if (it['dir'] == true) continue; // folders are made as their files are saved
+        files.add(rel);
+        total += (it['size'] as num?)?.toInt() ?? 0;
+      }
+      if (files.isEmpty) throw NexusError('Nothing to paste');
+      if (total > _maxFilesBytes || items.length > _maxFilesCount) {
+        throw NexusError('Too much for the clipboard — use Browse files instead');
+      }
+      stage = Directory('${(await getTemporaryDirectory()).path}/incoming/${DateTime.now().millisecondsSinceEpoch}');
+      await stage.create(recursive: true);
+      final what = '${files.length} file${files.length == 1 ? '' : 's'}';
+      fileStatus.value = 'Receiving $what from $who…';
+      c.send({'op': 'ready'});
+      for (final rel in files) {
+        final f = File('${stage.path}/$rel');
+        await f.parent.create(recursive: true);
+        final sink = f.openWrite();
+        try {
+          var n = 0;
+          while (true) {
+            final v = await c.recv(const Duration(seconds: 60));
+            if (v['next'] != null) break;
+            if (v['error'] != null) throw NexusError('${v['error']}');
+            final d = v['data'];
+            if (d is! String) throw NexusError('Unexpected message');
+            sink.add(base64Decode(d));
+            if (++n % 16 == 0) await sink.flush();
+          }
+        } finally {
+          await sink.close();
+        }
+      }
+      if ((await c.recv(const Duration(seconds: 60)))['done'] == null) throw NexusError('Unexpected message');
+      // Everything is here; answer now so the PC isn't kept waiting while the phone saves.
+      c.send({'op': 'ok'});
+      final r = await _native('saveIncoming', {'dir': stage.path, 'files': files});
+      stage = null; // the native side cleans it up
+      if (r is! Map) throw NexusError('The phone could not save the files');
+      final pics = (r['pictures'] as num?)?.toInt() ?? 0;
+      final other = (r['files'] as num?)?.toInt() ?? 0;
+      final failed = (r['failed'] as num?)?.toInt() ?? 0;
+      _clipStamp = await _clipboardStamp();
+      final parts = [
+        if (pics > 0) '$pics picture${pics == 1 ? '' : 's'} in the Gallery',
+        if (other > 0) '$other file${other == 1 ? '' : 's'} in Downloads › Nexus',
+        if (failed > 0) '$failed could not be saved',
+      ];
+      lastClipText = parts.join(', ');
+      lastClipFrom = who;
+      addLog('Copied files from $who: ${parts.join(', ')}');
+      await toast('Nexus: from $who — ${parts.join(', ')}');
+    } catch (e) {
+      addLog('Copied files from $who did not arrive: $e');
+      try {
+        c.send({'error': '$e'});
+      } catch (_) {}
+      if (stage != null) {
+        try {
+          await stage.delete(recursive: true);
+        } catch (_) {}
+      }
+    } finally {
+      fileStatus.value = null;
+      c.close();
+      notifyListeners();
+    }
   }
 
   /// This phone's RAM (from /proc/meminfo) and battery. Android does not let apps read CPU use.
@@ -1371,6 +1585,8 @@ class NexusNode extends ChangeNotifier {
       await _soundServe(c, peer.name);
     } else if (first['op'] == 'clip') {
       await _clipServe(c, first, peer.name);
+    } else if (first['op'] == 'clipfiles') {
+      await _clipFilesServe(c, first, peer.name);
     } else if (first['op'] == 'auto') {
       c.send({'error': 'Automations run on computers, not on phones'});
       c.close();
