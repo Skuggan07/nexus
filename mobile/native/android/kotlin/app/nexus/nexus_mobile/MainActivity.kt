@@ -31,6 +31,15 @@ class MainActivity : FlutterActivity() {
     companion object {
         private const val CAPTURE_REQUEST = 4711
         private const val INSTALL_STATUS = "app.nexus.INSTALL_STATUS"
+        const val SHARED = "app.nexus.SHARED"
+
+        /** The channel to the Dart side, while Nexus is running. */
+        private var live: MethodChannel? = null
+
+        /** Tells the Dart side that photos, files or text were shared to Nexus. */
+        fun notifyShared() {
+            live?.invokeMethod("shared", null)
+        }
     }
 
     private var pending: MethodChannel.Result? = null
@@ -79,6 +88,7 @@ class MainActivity : FlutterActivity() {
         super.configureFlutterEngine(flutterEngine)
         val ch = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "nexus/screen")
         channel = ch
+        live = ch
         ch.setMethodCallHandler { call, result ->
             when (call.method) {
                 "startCapture" -> {
@@ -232,6 +242,52 @@ class MainActivity : FlutterActivity() {
                     }
                     result.success(null)
                 }
+                // Photos, files or text shared to Nexus from another app's Share menu.
+                "takeShared" -> {
+                    val files = synchronized(NexusFiles.pending) {
+                        val l = NexusFiles.pending.toList()
+                        NexusFiles.pending.clear()
+                        l
+                    }
+                    val text = NexusFiles.pendingText
+                    NexusFiles.pendingText = null
+                    result.success(mapOf("files" to files, "text" to text))
+                }
+                // Pictures or files on the clipboard, copied so they can be sent.
+                "clipFiles" -> {
+                    val uris = NexusFiles.clipboardUris(this)
+                    if (uris.isEmpty()) {
+                        result.success(emptyList<Any>())
+                    } else {
+                        val ctx = applicationContext
+                        Thread {
+                            val files = NexusFiles.copyIn(ctx, uris)
+                            runOnUiThread { result.success(files) }
+                        }.start()
+                    }
+                }
+                // Saves files that arrived from a PC to the Gallery or Downloads.
+                "saveIncoming" -> {
+                    val dir = call.argument<String>("dir")
+                    val files = call.argument<List<String>>("files") ?: emptyList()
+                    if (dir == null) {
+                        result.success(null)
+                    } else {
+                        val ctx = applicationContext
+                        Thread {
+                            val r = try {
+                                NexusFiles.saveIncoming(ctx, File(dir), files)
+                            } catch (e: Exception) {
+                                null
+                            }
+                            runOnUiThread { result.success(r) }
+                        }.start()
+                    }
+                }
+                "toast" -> {
+                    Toast.makeText(applicationContext, call.arguments as? String ?: "", Toast.LENGTH_LONG).show()
+                    result.success(null)
+                }
                 "installApk" -> {
                     val path = call.argument<String>("path")
                     if (path == null) {
@@ -294,6 +350,13 @@ class MainActivity : FlutterActivity() {
             // If the screen is already shared, let it share sound too.
             ScreenCaptureService.instance?.enableSound()
         }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // In case the Dart side missed the news while Nexus was starting.
+        val waiting = synchronized(NexusFiles.pending) { NexusFiles.pending.isNotEmpty() } || NexusFiles.pendingText != null
+        if (waiting) notifyShared()
     }
 
     override fun onNewIntent(intent: Intent) {
