@@ -2520,7 +2520,17 @@ fn power_controls(ui: &mut egui::Ui, r: &Row, confirm_cmd: Option<&(String, Comm
                 actions.push(Action::AskCommand(id.clone(), Command::Shutdown));
             }
         });
-    } else if !r.peer.macs.is_empty() {
+    } else if r.peer.macs.is_empty() {
+        ui.add_enabled(false, primary("Wake"));
+        ui.label(
+            RichText::new(
+                "Nexus doesn't know this PC's network card yet. Turn the PC on once with Nexus open on it \
+                 (build 31 or newer) — after that, Wake works.",
+            )
+            .size(12.0)
+            .color(OFF),
+        );
+    } else {
         ui.horizontal(|ui| match r.waking {
             Some(t) => {
                 ui.add(egui::Spinner::new());

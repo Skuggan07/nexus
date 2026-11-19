@@ -1700,6 +1700,18 @@ pub fn start_status_checker(me: Arc<Identity>, shared: SharedState, dir: PathBuf
                     if let Some(w) = stats.as_ref().and_then(|x| x.wake.clone()) {
                         s.wake_hints.insert(p.id.clone(), w);
                     }
+                    // Learn its network card addresses for Wake (in case its announcements don't arrive).
+                    let macs = stats.as_ref().map(|x| x.macs.clone()).unwrap_or_default();
+                    if !macs.is_empty() {
+                        let changed = s.paired.iter_mut().find(|x| x.id == p.id).is_some_and(|x| {
+                            let c = x.macs != macs;
+                            x.macs = macs;
+                            c
+                        });
+                        if changed {
+                            let _ = store::save_peers(&dir, &s.paired);
+                        }
+                    }
                     s.checks.insert(p.id.clone(), Check::Ok { rtt_ms, at: Instant::now(), stats });
                     let a = addr.to_string();
                     let changed = s.paired.iter_mut().find(|x| x.id == p.id).is_some_and(|x| {

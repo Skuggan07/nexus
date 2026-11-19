@@ -75,7 +75,10 @@ class Seen {
 
 /// A device's CPU, RAM and battery in percent; null when that device can't tell.
 class Stats {
-  const Stats({this.cpu, this.ram, this.battery, this.wake});
+  const Stats({this.cpu, this.ram, this.battery, this.wake, this.macs = const []});
+
+  /// For PCs: its network card addresses, for Wake.
+  final List<String> macs;
   final double? cpu, ram, battery;
 
   /// For PCs: whether it can be woken from another device (ready, wifi, off, unknown).
@@ -88,8 +91,14 @@ class Stats {
       final m = jsonDecode(json);
       if (m is! Map<String, dynamic>) return null;
       final wake = m['wake'];
+      final macs = m['macs'];
       return Stats(
-          cpu: _num(m['cpu']), ram: _num(m['ram']), battery: _num(m['battery']), wake: wake is String ? wake : null);
+        cpu: _num(m['cpu']),
+        ram: _num(m['ram']),
+        battery: _num(m['battery']),
+        wake: wake is String ? wake : null,
+        macs: macs is List ? macs.map((e) => '$e').toList() : const [],
+      );
     } catch (_) {
       return null;
     }
@@ -1762,6 +1771,13 @@ class NexusNode extends ChangeNotifier {
           if (waking.remove(p.id) != null) addLog('${p.name} woke up ✓');
           wakeFailed.remove(p.id);
           if (stats?.wake != null) wakeHints[p.id] = stats!.wake!;
+          // Learn its network card addresses for Wake. They are also in the network
+          // announcements, but many phones never receive those.
+          final macs = stats?.macs ?? const <String>[];
+          if (macs.isNotEmpty && !listEquals(p.macs, macs)) {
+            p.macs = macs;
+            await _savePeers();
+          }
           checks[p.id] = Check.ok(rtt, stats);
           final addr = '$host:$port';
           if (p.lastAddr != addr) {

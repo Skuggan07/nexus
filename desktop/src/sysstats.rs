@@ -17,6 +17,10 @@ pub struct Stats {
     /// Whether this PC can be woken from another device: ready, wifi, off or unknown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wake: Option<String>,
+    /// This PC's network card addresses, so paired devices can wake it. Also in the
+    /// network announcements, but some phones never receive those.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub macs: Vec<String>,
 }
 
 static LATEST: OnceLock<Mutex<Option<String>>> = OnceLock::new();
@@ -34,6 +38,7 @@ pub fn start_sampler() {
     let _ = thread::Builder::new().name("nexus-stats".into()).spawn(|| {
         let mut sys = sysinfo::System::new();
         sys.refresh_cpu();
+        let macs = crate::net::local_macs();
         loop {
             thread::sleep(Duration::from_secs(3));
             sys.refresh_cpu();
@@ -44,6 +49,7 @@ pub fn start_sampler() {
                 ram: (total > 0).then(|| round1(sys.used_memory() as f32 / total as f32 * 100.0)),
                 battery: battery_percent(),
                 wake: crate::wakeup::code(),
+                macs: macs.clone(),
             };
             if let (Ok(json), Ok(mut g)) = (serde_json::to_string(&s), slot().lock()) {
                 *g = Some(json);

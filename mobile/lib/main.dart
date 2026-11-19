@@ -585,7 +585,29 @@ class _HomePageState extends State<HomePage> {
         ]),
       ];
     }
-    if (p.macs.isNotEmpty) {
+    if (p.macs.isEmpty) {
+      return [
+        SizedBox(
+          width: double.infinity,
+          height: 46,
+          child: FilledButton.icon(
+            style: FilledButton.styleFrom(disabledBackgroundColor: box2, disabledForegroundColor: off),
+            onPressed: null,
+            icon: const Icon(Icons.power_settings_new),
+            label: const Text('Wake'),
+          ),
+        ),
+        const Padding(
+          padding: EdgeInsets.only(top: 8),
+          child: Text(
+            "Nexus doesn't know this PC's network card yet. Turn the PC on once with Nexus open on it "
+            '(build 31 or newer) — after that, Wake works.',
+            style: TextStyle(fontSize: 12, color: off),
+          ),
+        ),
+      ];
+    }
+    {
       final since = node.waking[p.id];
       final failed = node.wakeFailed.contains(p.id);
       final hint = node.wakeHints[p.id];
