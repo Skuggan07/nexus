@@ -469,6 +469,7 @@ fn screen_serve(mut c: Conn, me: &Arc<Identity>, shared: &SharedState, dir: &Pat
         Some("monitor") => return monitor_serve(c, shared, &id),
         Some("auto") => return auto_serve(c, me, shared, dir, &id),
         Some("clip") => return clip_serve(c, shared, &id, &start),
+        Some("clipfiles") => return clipfiles_serve(c, shared, dir, &id, &start),
         _ => {}
     }
     let fps = start.get("fps").and_then(|x| x.as_u64()).unwrap_or(8).clamp(1, 30);
@@ -519,6 +520,125 @@ fn clip_serve(mut c: Conn, shared: &SharedState, id: &str, start: &serde_json::V
         }
     };
     let _ = c.send_val(&reply);
+}
+
+/// One file or folder in a copied-files transfer.
+pub struct ClipItem {
+    /// Path inside the copy, with "/" between folders, e.g. "Photos/beach.jpg".
+    pub rel: String,
+    pub abs: PathBuf,
+    pub size: u64,
+    pub dir: bool,
+}
+
+const CLIP_CHUNK: usize = 256 * 1024;
+
+/// Sends files copied on this PC to a paired PC, which puts them on its clipboard.
+pub(crate) fn clipfiles_send(
+    me: &Identity,
+    peer: &PairedPeer,
+    addr: SocketAddr,
+    items: &[ClipItem],
+) -> Result<(), String> {
+    let mut c = screen_open(me, peer, addr)?;
+    let list: Vec<serde_json::Value> =
+        items.iter().map(|i| serde_json::json!({ "path": i.rel, "size": i.size, "dir": i.dir })).collect();
+    c.send_val(&serde_json::json!({ "op": "clipfiles", "items": list }))?;
+    let ready = c.recv_val()?;
+    if let Some(e) = fs_err(&ready) {
+        return Err(e);
+    }
+    let mut buf = vec![0u8; CLIP_CHUNK];
+    for i in items.iter().filter(|i| !i.dir) {
+        let mut f = std::fs::File::open(&i.abs).map_err(|e| format!("Cannot open {}: {e}", i.abs.display()))?;
+        loop {
+            let n = f.read(&mut buf).map_err(|e| e.to_string())?;
+            if n == 0 {
+                break;
+            }
+            let data = base64::engine::general_purpose::STANDARD.encode(&buf[..n]);
+            c.send_val(&serde_json::json!({ "data": data }))?;
+        }
+        c.send_val(&serde_json::json!({ "next": true }))?;
+    }
+    c.send_val(&serde_json::json!({ "done": true }))?;
+    let done = c.recv_val()?;
+    match fs_err(&done) {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+/// Receives files copied on a paired PC and puts them on this PC's clipboard.
+fn clipfiles_serve(mut c: Conn, shared: &SharedState, dir: &Path, id: &str, start: &serde_json::Value) {
+    let who = peer_name(shared, id);
+    let result = (|| -> Result<usize, String> {
+        if !lock(shared).share_clipboard {
+            return Err("Shared clipboard is turned off on this PC".into());
+        }
+        let items = start.get("items").and_then(|x| x.as_array()).cloned().unwrap_or_default();
+        let (mut files, mut dirs, mut tops) = (Vec::new(), Vec::new(), Vec::<String>::new());
+        let mut total = 0u64;
+        for it in &items {
+            let rel = it.get("path").and_then(|x| x.as_str()).unwrap_or("");
+            let safe = crate::clipboard::safe_rel(rel).ok_or("A file name was not allowed")?;
+            let top = safe.split('/').next().unwrap_or("").to_string();
+            if !tops.contains(&top) {
+                tops.push(top);
+            }
+            if it.get("dir").and_then(|x| x.as_bool()) == Some(true) {
+                dirs.push(safe);
+            } else {
+                total += it.get("size").and_then(|x| x.as_u64()).unwrap_or(0);
+                files.push(safe);
+            }
+        }
+        if files.is_empty() && dirs.is_empty() {
+            return Err("Nothing to paste".into());
+        }
+        if total > crate::clipboard::MAX_FILES_BYTES || items.len() > crate::clipboard::MAX_FILES_COUNT {
+            return Err("Too much for the clipboard — use Browse files instead".into());
+        }
+        let stage = crate::clipboard::new_stage(dir)?;
+        lock(shared).log(format!("Receiving copied files from {who}…"));
+        c.send_val(&serde_json::json!({ "op": "ready" }))?;
+        for d in &dirs {
+            std::fs::create_dir_all(stage.join(d)).map_err(|e| e.to_string())?;
+        }
+        for rel in &files {
+            let path = stage.join(rel);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            }
+            let mut f = std::fs::File::create(&path).map_err(|e| format!("Cannot create {}: {e}", path.display()))?;
+            loop {
+                let v = c.recv_val()?;
+                if v.get("next").is_some() {
+                    break;
+                }
+                let d = v.get("data").and_then(|x| x.as_str()).ok_or_else(unexpected)?;
+                let bytes =
+                    base64::engine::general_purpose::STANDARD.decode(d).map_err(|_| "Garbled file data".to_string())?;
+                f.write_all(&bytes).map_err(|e| e.to_string())?;
+            }
+        }
+        if c.recv_val()?.get("done").is_none() {
+            return Err(unexpected());
+        }
+        let top_paths: Vec<PathBuf> = tops.iter().map(|t| stage.join(t)).collect();
+        crate::clipboard::receive_files(shared, &top_paths)?;
+        Ok(files.len())
+    })();
+    match result {
+        Ok(n) => {
+            lock(shared).log(format!("{n} copied file{} from {who} — ready to paste", if n == 1 { "" } else { "s" }));
+            let _ = c.send_val(&serde_json::json!({ "op": "ok" }));
+        }
+        Err(e) => {
+            lock(shared).log(format!("Copied files from {who} did not arrive: {e}"));
+            let _ = c.send_val(&serde_json::json!({ "error": e }));
+        }
+    }
 }
 
 /// Sends copied text to a paired device's clipboard.

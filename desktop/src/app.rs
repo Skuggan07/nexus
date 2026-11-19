@@ -1330,7 +1330,7 @@ impl NexusApp {
             }
             let mut share = lock(&self.shared).share_clipboard;
             if ui
-                .checkbox(&mut share, "Shared clipboard — text you copy here goes to your paired devices that are online, and theirs comes here")
+                .checkbox(&mut share, "Shared clipboard — text and files you copy here go to your paired devices that are online, and theirs come here")
                 .changed()
             {
                 lock(&self.shared).share_clipboard = share;
