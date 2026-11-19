@@ -15,6 +15,7 @@ mod state;
 mod store;
 mod sysstats;
 mod update;
+mod wakeup;
 
 use eframe::egui;
 use std::sync::{Arc, Mutex};
@@ -48,6 +49,7 @@ fn main() -> eframe::Result<()> {
         problems.push(e);
     }
     sysstats::start_sampler();
+    wakeup::start();
     net::start_status_checker(me.clone(), shared.clone(), dir.clone());
     automation::start(me.clone(), shared.clone(), dir.clone());
     clipboard::start(me.clone(), shared.clone(), dir.clone());

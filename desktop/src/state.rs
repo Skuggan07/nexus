@@ -116,6 +116,12 @@ pub struct Shared {
     pub share_clipboard: bool,
     /// The last clipboard text sent or received, so it isn't sent back and forth.
     pub clip_last: String,
+    /// What each PC said about being woken (ready, wifi, off, unknown), by device id.
+    pub wake_hints: HashMap<String, String>,
+    /// Devices we just sent a wake signal to, and when.
+    pub waking: HashMap<String, Instant>,
+    /// Devices that did not wake up after the last try.
+    pub wake_failed: std::collections::HashSet<String>,
     next_session: u64,
 }
 
@@ -132,6 +138,9 @@ impl Shared {
             automations: Vec::new(),
             share_clipboard: true,
             clip_last: String::new(),
+            wake_hints: HashMap::new(),
+            waking: HashMap::new(),
+            wake_failed: std::collections::HashSet::new(),
             next_session: 1,
         }
     }

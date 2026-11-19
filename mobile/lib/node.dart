@@ -75,8 +75,11 @@ class Seen {
 
 /// A device's CPU, RAM and battery in percent; null when that device can't tell.
 class Stats {
-  const Stats({this.cpu, this.ram, this.battery});
+  const Stats({this.cpu, this.ram, this.battery, this.wake});
   final double? cpu, ram, battery;
+
+  /// For PCs: whether it can be woken from another device (ready, wifi, off, unknown).
+  final String? wake;
 
   static double? _num(Object? v) => v is num ? v.toDouble() : null;
 
@@ -84,7 +87,9 @@ class Stats {
     try {
       final m = jsonDecode(json);
       if (m is! Map<String, dynamic>) return null;
-      return Stats(cpu: _num(m['cpu']), ram: _num(m['ram']), battery: _num(m['battery']));
+      final wake = m['wake'];
+      return Stats(
+          cpu: _num(m['cpu']), ram: _num(m['ram']), battery: _num(m['battery']), wake: wake is String ? wake : null);
     } catch (_) {
       return null;
     }
@@ -751,6 +756,15 @@ class NexusNode extends ChangeNotifier {
   }
 
   /// Sends a Wake-on-LAN magic packet for each known MAC of a device.
+  /// What each PC said about being woken (ready, wifi, off, unknown), by device id.
+  final wakeHints = <String, String>{};
+
+  /// PCs we just sent a wake signal to, and when.
+  final waking = <String, DateTime>{};
+
+  /// PCs that did not wake up after the last try.
+  final wakeFailed = <String>{};
+
   Future<void> wake(PairedPeer p) async {
     final macs = p.macs.map(parseMac).whereType<List<int>>().toList();
     if (macs.isEmpty) {
@@ -758,20 +772,37 @@ class NexusNode extends ChangeNotifier {
       notifyListeners();
       return;
     }
+    wakeFailed.remove(p.id);
+    final started = DateTime.now();
+    waking[p.id] = started;
+    notifyListeners();
+    // Give up waiting after 90 seconds.
+    Timer(const Duration(seconds: 90), () {
+      if (waking[p.id] == started) {
+        waking.remove(p.id);
+        wakeFailed.add(p.id);
+        addLog('${p.name} did not wake up');
+        notifyListeners();
+      }
+    });
     RawDatagramSocket? sock;
     try {
       sock = await RawDatagramSocket.bind(InternetAddress.anyIPv4, 0);
       sock.broadcastEnabled = true;
       final targets = await _broadcastTargets();
-      for (final mac in macs) {
-        final packet = <int>[...List.filled(6, 0xFF), for (var i = 0; i < 16; i++) ...mac];
-        for (final t in targets) {
-          try {
-            sock.send(packet, t, wolPort);
-          } catch (_) {}
+      // Send it a few times: a single packet is easy to lose.
+      for (var round = 0; round < 3; round++) {
+        if (round > 0) await Future<void>.delayed(const Duration(seconds: 1));
+        for (final mac in macs) {
+          final packet = <int>[...List.filled(6, 0xFF), for (var i = 0; i < 16; i++) ...mac];
+          for (final t in targets) {
+            try {
+              sock.send(packet, t, wolPort);
+            } catch (_) {}
+          }
         }
       }
-      addLog('Sent a wake signal to ${p.name}');
+      addLog('Sent a wake signal to ${p.name} — waiting for it to come online');
     } catch (e) {
       addLog('Could not wake ${p.name}: $e');
     } finally {
@@ -1728,6 +1759,9 @@ class NexusNode extends ChangeNotifier {
         try {
           final (rtt, stats) = await _ping(p, host, port);
           if (!wasOk) addLog('${p.name} is online and verified ($rtt ms)');
+          if (waking.remove(p.id) != null) addLog('${p.name} woke up ✓');
+          wakeFailed.remove(p.id);
+          if (stats?.wake != null) wakeHints[p.id] = stats!.wake!;
           checks[p.id] = Check.ok(rtt, stats);
           final addr = '$host:$port';
           if (p.lastAddr != addr) {

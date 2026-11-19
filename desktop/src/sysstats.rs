@@ -14,6 +14,9 @@ pub struct Stats {
     pub cpu: Option<f32>,
     pub ram: Option<f32>,
     pub battery: Option<f32>,
+    /// Whether this PC can be woken from another device: ready, wifi, off or unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wake: Option<String>,
 }
 
 static LATEST: OnceLock<Mutex<Option<String>>> = OnceLock::new();
@@ -40,6 +43,7 @@ pub fn start_sampler() {
                 cpu: Some(round1(sys.global_cpu_info().cpu_usage())),
                 ram: (total > 0).then(|| round1(sys.used_memory() as f32 / total as f32 * 100.0)),
                 battery: battery_percent(),
+                wake: crate::wakeup::code(),
             };
             if let (Ok(json), Ok(mut g)) = (serde_json::to_string(&s), slot().lock()) {
                 *g = Some(json);

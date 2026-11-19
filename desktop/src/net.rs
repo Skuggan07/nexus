@@ -1693,6 +1693,13 @@ pub fn start_status_checker(me: Arc<Identity>, shared: SharedState, dir: PathBuf
                     if !was_ok {
                         s.log(format!("{} is online and verified ({rtt_ms} ms)", p.name));
                     }
+                    if s.waking.remove(&p.id).is_some() {
+                        s.log(format!("{} woke up ✓", p.name));
+                    }
+                    s.wake_failed.remove(&p.id);
+                    if let Some(w) = stats.as_ref().and_then(|x| x.wake.clone()) {
+                        s.wake_hints.insert(p.id.clone(), w);
+                    }
                     s.checks.insert(p.id.clone(), Check::Ok { rtt_ms, at: Instant::now(), stats });
                     let a = addr.to_string();
                     let changed = s.paired.iter_mut().find(|x| x.id == p.id).is_some_and(|x| {

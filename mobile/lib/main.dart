@@ -586,6 +586,17 @@ class _HomePageState extends State<HomePage> {
       ];
     }
     if (p.macs.isNotEmpty) {
+      final since = node.waking[p.id];
+      final failed = node.wakeFailed.contains(p.id);
+      final hint = node.wakeHints[p.id];
+      final String? tip = failed
+          ? "It didn't wake up. On that PC: open Nexus → Settings → Set up waking, connect it with a network cable, "
+              'and check that Wake-on-LAN is on in its BIOS.'
+          : switch (hint) {
+              'wifi' => "That PC uses Wi-Fi. Most PCs can't be woken over Wi-Fi — a network cable works best.",
+              'off' => "Waking isn't set up on that PC. On it, open Nexus → Settings → Set up waking.",
+              _ => null,
+            };
       return [
         SizedBox(
           width: double.infinity,
@@ -594,14 +605,24 @@ class _HomePageState extends State<HomePage> {
             style: FilledButton.styleFrom(
               backgroundColor: accent,
               foregroundColor: white,
+              disabledBackgroundColor: box2,
+              disabledForegroundColor: white,
               shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
               textStyle: const TextStyle(fontWeight: FontWeight.w800),
             ),
-            onPressed: () => node.wake(p),
-            icon: const Icon(Icons.power_settings_new),
-            label: const Text('Wake'),
+            onPressed: since == null ? () => node.wake(p) : null,
+            icon: since == null
+                ? const Icon(Icons.power_settings_new)
+                : const SizedBox(
+                    width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2, color: white)),
+            label: Text(since == null ? 'Wake' : 'Waking… (can take up to a minute)'),
           ),
         ),
+        if (tip != null)
+          Padding(
+            padding: const EdgeInsets.only(top: 8),
+            child: Text(tip, style: TextStyle(fontSize: 12, color: failed ? bad : off)),
+          ),
       ];
     }
     return const [];

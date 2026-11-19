@@ -370,15 +370,36 @@ impl NexusApp {
                 }
             }
             Action::Wake(id) => {
-                let peer = lock(&self.shared).paired.iter().find(|p| p.id == id).cloned();
+                let peer = {
+                    let mut s = lock(&self.shared);
+                    s.wake_failed.remove(&id);
+                    s.waking.insert(id.clone(), Instant::now());
+                    s.paired.iter().find(|p| p.id == id).cloned()
+                };
                 if let Some(peer) = peer {
                     let shared = self.shared.clone();
                     std::thread::spawn(move || {
-                        let msg = match net::wake(&peer) {
-                            Ok(()) => format!("Sent a wake signal to {}", peer.name),
-                            Err(e) => format!("Could not wake {}: {e}", peer.name),
-                        };
-                        lock(&shared).log(msg);
+                        // Send it a few times: a single packet is easy to lose.
+                        let mut result = Ok(());
+                        for i in 0..3 {
+                            if i > 0 {
+                                std::thread::sleep(Duration::from_secs(1));
+                            }
+                            result = net::wake(&peer);
+                            if result.is_err() {
+                                break;
+                            }
+                        }
+                        let mut s = lock(&shared);
+                        match result {
+                            Ok(()) => {
+                                s.log(format!("Sent a wake signal to {} — waiting for it to come online", peer.name))
+                            }
+                            Err(e) => {
+                                s.waking.remove(&peer.id);
+                                s.log(format!("Could not wake {}: {e}", peer.name));
+                            }
+                        }
                     });
                 }
             }
@@ -771,6 +792,12 @@ struct Row {
     peer: PairedPeer,
     status: Status,
     addr: Option<String>,
+    /// What that PC said about being woken: ready, wifi, off or unknown.
+    wake_hint: Option<String>,
+    /// How long ago a wake signal was sent, while we wait for it to come online.
+    waking: Option<Duration>,
+    /// The last wake signal did not wake it.
+    wake_failed: bool,
 }
 struct Near {
     id: String,
@@ -912,7 +939,20 @@ impl eframe::App for NexusApp {
         self.update_banner(ctx);
 
         let (rows, nearby, window, session, log) = {
-            let s = lock(&self.shared);
+            let mut s = lock(&self.shared);
+            // Give up waiting for a woken PC after 90 seconds.
+            let late: Vec<String> = s
+                .waking
+                .iter()
+                .filter(|(_, t)| t.elapsed() > Duration::from_secs(90))
+                .map(|(id, _)| id.clone())
+                .collect();
+            for id in late {
+                s.waking.remove(&id);
+                s.wake_failed.insert(id.clone());
+                let name = s.paired.iter().find(|p| p.id == id).map(|p| p.name.clone()).unwrap_or_default();
+                s.log(format!("{name} did not wake up"));
+            }
             let mut rows: Vec<Row> = s
                 .paired
                 .iter()
@@ -922,6 +962,9 @@ impl eframe::App for NexusApp {
                         p.last_addr.as_deref().and_then(|a| a.parse::<SocketAddr>().ok()).map(|a| a.ip().to_string())
                     }),
                     peer: p.clone(),
+                    wake_hint: s.wake_hints.get(&p.id).cloned(),
+                    waking: s.waking.get(&p.id).map(|t| t.elapsed()),
+                    wake_failed: s.wake_failed.contains(&p.id),
                 })
                 .collect();
             rows.sort_by_key(|r| r.peer.name.to_lowercase());
@@ -1420,6 +1463,67 @@ impl NexusApp {
                 }
             });
         });
+        box_frame().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(RichText::new("WAKE THIS PC FROM OTHER DEVICES").size(14.0).strong());
+            ui.add_space(4.0);
+            match crate::wakeup::current() {
+                None => {
+                    ui.label(RichText::new("Checking…").color(OFF));
+                }
+                Some(w) => {
+                    let yes_no = |v: Option<bool>| match v {
+                        Some(true) => "on",
+                        Some(false) => "off",
+                        None => "unknown",
+                    };
+                    ui.label(format!("Network: {} ({})", w.adapter, if w.wifi { "Wi-Fi" } else { "cable" }));
+                    ui.label(format!(
+                        "Wake on magic packet: {} · Allowed to wake this PC: {}",
+                        yes_no(w.magic),
+                        yes_no(w.armed)
+                    ));
+                    let (text, color) = match w.code() {
+                        "ready" => ("Ready — Wake on your other devices can wake this PC from sleep.", ONLINE),
+                        "wifi" => (
+                            "This PC uses Wi-Fi. Most PCs can't be woken over Wi-Fi — use a network cable if you can.",
+                            OFF,
+                        ),
+                        "off" => ("Waking is turned off. Click Set up waking.", BAD),
+                        _ => ("Nexus couldn't tell if waking works. Click Set up waking to make sure.", OFF),
+                    };
+                    ui.label(RichText::new(text).color(color));
+                }
+            }
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                let busy = crate::wakeup::busy();
+                if ui
+                    .add_enabled(!busy, primary("Set up waking"))
+                    .on_hover_text("Turns on the network card's wake settings. Windows asks for permission first.")
+                    .clicked()
+                {
+                    crate::wakeup::run_in_background(true);
+                }
+                if ui.add_enabled(!busy, secondary("Check again")).clicked() {
+                    crate::wakeup::run_in_background(false);
+                }
+                if busy {
+                    ui.add(egui::Spinner::new());
+                }
+            });
+            if let Some(n) = crate::wakeup::note() {
+                ui.label(RichText::new(n).size(12.0));
+            }
+            ui.label(
+                RichText::new(
+                    "Shutting down: waking from \"Shut down\" also needs Wake-on-LAN on in the BIOS. Sleep works best.",
+                )
+                .size(12.0)
+                .color(OFF),
+            );
+        });
+        ui.add_space(10.0);
         box_frame().show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.label(RichText::new("PRIVACY AND SECURITY").size(14.0).strong());
@@ -2417,8 +2521,36 @@ fn power_controls(ui: &mut egui::Ui, r: &Row, confirm_cmd: Option<&(String, Comm
             }
         });
     } else if !r.peer.macs.is_empty() {
-        if ui.add(primary("Wake")).clicked() {
-            actions.push(Action::Wake(id));
+        ui.horizontal(|ui| match r.waking {
+            Some(t) => {
+                ui.add(egui::Spinner::new());
+                ui.label(RichText::new(format!("Waking… {}s", t.as_secs())).color(OFF));
+            }
+            None => {
+                if ui.add(primary("Wake")).clicked() {
+                    actions.push(Action::Wake(id.clone()));
+                }
+            }
+        });
+        let tip = if r.wake_failed {
+            Some((
+                "It didn't wake up. On that PC: open Nexus → Settings → Set up waking, connect it with a \
+                 network cable, and check that Wake-on-LAN is on in its BIOS.",
+                BAD,
+            ))
+        } else {
+            match r.wake_hint.as_deref() {
+                Some("wifi") => {
+                    Some(("That PC uses Wi-Fi. Most PCs can't be woken over Wi-Fi — a network cable works best.", OFF))
+                }
+                Some("off") => {
+                    Some(("Waking isn't set up on that PC. On it, open Nexus → Settings → Set up waking.", OFF))
+                }
+                _ => None,
+            }
+        };
+        if let Some((text, color)) = tip {
+            ui.label(RichText::new(text).size(12.0).color(color));
         }
     }
 }
