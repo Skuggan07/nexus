@@ -319,18 +319,55 @@ class LogLine {
 /// Newline-delimited JSON over TCP.
 class Conn {
   Conn(this.socket) : _lines = StreamIterator(utf8.decoder.bind(socket).transform(const LineSplitter())) {
-    socket.done.then((_) {}, onError: (_) {}); // a reset connection is not a crash
+    // A reset connection is not a crash; later sends report it.
+    socket.done.then((_) => _dead = true, onError: (_) => _dead = true);
   }
 
   final Socket socket;
   final StreamIterator<String> _lines;
 
+  // After a file or screen handshake every line is encrypted with ChaCha20-Poly1305:
+  // {"x": base64(ciphertext + tag)}, with a message counter as the nonce.
+  static final _aead = Chacha20.poly1305Aead();
+  SecretKey? _txKey, _rxKey;
+  int _txCount = 0, _rxCount = 0;
+  Future<void> _out = Future.value();
+  bool _dead = false;
+
+  /// From now on every line in both directions is encrypted.
+  void secure(List<int> sendKey, List<int> recvKey) {
+    _txKey = SecretKey(sendKey);
+    _rxKey = SecretKey(recvKey);
+  }
+
+  static List<int> _nonce(int n) {
+    final b = Uint8List(12);
+    ByteData.sublistView(b).setUint64(4, n, Endian.little);
+    return b;
+  }
+
   void send(Map<String, Object?> m) {
-    try {
-      socket.write('${jsonEncode(m)}\n');
-    } catch (_) {
-      throw NexusError('Connection lost');
+    if (_dead) throw NexusError('Connection lost');
+    final text = jsonEncode(m);
+    final key = _txKey;
+    if (key == null) {
+      try {
+        socket.write('$text\n');
+      } catch (_) {
+        _dead = true;
+        throw NexusError('Connection lost');
+      }
+      return;
     }
+    // Encryption is asynchronous; a queue keeps the lines in order.
+    final nonce = _nonce(_txCount++);
+    _out = _out.then((_) async {
+      if (_dead) return;
+      final box = await _aead.encrypt(utf8.encode(text), secretKey: key, nonce: nonce);
+      socket.write('${jsonEncode({'x': base64Encode([...box.cipherText, ...box.mac.bytes])})}\n');
+    }).catchError((Object _) {
+      _dead = true;
+    });
   }
 
   /// Reads one message. An `error` message from the other side is thrown as a NexusError.
@@ -343,10 +380,48 @@ class Conn {
     } catch (_) {
       throw NexusError('Connection lost');
     }
-    if (!has) throw NexusError('The other device closed the connection');
+    if (!has) {
+      _dead = true;
+      throw NexusError('The other device closed the connection');
+    }
+    var text = _lines.current;
+    final key = _rxKey;
+    if (key != null) {
+      Object? outer;
+      try {
+        outer = jsonDecode(text);
+      } catch (_) {
+        throw NexusError('Garbled message');
+      }
+      final x = outer is Map ? outer['x'] : null;
+      // The handshake's own refusal (e.g. a failed security check) arrives unencrypted.
+      if (outer is Map && outer['t'] == 'error') throw NexusError('${outer['reason']}');
+      if (x is! String) {
+        throw NexusError("The other device doesn't encrypt yet — update Nexus on both devices to the newest build");
+      }
+      final List<int> data;
+      try {
+        data = base64Decode(x);
+      } catch (_) {
+        throw NexusError('Garbled message');
+      }
+      if (data.length < 16) throw NexusError('Garbled message');
+      try {
+        final plain = await _aead.decrypt(
+          SecretBox(data.sublist(0, data.length - 16),
+              nonce: _nonce(_rxCount++), mac: Mac(data.sublist(data.length - 16))),
+          secretKey: key,
+        );
+        text = utf8.decode(plain);
+      } on SecretBoxAuthenticationError {
+        throw NexusError('A message failed its security check (it was changed on the way)');
+      } catch (_) {
+        throw NexusError('Garbled message');
+      }
+    }
     Object? m;
     try {
-      m = jsonDecode(_lines.current);
+      m = jsonDecode(text);
     } catch (_) {
       throw NexusError('Garbled message');
     }
@@ -355,9 +430,13 @@ class Conn {
     return m;
   }
 
+  /// Closes the link once everything queued has been sent.
   void close() {
-    _lines.cancel();
-    socket.destroy();
+    _out.whenComplete(() {
+      _dead = true;
+      _lines.cancel();
+      socket.destroy();
+    });
   }
 }
 
@@ -837,6 +916,8 @@ class NexusNode extends ChangeNotifier {
         throw NexusError('The device failed the file-transfer security check');
       }
       c.send({'t': 'fs_auth', 'mac': toHex(await fsMac(ss, nonceS, nonceC, id, p.id))});
+      final (c2s, s2c) = await linkKeys(ss, nonceC, nonceS);
+      c.secure(c2s, s2c);
       return c;
     } catch (e) {
       c.close();
@@ -861,6 +942,8 @@ class NexusNode extends ChangeNotifier {
         throw NexusError('The device failed the screen-sharing security check');
       }
       c.send({'t': 'screen_auth', 'mac': toHex(await screenMac(ss, nonceS, nonceC, id, p.id))});
+      final (c2s, s2c) = await linkKeys(ss, nonceC, nonceS);
+      c.secure(c2s, s2c);
       return c;
     } catch (e) {
       c.close();
@@ -1277,6 +1360,8 @@ class NexusNode extends ChangeNotifier {
       c.send({'t': 'error', 'reason': 'Screen-sharing security check failed'});
       return;
     }
+    final (c2s, s2c) = await linkKeys(ss, nonceC, nonceS);
+    c.secure(s2c, c2s);
     final first = await c.recv();
     if (first['op'] == 'control') {
       await _controlServe(c, peer.name);
@@ -1465,6 +1550,8 @@ class NexusNode extends ChangeNotifier {
       c.send({'t': 'error', 'reason': 'File-transfer security check failed'});
       return;
     }
+    final (c2s, s2c) = await linkKeys(ss, nonceC, nonceS);
+    c.secure(s2c, c2s);
     addLog('${peer.name} opened a file connection');
     notifyListeners();
     while (true) {

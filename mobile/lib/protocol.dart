@@ -20,6 +20,8 @@ final labelCmd = utf8.encode('nexus-cmd-v2');
 final labelCmdAck = utf8.encode('nexus-cmdack-v2');
 final labelFs = utf8.encode('nexus-fs-v2');
 final labelScreen = utf8.encode('nexus-screen-v2');
+final labelLinkC2s = utf8.encode('nexus-link-c2s-v1');
+final labelLinkS2c = utf8.encode('nexus-link-s2c-v1');
 
 const wolPort = 9;
 const fsChunk = 256 * 1024;
@@ -117,6 +119,11 @@ Future<List<int>> fsMac(List<int> ss, List<int> n1, List<int> n2, String a, Stri
 /// Screen-sharing handshake MAC: HMAC(ss, labelScreen | n1 | n2 | idA | idB).
 Future<List<int>> screenMac(List<int> ss, List<int> n1, List<int> n2, String a, String b) =>
     hmac(ss, [labelScreen, n1, n2, utf8.encode(a), utf8.encode(b)]);
+
+/// The two keys that encrypt a file or screen link after its handshake:
+/// (opener → host, host → opener). HMAC(ss, label | nonceC | nonceS).
+Future<(List<int>, List<int>)> linkKeys(List<int> ss, List<int> nonceC, List<int> nonceS) async =>
+    (await hmac(ss, [labelLinkC2s, nonceC, nonceS]), await hmac(ss, [labelLinkS2c, nonceC, nonceS]));
 
 /// Parses "aa:bb:cc:dd:ee:ff" (any separators) into 6 bytes, or null if it is all zeros / malformed.
 List<int>? parseMac(String s) {
