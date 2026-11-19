@@ -54,5 +54,29 @@ if "supportsPictureInPicture" not in s:
 if "ScreenCaptureService" not in s:
     s = s.replace("</application>", services + "    </application>", 1)
 
+# "Share → Nexus": sends photos and files from any app to the PCs.
+share = """
+        <activity
+            android:name=".ShareActivity"
+            android:exported="true"
+            android:label="Nexus"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar">
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="*/*" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.SEND_MULTIPLE" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="*/*" />
+            </intent-filter>
+        </activity>
+"""
+if "ShareActivity" not in s:
+    s = s.replace("</application>", share + "    </application>", 1)
+
 open(path, "w", encoding="utf-8").write(s)
-print("Manifest patched:", ", ".join(perms), "+ screen sharing and remote-control services")
+print("Manifest patched:", ", ".join(perms), "+ screen sharing, remote-control services and Share → Nexus")
