@@ -2,6 +2,8 @@ package app.nexus.nexus_mobile
 
 import android.app.Activity
 import android.app.PendingIntent
+import android.content.ClipboardManager
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageInstaller
 import android.media.projection.MediaProjectionManager
@@ -59,6 +61,19 @@ class MainActivity : FlutterActivity() {
                     } else {
                         result.success(false)
                     }
+                }
+                // When the clipboard last changed, without reading what's on it (reading
+                // makes Android show a "pasted from your clipboard" notice).
+                "clipStamp" -> {
+                    val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                    val d = try { cm.primaryClipDescription } catch (e: Exception) { null }
+                    result.success(
+                        when {
+                            d == null -> null
+                            Build.VERSION.SDK_INT >= 26 -> d.timestamp
+                            else -> System.identityHashCode(d).toLong()
+                        }
+                    )
                 }
                 "installApk" -> {
                     val path = call.argument<String>("path")

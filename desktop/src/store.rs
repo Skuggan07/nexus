@@ -70,6 +70,14 @@ pub fn save_allow_control(dir: &Path, on: bool) {
     save_pref(dir, "allow_control", serde_json::Value::Bool(on));
 }
 
+pub fn load_share_clipboard(dir: &Path) -> bool {
+    load_prefs(dir).get("share_clipboard").and_then(|d| d.as_bool()).unwrap_or(true)
+}
+
+pub fn save_share_clipboard(dir: &Path, on: bool) {
+    save_pref(dir, "share_clipboard", serde_json::Value::Bool(on));
+}
+
 fn load_prefs(dir: &Path) -> serde_json::Value {
     fs::read_to_string(dir.join("prefs.json"))
         .ok()

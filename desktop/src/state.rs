@@ -112,6 +112,10 @@ pub struct Shared {
     pub allow_control: bool,
     /// This PC's automation rules (see automation.rs).
     pub automations: Vec<crate::automation::Rule>,
+    /// Whether copied text is shared with paired devices (Settings).
+    pub share_clipboard: bool,
+    /// The last clipboard text sent or received, so it isn't sent back and forth.
+    pub clip_last: String,
     next_session: u64,
 }
 
@@ -126,6 +130,8 @@ impl Shared {
             log: VecDeque::new(),
             allow_control: true,
             automations: Vec::new(),
+            share_clipboard: true,
+            clip_last: String::new(),
             next_session: 1,
         }
     }

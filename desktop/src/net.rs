@@ -468,6 +468,7 @@ fn screen_serve(mut c: Conn, me: &Arc<Identity>, shared: &SharedState, dir: &Pat
         Some("control") => return control_serve(c, shared, &id),
         Some("monitor") => return monitor_serve(c, shared, &id),
         Some("auto") => return auto_serve(c, me, shared, dir, &id),
+        Some("clip") => return clip_serve(c, shared, &id, &start),
         _ => {}
     }
     let fps = start.get("fps").and_then(|x| x.as_u64()).unwrap_or(8).clamp(1, 30);
@@ -499,6 +500,36 @@ fn screen_serve(mut c: Conn, me: &Arc<Identity>, shared: &SharedState, dir: &Pat
         }
     }
     lock(shared).log(format!("{who} stopped viewing this screen"));
+}
+
+/// Puts text from a paired device on this PC's clipboard (if shared clipboard is on).
+fn clip_serve(mut c: Conn, shared: &SharedState, id: &str, start: &serde_json::Value) {
+    let who = peer_name(shared, id);
+    let text = start.get("text").and_then(|t| t.as_str()).unwrap_or("");
+    let on = lock(shared).share_clipboard;
+    let reply = if !on {
+        serde_json::json!({ "error": "Shared clipboard is turned off on this PC" })
+    } else {
+        match crate::clipboard::receive(shared, text) {
+            Ok(()) => {
+                lock(shared).log(format!("Clipboard from {who}"));
+                serde_json::json!({ "op": "ok" })
+            }
+            Err(e) => serde_json::json!({ "error": e }),
+        }
+    };
+    let _ = c.send_val(&reply);
+}
+
+/// Sends copied text to a paired device's clipboard.
+pub(crate) fn clip_send(me: &Identity, peer: &PairedPeer, addr: SocketAddr, text: &str) -> Result<(), String> {
+    let mut c = screen_open(me, peer, addr)?;
+    c.send_val(&serde_json::json!({ "op": "clip", "text": text }))?;
+    let answer = c.recv_val()?;
+    match fs_err(&answer) {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 /// The automation list as sent to a paired device.

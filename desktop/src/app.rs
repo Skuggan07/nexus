@@ -1103,7 +1103,7 @@ impl NexusApp {
                 }
                 ui.add_space(6.0);
                 ui.label(
-                    RichText::new("Coming next: Clipboard · Other networks · More monitors · Floating screen")
+                    RichText::new("Coming next: Other networks · More monitors · Floating screen · Better wake")
                         .size(12.0),
                 );
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
@@ -1327,6 +1327,14 @@ impl NexusApp {
             {
                 lock(&self.shared).allow_control = allow;
                 store::save_allow_control(&self.dir, allow);
+            }
+            let mut share = lock(&self.shared).share_clipboard;
+            if ui
+                .checkbox(&mut share, "Shared clipboard — text you copy here goes to your paired devices that are online, and theirs comes here")
+                .changed()
+            {
+                lock(&self.shared).share_clipboard = share;
+                store::save_share_clipboard(&self.dir, share);
             }
             ui.add_space(4.0);
             ui.label(

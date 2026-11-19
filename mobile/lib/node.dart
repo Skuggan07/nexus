@@ -480,17 +480,129 @@ class NexusNode extends ChangeNotifier {
     try {
       final f = File('${_dir.path}/prefs.json');
       if (await f.exists()) {
-        detailed = (jsonDecode(await f.readAsString()) as Map<String, dynamic>)['detailed'] == true;
+        final m = jsonDecode(await f.readAsString()) as Map<String, dynamic>;
+        detailed = m['detailed'] == true;
+        shareClipboard = m['share_clipboard'] != false;
       }
+    } catch (_) {}
+  }
+
+  Future<void> _savePrefs() async {
+    try {
+      await File('${_dir.path}/prefs.json')
+          .writeAsString(jsonEncode({'detailed': detailed, 'share_clipboard': shareClipboard}));
     } catch (_) {}
   }
 
   Future<void> setDetailed(bool value) async {
     detailed = value;
     notifyListeners();
+    await _savePrefs();
+  }
+
+  /* ---------------------------------------------- shared clipboard */
+
+  /// Whether copied text is shared with paired devices.
+  bool shareClipboard = true;
+
+  /// The last text that arrived from another device, for the home screen.
+  String? lastClipText;
+  String? lastClipFrom;
+  String? _clipLast;
+  int? _clipStamp;
+
+  Future<void> setShareClipboard(bool value) async {
+    shareClipboard = value;
+    notifyListeners();
+    await _savePrefs();
+  }
+
+  Future<int?> _clipboardStamp() async {
+    final v = await _native('clipStamp');
+    return v is int ? v : null;
+  }
+
+  /// Called when Nexus comes to the front: if something new was copied while it was
+  /// in the background, send it. (Android only lets the app in front read the clipboard.)
+  Future<void> checkClipboard() async {
+    if (!shareClipboard) return;
+    final stamp = await _clipboardStamp();
+    if (stamp == null) return;
+    final first = _clipStamp == null;
+    if (stamp == _clipStamp) return;
+    _clipStamp = stamp;
+    // On the first look, only remember where things are — don't send old text.
+    if (first) return;
+    await sendClipboard(auto: true);
+  }
+
+  /// Sends this phone's clipboard text to the paired devices that are online.
+  /// Returns how many took it.
+  Future<int> sendClipboard({bool auto = false}) async {
+    String text = '';
     try {
-      await File('${_dir.path}/prefs.json').writeAsString(jsonEncode({'detailed': value}));
+      text = (await Clipboard.getData(Clipboard.kTextPlain))?.text ?? '';
     } catch (_) {}
+    if (text.trim().isEmpty) {
+      if (!auto) {
+        addLog('The clipboard is empty');
+        notifyListeners();
+      }
+      return 0;
+    }
+    if (auto && text == _clipLast) return 0;
+    _clipLast = text;
+    final names = <String>[];
+    for (final p in paired) {
+      final k = statusOf(p).kind;
+      if (k != StatusKind.verified && k != StatusKind.checking) continue;
+      Conn? c;
+      try {
+        c = await _screenOpen(p);
+        c.send({'op': 'clip', 'text': text});
+        final v = await c.recv(const Duration(seconds: 8));
+        if (v['error'] == null) {
+          names.add(p.name);
+        } else {
+          addLog('${p.name}: ${v['error']}');
+        }
+      } catch (e) {
+        addLog('Could not send the clipboard to ${p.name}: $e');
+      } finally {
+        c?.close();
+      }
+    }
+    if (names.isNotEmpty) {
+      addLog('Copied text sent to ${names.join(', ')}');
+    } else if (!auto) {
+      addLog('No device is online to send the clipboard to');
+    }
+    notifyListeners();
+    return names.length;
+  }
+
+  /// A paired device sent text for this phone's clipboard.
+  Future<void> _clipServe(Conn c, Map<String, dynamic> m, String who) async {
+    final text = '${m['text'] ?? ''}';
+    if (!shareClipboard) {
+      c.send({'error': 'Shared clipboard is turned off on $name'});
+    } else if (text.isEmpty || text.length > 1000000) {
+      c.send({'error': 'Nothing to paste'});
+    } else {
+      _clipLast = text;
+      try {
+        await Clipboard.setData(ClipboardData(text: text));
+        _clipStamp = await _clipboardStamp();
+        lastClipText = text;
+        lastClipFrom = who;
+        addLog('Clipboard from $who');
+        notifyListeners();
+        c.send({'op': 'ok'});
+      } catch (e) {
+        c.send({'error': 'The phone did not accept the text'});
+      }
+    }
+    c.close();
   }
 
   /// This phone's RAM (from /proc/meminfo) and battery. Android does not let apps read CPU use.
@@ -1081,6 +1193,8 @@ class NexusNode extends ChangeNotifier {
       await _controlServe(c, peer.name);
     } else if (first['op'] == 'monitor') {
       await _monitorServe(c, peer.name);
+    } else if (first['op'] == 'clip') {
+      await _clipServe(c, first, peer.name);
     } else if (first['op'] == 'auto') {
       c.send({'error': 'Automations run on computers, not on phones'});
       c.close();

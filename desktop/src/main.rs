@@ -3,6 +3,7 @@
 
 mod app;
 mod automation;
+mod clipboard;
 mod discovery;
 mod identity;
 mod input;
@@ -34,6 +35,7 @@ fn main() -> eframe::Result<()> {
     };
     let shared = Arc::new(Mutex::new(state::Shared::new(store::load_peers(&dir))));
     state::lock(&shared).allow_control = store::load_allow_control(&dir);
+    state::lock(&shared).share_clipboard = store::load_share_clipboard(&dir);
 
     let preferred = std::env::var("NEXUS_TCP_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(net::DEFAULT_TCP_PORT);
     let mut problems = Vec::new();
@@ -47,6 +49,7 @@ fn main() -> eframe::Result<()> {
     sysstats::start_sampler();
     net::start_status_checker(me.clone(), shared.clone(), dir.clone());
     automation::start(me.clone(), shared.clone(), dir.clone());
+    clipboard::start(me.clone(), shared.clone());
     state::lock(&shared).log(format!("Nexus started as {} (data in {})", me.name, dir.display()));
     let startup_error = (!problems.is_empty()).then(|| problems.join("\n"));
 

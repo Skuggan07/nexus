@@ -33,6 +33,8 @@ windows-sys = { version = "0.59", features = [
     "Win32_UI_Input_KeyboardAndMouse",  # remote control (SendInput) + idle time
     "Win32_System_SystemInformation",   # automation: local time and tick count
     "Win32_UI_Shell",                   # automation: open programs, files and web addresses
+    "Win32_System_DataExchange",        # shared clipboard
+    "Win32_System_Memory",              # shared clipboard (clipboard memory)
 ] }
 
 [profile.release]

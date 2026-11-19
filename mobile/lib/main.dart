@@ -233,6 +233,8 @@ class _HomePageState extends State<HomePage> {
       ],
       const SizedBox(height: 16),
       _PhoneSharingBox(node: node),
+      const SizedBox(height: 12),
+      _ClipboardBox(node: node),
       const SizedBox(height: 24),
       Center(
         child: TextButton(
@@ -282,6 +284,8 @@ class _HomePageState extends State<HomePage> {
       _activity(),
       const SizedBox(height: 12),
       _PhoneSharingBox(node: node),
+      const SizedBox(height: 12),
+      _ClipboardBox(node: node),
       const SizedBox(height: 12),
       _Box(
         child: Row(children: [
@@ -1891,6 +1895,91 @@ class _PhoneSharingBoxState extends State<_PhoneSharingBox> with WidgetsBindingO
             onPressed: () => widget.node.openControlSettings(),
           ),
         ]),
+      ]),
+    );
+  }
+}
+
+/// Shared clipboard: on/off, "Send clipboard now", and the last text that arrived.
+/// Android only lets the app in front read the clipboard, so new text is sent when
+/// Nexus is opened (or with the button). Text from other devices arrives any time.
+class _ClipboardBox extends StatefulWidget {
+  const _ClipboardBox({required this.node});
+  final NexusNode node;
+
+  @override
+  State<_ClipboardBox> createState() => _ClipboardBoxState();
+}
+
+class _ClipboardBoxState extends State<_ClipboardBox> with WidgetsBindingObserver {
+  bool _sending = false;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    widget.node.checkClipboard();
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) widget.node.checkClipboard();
+  }
+
+  Future<void> _send() async {
+    setState(() => _sending = true);
+    final n = await widget.node.sendClipboard();
+    if (!mounted) return;
+    setState(() => _sending = false);
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+      content: Text(n > 0 ? 'Sent to $n device${n == 1 ? '' : 's'}' : 'Nothing was sent — see Activity'),
+    ));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final node = widget.node;
+    final last = node.lastClipText;
+    return _Box(
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        const Text('SHARED CLIPBOARD', style: TextStyle(color: online, fontSize: 11, letterSpacing: 1.5)),
+        const SizedBox(height: 6),
+        Row(children: [
+          Expanded(
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              const Text('Copy here, paste on your PC', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 15)),
+              Text(
+                node.shareClipboard
+                    ? 'Text copied on your PC lands here. Text you copy here is sent when you open Nexus.'
+                    : 'Off — nothing is sent or received.',
+                style: TextStyle(fontSize: 12, color: node.shareClipboard ? white : off),
+              ),
+            ]),
+          ),
+          Switch(value: node.shareClipboard, activeTrackColor: accent, onChanged: node.setShareClipboard),
+        ]),
+        if (node.shareClipboard) ...[
+          const SizedBox(height: 8),
+          SizedBox(
+            width: double.infinity,
+            child: _SecondaryButton(
+              label: _sending ? 'Sending…' : 'Send clipboard now',
+              onPressed: _sending ? null : _send,
+            ),
+          ),
+        ],
+        if (last != null) ...[
+          const SizedBox(height: 10),
+          Text('Last from ${node.lastClipFrom ?? 'a device'}:', style: const TextStyle(color: off, fontSize: 12)),
+          const SizedBox(height: 2),
+          Text(last, maxLines: 3, overflow: TextOverflow.ellipsis),
+        ],
       ]),
     );
   }
