@@ -712,7 +712,8 @@ pub struct ClipItem {
 
 const CLIP_CHUNK: usize = 256 * 1024;
 
-/// Sends files copied on this PC to a paired PC, which puts them on its clipboard.
+/// Sends files copied on this PC to a paired device, which puts them on its clipboard
+/// (a phone also saves them to its Gallery or Downloads).
 pub(crate) fn clipfiles_send(
     me: &Identity,
     peer: &PairedPeer,

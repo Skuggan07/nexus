@@ -3,9 +3,11 @@
 //! own authenticated screen link (`{op:"clip", text}`), so only paired devices can
 //! read or change the clipboard. It can be turned off in Settings.
 //!
-//! Files and folders copied in File Explorer are sent to the other paired PCs too
-//! (`{op:"clipfiles"}`). They land in a folder inside Nexus's data folder and are put
-//! on that PC's clipboard as files, so Ctrl+V in Explorer pastes them like normal.
+//! Files and folders copied in File Explorer are sent to the other paired devices too
+//! (`{op:"clipfiles"}`). On a PC they land in a folder inside Nexus's data folder and are
+//! put on that PC's clipboard as files, so Ctrl+V in Explorer pastes them like normal.
+//! A phone saves them (pictures to the Gallery, other files to Downloads) and puts
+//! them on its clipboard. Photos and files sent from a phone arrive the same way.
 
 use crate::{
     identity::Identity,
@@ -181,10 +183,10 @@ fn walk(path: &Path, rel: &str, items: &mut Vec<net::ClipItem>, total: &mut u64)
     Ok(())
 }
 
-/// Sends copied files to the other PCs that are online (phones can't paste files).
+/// Sends copied files to the other devices that are online: PCs paste them with Ctrl+V,
+/// phones save them to the Gallery or Downloads.
 fn send_files_to_all(me: &Identity, shared: &SharedState, paths: &[PathBuf]) {
-    let targets: Vec<_> =
-        online_targets(shared).into_iter().filter(|(p, _)| !matches!(p.os.as_str(), "Android" | "iOS")).collect();
+    let targets = online_targets(shared);
     if targets.is_empty() {
         return;
     }
@@ -197,15 +199,23 @@ fn send_files_to_all(me: &Identity, shared: &SharedState, paths: &[PathBuf]) {
     };
     let count = items.iter().filter(|i| !i.dir).count();
     lock(shared).log(format!("Sending {count} copied file{}…", if count == 1 { "" } else { "s" }));
-    let mut sent = Vec::new();
+    let (mut pcs, mut phones) = (Vec::new(), Vec::new());
     for (peer, addr) in targets {
+        let phone = matches!(peer.os.as_str(), "Android" | "iOS");
         match net::clipfiles_send(me, &peer, addr, &items) {
-            Ok(()) => sent.push(peer.name.clone()),
+            Ok(()) if phone => phones.push(peer.name.clone()),
+            Ok(()) => pcs.push(peer.name.clone()),
             Err(e) => lock(shared).log(format!("Could not send the copied files to {}: {e}", peer.name)),
         }
     }
-    if !sent.is_empty() {
-        lock(shared).log(format!("Copied files sent to {} — paste them there with Ctrl+V", sent.join(", ")));
+    if !pcs.is_empty() {
+        lock(shared).log(format!("Copied files sent to {} — paste them there with Ctrl+V", pcs.join(", ")));
+    }
+    if !phones.is_empty() {
+        lock(shared).log(format!(
+            "Copied files sent to {} — pictures are in the Gallery, other files in Downloads › Nexus",
+            phones.join(", ")
+        ));
     }
 }
 
