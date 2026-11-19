@@ -22,6 +22,7 @@ sysinfo = { version = "0.30", default-features = false }   # CPU and RAM usage
 mac_address = "1"                                           # local MAC addresses for Wake-on-LAN
 image = { version = "0.25", default-features = false, features = ["jpeg"] }  # encode/decode screen frames
 base64 = "0.22"                                            # frames travel as base64 inside a JSON line
+cpal = "0.15"                                              # sound sharing (record what a PC plays, play it here)
 ureq = "2"                                                 # in-app updates (asks GitHub for the newest release)
 
 [target.'cfg(windows)'.dependencies]

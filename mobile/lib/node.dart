@@ -846,6 +846,35 @@ class NexusNode extends ChangeNotifier {
     }
   }
 
+  /// Streams a paired PC's sound: (sample rate, 16-bit stereo PCM bytes) chunks.
+  /// Cancelling the subscription closes the link, which stops the PC recording.
+  Stream<(int, Uint8List)> soundStream(PairedPeer p) async* {
+    final c = await _screenOpen(p);
+    try {
+      c.send({'op': 'audio'});
+      final head = await c.recv(const Duration(seconds: 8));
+      if (head['error'] != null) throw NexusError('${head['error']}');
+      if (head['op'] != 'audio') throw NexusError('Update Nexus on that PC to hear its sound');
+      final rate = (head['rate'] as num?)?.toInt() ?? 48000;
+      while (true) {
+        final v = await c.recv(const Duration(seconds: 10));
+        if (v['error'] != null) throw NexusError('${v['error']}');
+        final d = v['pcm'];
+        if (d is String) yield (rate, base64Decode(d));
+      }
+    } finally {
+      try {
+        c.send({'op': 'bye'});
+      } catch (_) {}
+      c.close();
+    }
+  }
+
+  /// Plays PC sound on this phone's speaker (see [soundStream]).
+  Future<void> soundPlay(int rate) async => _native('audioStart', {'rate': rate});
+  void soundWrite(Uint8List pcm) => _native('audioWrite', pcm);
+  Future<void> soundStop() async => _native('audioStop');
+
   /// Opens a remote-control link to a paired device: mouse and keyboard events
   /// sent on it are carried out there. Fails if that device has control turned off.
   Future<ScreenControl> screenControl(PairedPeer p) async {

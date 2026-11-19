@@ -470,6 +470,7 @@ fn screen_serve(mut c: Conn, me: &Arc<Identity>, shared: &SharedState, dir: &Pat
         Some("auto") => return auto_serve(c, me, shared, dir, &id),
         Some("clip") => return clip_serve(c, shared, &id, &start),
         Some("clipfiles") => return clipfiles_serve(c, shared, dir, &id, &start),
+        Some("audio") => return audio_serve(c, shared, &id),
         _ => {}
     }
     let fps = start.get("fps").and_then(|x| x.as_u64()).unwrap_or(8).clamp(1, 30);
@@ -523,6 +524,84 @@ fn clip_serve(mut c: Conn, shared: &SharedState, id: &str, start: &serde_json::V
         }
     };
     let _ = c.send_val(&reply);
+}
+
+/// Sends what this PC is playing to a paired viewer until it disconnects.
+fn audio_serve(mut c: Conn, shared: &SharedState, id: &str) {
+    let who = peer_name(shared, id);
+    let (stream, rate, rx) = match crate::audio::start_capture() {
+        Ok(x) => x,
+        Err(e) => {
+            let _ = c.send_val(&serde_json::json!({ "error": e }));
+            return;
+        }
+    };
+    if c.send_val(&serde_json::json!({ "op": "audio", "rate": rate, "channels": 2 })).is_err() {
+        return;
+    }
+    lock(shared).log(format!("{who} is listening to this PC's sound"));
+    loop {
+        let msg = match rx.recv_timeout(Duration::from_millis(500)) {
+            Ok(samples) => {
+                let bytes: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
+                serde_json::json!({ "pcm": base64::engine::general_purpose::STANDARD.encode(&bytes) })
+            }
+            // Nothing is playing: Windows sends no sound, so say so to keep the link open.
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => serde_json::json!({ "op": "quiet" }),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        };
+        if c.send_val(&msg).is_err() {
+            break; // the viewer turned sound off
+        }
+    }
+    drop(stream);
+    lock(shared).log(format!("{who} stopped listening"));
+}
+
+/// Plays a paired PC's sound on this PC's speakers, on its own thread, until `stop`
+/// is set or the link ends. `on_error` is told why it stopped if it failed.
+pub fn audio_session<E>(
+    me: Arc<Identity>,
+    peer: PairedPeer,
+    addr: SocketAddr,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    on_error: E,
+) where
+    E: Fn(String) + Send + 'static,
+{
+    thread::spawn(move || {
+        let run = || -> Result<(), String> {
+            let mut c = screen_open(&me, &peer, addr)?;
+            c.send_val(&serde_json::json!({ "op": "audio" }))?;
+            let head = c.recv_val()?;
+            if let Some(e) = fs_err(&head) {
+                return Err(e);
+            }
+            if head.get("op").and_then(|o| o.as_str()) != Some("audio") {
+                return Err("Update Nexus on that PC to hear its sound".into());
+            }
+            let rate = head.get("rate").and_then(|r| r.as_u64()).unwrap_or(48_000) as u32;
+            let player = crate::audio::Player::new()?;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let v = c.recv_val()?;
+                if let Some(e) = fs_err(&v) {
+                    return Err(e);
+                }
+                if let Some(d) = v.get("pcm").and_then(|x| x.as_str()) {
+                    let bytes =
+                        base64::engine::general_purpose::STANDARD.decode(d).map_err(|_| "Garbled sound".to_string())?;
+                    let samples: Vec<i16> = bytes.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]])).collect();
+                    player.push(rate, &samples);
+                }
+            }
+            Ok(())
+        };
+        if let Err(e) = run() {
+            if !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                on_error(e);
+            }
+        }
+    });
 }
 
 /// One file or folder in a copied-files transfer.

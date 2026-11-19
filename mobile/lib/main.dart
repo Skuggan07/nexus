@@ -1212,6 +1212,8 @@ class _ScreenViewPageState extends State<ScreenViewPage> {
   StreamSubscription<ScreenFrame>? _sub;
   late int _monitor = widget.monitor;
   int _mons = 1;
+  StreamSubscription<(int, Uint8List)>? _soundSub;
+  bool _sound = false;
   Uint8List? _frame;
   int _w = 0, _h = 0, _count = 0;
   String? _error;
@@ -1304,6 +1306,32 @@ class _ScreenViewPageState extends State<ScreenViewPage> {
     _listen();
   }
 
+  /// Plays the PC's sound on this phone while on.
+  void _setSound(bool on) {
+    setState(() => _sound = on);
+    _soundSub?.cancel();
+    _soundSub = null;
+    widget.node.soundStop();
+    if (!on) return;
+    var started = false;
+    _soundSub = widget.node.soundStream(widget.peer).listen(
+      (chunk) {
+        if (!started) {
+          started = true;
+          widget.node.soundPlay(chunk.$1);
+        }
+        widget.node.soundWrite(chunk.$2);
+      },
+      onError: (Object e) {
+        widget.node.soundStop();
+        if (!mounted) return;
+        setState(() => _sound = false);
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Sound: $e')));
+      },
+      cancelOnError: true,
+    );
+  }
+
   void _showAllMonitors() {
     Navigator.of(context).push(
       MaterialPageRoute<void>(builder: (_) => ScreenGridPage(node: widget.node, onlyPeer: widget.peer)),
@@ -1318,6 +1346,10 @@ class _ScreenViewPageState extends State<ScreenViewPage> {
   @override
   void dispose() {
     _sub?.cancel();
+    if (_soundSub != null) {
+      _soundSub!.cancel();
+      widget.node.soundStop();
+    }
     _fpsTimer?.cancel();
     _ctl?.close();
     _typed.dispose();
@@ -1461,6 +1493,12 @@ class _ScreenViewPageState extends State<ScreenViewPage> {
             style: TextStyle(color: live ? online : off, fontSize: 12, fontWeight: FontWeight.w600),
           ),
         ),
+        if (widget.peer.controllable)
+          IconButton(
+            tooltip: _sound ? 'Sound on — tap to mute' : 'Hear this PC',
+            icon: Icon(_sound ? Icons.volume_up : Icons.volume_off, color: _sound ? online : white),
+            onPressed: () => _setSound(!_sound),
+          ),
         if (_mons > 1)
           PopupMenuButton<int>(
             tooltip: 'Monitor',

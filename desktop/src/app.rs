@@ -85,6 +85,8 @@ struct ScreenInner {
     control_error: Option<String>,
     /// How many monitors the other PC has (from its frames).
     mons: usize,
+    /// Why sound could not be played, if it failed.
+    sound_error: Option<String>,
 }
 
 /// One open screen viewer (several can be open at once, also several monitors of one PC).
@@ -99,6 +101,10 @@ struct ScreenView {
     mons: usize,
     /// Open views of the PC's other monitors as soon as we know how many there are.
     open_rest: bool,
+    /// Whether the other device is a computer (only computers can share sound).
+    is_pc: bool,
+    /// Set while this PC plays the other PC's sound; storing true stops it.
+    sound_stop: Option<Arc<AtomicBool>>,
     inner: Arc<Mutex<ScreenInner>>,
     /// Stops the current picture stream (a new one starts when the quality changes).
     stream_stop: Arc<AtomicBool>,
@@ -223,6 +229,8 @@ enum Action {
     ViewAllMonitors(String),
     /// Switch an open view (by key) to another monitor.
     SwitchMonitor(String, usize),
+    /// Turn the other PC's sound on or off for a view (by key).
+    SetSound(String, bool),
     ViewAllScreens,
     CloseScreen(String),
     SetQuality(String, Quality),
@@ -413,6 +421,28 @@ impl NexusApp {
                     },
                 }
             }
+            Action::SetSound(key, on) => {
+                let Some(i) = self.screens.iter().position(|s| s.key == key) else { return };
+                if let Some(stop) = self.screens[i].sound_stop.take() {
+                    stop.store(true, Ordering::Relaxed);
+                }
+                self.screens[i].inner.lock().unwrap_or_else(|e| e.into_inner()).sound_error = None;
+                if !on {
+                    return;
+                }
+                let id = self.screens[i].peer_id.clone();
+                let (Some(addr), Some(peer)) = (self.addr_of(&id), self.peer_of(&id)) else {
+                    self.screens[i].inner.lock().unwrap_or_else(|e| e.into_inner()).sound_error =
+                        Some("That device is not reachable right now".into());
+                    return;
+                };
+                let stop = Arc::new(AtomicBool::new(false));
+                let inner = self.screens[i].inner.clone();
+                net::audio_session(self.me.clone(), peer, addr, stop.clone(), move |e| {
+                    inner.lock().unwrap_or_else(|e| e.into_inner()).sound_error = Some(e);
+                });
+                self.screens[i].sound_stop = Some(stop);
+            }
             Action::SwitchMonitor(key, m) => {
                 let Some(i) = self.screens.iter().position(|s| s.key == key) else { return };
                 let new_key = format!("{}#{m}", self.screens[i].peer_id);
@@ -445,6 +475,9 @@ impl NexusApp {
             Action::CloseScreen(id) => {
                 if let Some(i) = self.screens.iter().position(|s| s.key == id) {
                     let sv = self.screens.remove(i);
+                    if let Some(stop) = &sv.sound_stop {
+                        stop.store(true, Ordering::Relaxed);
+                    }
                     sv.stream_stop.store(true, Ordering::Relaxed);
                     sv.inner.lock().unwrap_or_else(|e| e.into_inner()).closed = true;
                 }
@@ -576,6 +609,8 @@ impl NexusApp {
             key,
             mons: 1,
             open_rest,
+            is_pc: self.peer_of(&id).is_some_and(|p| !matches!(p.os.as_str(), "Android" | "iOS")),
+            sound_stop: None,
             inner: inner.clone(),
             stream_stop: stream_stop.clone(),
             tex: None,
@@ -1983,6 +2018,17 @@ fn screen_toolbar(
             }
             if ui.small_button("Show all").on_hover_text("Open every monitor of this PC").clicked() {
                 actions.push(Action::ViewAllMonitors(sv.peer_id.clone()));
+            }
+        }
+        if sv.is_pc {
+            ui.separator();
+            let mut on = sv.sound_stop.is_some();
+            if ui.checkbox(&mut on, "🔊 Sound").on_hover_text("Hear what that PC is playing").changed() {
+                actions.push(Action::SetSound(sv.key.clone(), on));
+            }
+            let err = sv.inner.lock().unwrap_or_else(|e| e.into_inner()).sound_error.clone();
+            if let Some(e) = err {
+                ui.label(RichText::new(e).size(12.0).color(BAD));
             }
         }
     });

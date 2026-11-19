@@ -6,6 +6,9 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageInstaller
+import android.media.AudioAttributes
+import android.media.AudioFormat
+import android.media.AudioTrack
 import android.media.projection.MediaProjectionManager
 import android.net.Uri
 import android.os.Build
@@ -24,6 +27,22 @@ class MainActivity : FlutterActivity() {
     }
 
     private var pending: MethodChannel.Result? = null
+
+    // Sound from a PC: 16-bit stereo PCM played through an AudioTrack. Writes happen
+    // one at a time on their own thread; if too many are waiting, extra ones are
+    // dropped so the sound stays close to live.
+    private val soundThread = java.util.concurrent.Executors.newSingleThreadExecutor()
+    private val soundWaiting = java.util.concurrent.atomic.AtomicInteger(0)
+    private var soundTrack: AudioTrack? = null
+
+    private fun soundStopNow() {
+        try {
+            soundTrack?.stop()
+        } catch (e: Exception) {
+        }
+        soundTrack?.release()
+        soundTrack = null
+    }
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
@@ -74,6 +93,53 @@ class MainActivity : FlutterActivity() {
                             else -> System.identityHashCode(d).toLong()
                         }
                     )
+                }
+                "audioStart" -> {
+                    val rate = call.argument<Int>("rate") ?: 48000
+                    soundThread.execute {
+                        soundStopNow()
+                        val min = AudioTrack.getMinBufferSize(
+                            rate, AudioFormat.CHANNEL_OUT_STEREO, AudioFormat.ENCODING_PCM_16BIT
+                        )
+                        val track = AudioTrack.Builder()
+                            .setAudioAttributes(
+                                AudioAttributes.Builder()
+                                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                                    .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                                    .build()
+                            )
+                            .setAudioFormat(
+                                AudioFormat.Builder()
+                                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                                    .setSampleRate(rate)
+                                    .setChannelMask(AudioFormat.CHANNEL_OUT_STEREO)
+                                    .build()
+                            )
+                            .setBufferSizeInBytes(maxOf(min * 2, rate))
+                            .setTransferMode(AudioTrack.MODE_STREAM)
+                            .build()
+                        track.play()
+                        soundTrack = track
+                    }
+                    result.success(true)
+                }
+                "audioWrite" -> {
+                    val bytes = call.arguments as? ByteArray
+                    if (bytes != null && soundWaiting.get() < 12) {
+                        soundWaiting.incrementAndGet()
+                        soundThread.execute {
+                            try {
+                                soundTrack?.write(bytes, 0, bytes.size)
+                            } finally {
+                                soundWaiting.decrementAndGet()
+                            }
+                        }
+                    }
+                    result.success(null)
+                }
+                "audioStop" -> {
+                    soundThread.execute { soundStopNow() }
+                    result.success(null)
                 }
                 "installApk" -> {
                     val path = call.argument<String>("path")
