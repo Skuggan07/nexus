@@ -578,7 +578,7 @@ pub fn audio_session<E>(
                 return Err(e);
             }
             if head.get("op").and_then(|o| o.as_str()) != Some("audio") {
-                return Err("Update Nexus on that PC to hear its sound".into());
+                return Err("Update Nexus on that device to hear its sound".into());
             }
             let rate = head.get("rate").and_then(|r| r.as_u64()).unwrap_or(48_000) as u32;
             let player = crate::audio::Player::new()?;

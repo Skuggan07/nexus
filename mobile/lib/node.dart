@@ -854,7 +854,7 @@ class NexusNode extends ChangeNotifier {
       c.send({'op': 'audio'});
       final head = await c.recv(const Duration(seconds: 8));
       if (head['error'] != null) throw NexusError('${head['error']}');
-      if (head['op'] != 'audio') throw NexusError('Update Nexus on that PC to hear its sound');
+      if (head['op'] != 'audio') throw NexusError('Update Nexus on that device to hear its sound');
       final rate = (head['rate'] as num?)?.toInt() ?? 48000;
       while (true) {
         final v = await c.recv(const Duration(seconds: 10));
@@ -1232,6 +1232,8 @@ class NexusNode extends ChangeNotifier {
       await _controlServe(c, peer.name);
     } else if (first['op'] == 'monitor') {
       await _monitorServe(c, peer.name);
+    } else if (first['op'] == 'audio') {
+      await _soundServe(c, peer.name);
     } else if (first['op'] == 'clip') {
       await _clipServe(c, first, peer.name);
     } else if (first['op'] == 'auto') {
@@ -1279,6 +1281,62 @@ class NexusNode extends ChangeNotifier {
     }
     addLog('$who stopped viewing this phone\'s screen');
     notifyListeners();
+  }
+
+  /// Whether this phone may share its sound (Android's "record audio" permission).
+  Future<bool> soundAllowed() async => await _native('soundAllowed') == true;
+  Future<void> allowSound() async => _native('allowSound');
+
+  /// A paired device wants to hear this phone. Android only allows it while the
+  /// screen is being shared, so that has to be on.
+  Future<void> _soundServe(Conn c, String who) async {
+    void fail(String e) {
+      try {
+        c.send({'error': e});
+      } catch (_) {}
+      c.close();
+    }
+
+    if (!await isScreenShared()) {
+      return fail('To hear $name, turn on "Share this phone\'s screen" on the phone first — Android needs it');
+    }
+    final problem = await _native('soundCaptureStart');
+    if (problem is String) return fail(problem);
+    var closed = false;
+    unawaited(c.recv(const Duration(days: 1)).then((_) {}, onError: (_) {}).whenComplete(() => closed = true));
+    addLog('$who is listening to this phone');
+    notifyListeners();
+    try {
+      c.send({'op': 'audio', 'rate': 48000, 'channels': 2});
+      var lastSent = DateTime.now();
+      var checkedAt = DateTime.now();
+      while (!closed) {
+        final pcm = await _native('soundCaptureRead');
+        final now = DateTime.now();
+        if (pcm is Uint8List && pcm.isNotEmpty) {
+          c.send({'pcm': base64Encode(pcm)});
+          lastSent = now;
+        } else if (now.difference(lastSent).inMilliseconds >= 500) {
+          c.send({'op': 'quiet'});
+          lastSent = now;
+        }
+        if (now.difference(checkedAt).inSeconds >= 2) {
+          checkedAt = now;
+          if (!await isScreenShared()) {
+            c.send({'error': 'Screen sharing was turned off on $name'});
+            break;
+          }
+        }
+        await Future<void>.delayed(const Duration(milliseconds: 40));
+      }
+    } catch (_) {
+      // The listener went away.
+    } finally {
+      await _native('soundCaptureStop');
+      c.close();
+      addLog('$who stopped listening');
+      notifyListeners();
+    }
   }
 
   /// A paired device opened "apps and monitoring" for this phone. Android does not

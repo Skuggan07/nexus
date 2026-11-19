@@ -1493,9 +1493,8 @@ class _ScreenViewPageState extends State<ScreenViewPage> {
             style: TextStyle(color: live ? online : off, fontSize: 12, fontWeight: FontWeight.w600),
           ),
         ),
-        if (widget.peer.controllable)
-          IconButton(
-            tooltip: _sound ? 'Sound on — tap to mute' : 'Hear this PC',
+        IconButton(
+            tooltip: _sound ? 'Sound on — tap to mute' : 'Hear this device',
             icon: Icon(_sound ? Icons.volume_up : Icons.volume_off, color: _sound ? online : white),
             onPressed: () => _setSound(!_sound),
           ),
@@ -1981,6 +1980,7 @@ class _PhoneSharingBox extends StatefulWidget {
 class _PhoneSharingBoxState extends State<_PhoneSharingBox> with WidgetsBindingObserver {
   bool _sharing = false;
   bool _control = false;
+  bool _sound = false;
   bool _busy = false;
   Timer? _poll;
 
@@ -2008,10 +2008,12 @@ class _PhoneSharingBoxState extends State<_PhoneSharingBox> with WidgetsBindingO
   Future<void> _refresh() async {
     final sharing = await widget.node.isScreenShared();
     final control = await widget.node.controlEnabled();
-    if (mounted && (sharing != _sharing || control != _control)) {
+    final sound = await widget.node.soundAllowed();
+    if (mounted && (sharing != _sharing || control != _control || sound != _sound)) {
       setState(() {
         _sharing = sharing;
         _control = control;
+        _sound = sound;
       });
     }
   }
@@ -2067,6 +2069,30 @@ class _PhoneSharingBoxState extends State<_PhoneSharingBox> with WidgetsBindingO
             label: _control ? 'Settings' : 'Turn on',
             onPressed: () => widget.node.openControlSettings(),
           ),
+        ]),
+        const SizedBox(height: 10),
+        Row(children: [
+          Expanded(
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              const Text('Let paired devices hear this phone',
+                  style: TextStyle(fontWeight: FontWeight.w700, fontSize: 15)),
+              Text(
+                _sound
+                    ? 'Allowed — they can turn on sound while your screen is shared.'
+                    : 'Android asks once. Works while the screen is shared.',
+                style: TextStyle(fontSize: 12, color: _sound ? online : off),
+              ),
+            ]),
+          ),
+          if (!_sound)
+            _SecondaryButton(
+              label: 'Allow',
+              onPressed: () async {
+                await widget.node.allowSound();
+                await Future<void>.delayed(const Duration(seconds: 1));
+                await _refresh();
+              },
+            ),
         ]),
       ]),
     );

@@ -1,11 +1,13 @@
 package app.nexus.nexus_mobile
 
+import android.Manifest
 import android.app.Activity
 import android.app.PendingIntent
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageInstaller
+import android.content.pm.PackageManager
 import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioTrack
@@ -93,6 +95,24 @@ class MainActivity : FlutterActivity() {
                             else -> System.identityHashCode(d).toLong()
                         }
                     )
+                }
+                // Sharing this phone's sound (see ScreenCaptureService.startSound).
+                "soundCaptureStart" ->
+                    result.success(ScreenCaptureService.instance?.startSound() ?: "Screen sharing is off on the phone")
+                "soundCaptureRead" -> result.success(ScreenCaptureService.readSound())
+                "soundCaptureStop" -> {
+                    ScreenCaptureService.instance?.stopSound()
+                    result.success(null)
+                }
+                "soundAllowed" -> result.success(
+                    Build.VERSION.SDK_INT >= 29 &&
+                        checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+                )
+                "allowSound" -> {
+                    if (Build.VERSION.SDK_INT >= 29) {
+                        requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 7301)
+                    }
+                    result.success(null)
                 }
                 "audioStart" -> {
                     val rate = call.argument<Int>("rate") ?: 48000
