@@ -475,16 +475,19 @@ fn screen_serve(mut c: Conn, me: &Arc<Identity>, shared: &SharedState, dir: &Pat
     let fps = start.get("fps").and_then(|x| x.as_u64()).unwrap_or(8).clamp(1, 30);
     let max_w = start.get("maxw").and_then(|x| x.as_u64()).unwrap_or(1280).clamp(320, 3840) as u32;
     let quality = start.get("quality").and_then(|x| x.as_u64()).unwrap_or(55).clamp(20, 90) as u8;
+    let monitor = start.get("monitor").and_then(|x| x.as_u64()).unwrap_or(0).min(16) as usize;
     let who = peer_name(shared, &id);
     lock(shared).log(format!("{who} is viewing this screen"));
     let gap = Duration::from_millis(1000 / fps);
     let mut seq: u64 = 0;
     loop {
         let started = Instant::now();
-        match crate::screen::capture_jpeg(max_w, quality) {
-            Ok((w, h, jpeg)) => {
+        match crate::screen::capture_jpeg(monitor, max_w, quality) {
+            Ok((w, h, jpeg, mon, mons)) => {
                 let data = base64::engine::general_purpose::STANDARD.encode(&jpeg);
-                let frame = serde_json::json!({ "op": "frame", "w": w, "h": h, "seq": seq, "data": data });
+                let frame = serde_json::json!({
+                    "op": "frame", "w": w, "h": h, "seq": seq, "data": data, "mon": mon, "mons": mons,
+                });
                 if c.send_val(&frame).is_err() {
                     break; // viewer closed the window
                 }
@@ -890,6 +893,9 @@ pub struct Frame {
     pub h: u32,
     pub seq: u64,
     pub jpeg: Vec<u8>,
+    /// Which monitor this is (0 = main) and how many the other PC has.
+    pub mon: usize,
+    pub mons: usize,
 }
 
 /// Connects to a paired device and calls `on_frame` for every screen frame until
@@ -898,6 +904,7 @@ pub fn screen_stream<F, G>(
     me: &Identity,
     peer: &PairedPeer,
     addr: SocketAddr,
+    monitor: usize,
     fps: u64,
     max_w: u32,
     quality: u8,
@@ -909,7 +916,9 @@ where
     G: Fn() -> bool,
 {
     let mut c = screen_open(me, peer, addr)?;
-    c.send_val(&serde_json::json!({ "op": "start", "fps": fps, "maxw": max_w, "quality": quality }))?;
+    c.send_val(&serde_json::json!({
+        "op": "start", "fps": fps, "maxw": max_w, "quality": quality, "monitor": monitor,
+    }))?;
     while keep_going() {
         let v = c.recv_val()?;
         if let Some(e) = fs_err(&v) {
@@ -925,7 +934,9 @@ where
         };
         let jpeg =
             base64::engine::general_purpose::STANDARD.decode(data).map_err(|_| "Garbled screen frame".to_string())?;
-        on_frame(Frame { w: w as u32, h: h as u32, seq, jpeg });
+        let mon = v.get("mon").and_then(|x| x.as_u64()).unwrap_or(0) as usize;
+        let mons = v.get("mons").and_then(|x| x.as_u64()).unwrap_or(1).max(1) as usize;
+        on_frame(Frame { w: w as u32, h: h as u32, seq, jpeg, mon, mons });
     }
     let _ = c.send_val(&serde_json::json!({ "op": "bye" }));
     Ok(())

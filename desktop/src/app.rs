@@ -83,12 +83,22 @@ struct ScreenInner {
     closed: bool,
     control_ready: bool,
     control_error: Option<String>,
+    /// How many monitors the other PC has (from its frames).
+    mons: usize,
 }
 
-/// One open screen viewer (several can be open at once).
+/// One open screen viewer (several can be open at once, also several monitors of one PC).
 struct ScreenView {
     peer_id: String,
     peer_name: String,
+    /// Which monitor of that device is shown (0 = its main monitor).
+    monitor: usize,
+    /// "peer id#monitor": tells views of different monitors of one PC apart.
+    key: String,
+    /// How many monitors the other PC has.
+    mons: usize,
+    /// Open views of the PC's other monitors as soon as we know how many there are.
+    open_rest: bool,
     inner: Arc<Mutex<ScreenInner>>,
     /// Stops the current picture stream (a new one starts when the quality changes).
     stream_stop: Arc<AtomicBool>,
@@ -207,6 +217,12 @@ enum Action {
     Download(String),
     Upload(String),
     ViewScreen(String),
+    /// Open a view of one monitor of a device: (device id, monitor).
+    ViewMonitor(String, usize),
+    /// Show every monitor of one device.
+    ViewAllMonitors(String),
+    /// Switch an open view (by key) to another monitor.
+    SwitchMonitor(String, usize),
     ViewAllScreens,
     CloseScreen(String),
     SetQuality(String, Quality),
@@ -380,40 +396,79 @@ impl NexusApp {
             }
             Action::Download(name) => self.start_transfer(Some(name), None),
             Action::Upload(path) => self.start_transfer(None, Some(path)),
-            Action::ViewScreen(id) => self.open_screen(id),
+            Action::ViewScreen(id) => self.open_screen(id, 0, false),
+            Action::ViewMonitor(id, m) => self.open_screen(id, m, false),
+            Action::ViewAllMonitors(id) => {
+                // Use any open view of this PC that already knows how many monitors it has.
+                let known = self.screens.iter().find(|s| s.peer_id == id && s.mons > 1).map(|s| s.mons);
+                match known {
+                    Some(n) => {
+                        for m in 0..n {
+                            self.open_screen(id.clone(), m, false);
+                        }
+                    }
+                    None => match self.screens.iter_mut().find(|s| s.peer_id == id) {
+                        Some(sv) => sv.open_rest = true,
+                        None => self.open_screen(id, 0, true),
+                    },
+                }
+            }
+            Action::SwitchMonitor(key, m) => {
+                let Some(i) = self.screens.iter().position(|s| s.key == key) else { return };
+                let new_key = format!("{}#{m}", self.screens[i].peer_id);
+                if self.screens.iter().any(|s| s.key == new_key) {
+                    return;
+                }
+                let id = self.screens[i].peer_id.clone();
+                let target = (self.addr_of(&id), self.peer_of(&id));
+                let me = self.me.clone();
+                let sv = &mut self.screens[i];
+                sv.monitor = m;
+                sv.key = new_key;
+                sv.zoom = 1.0;
+                sv.center = Pos2::new(0.5, 0.5);
+                sv.stream_stop.store(true, Ordering::Relaxed);
+                sv.stream_stop = Arc::new(AtomicBool::new(false));
+                if let (Some(addr), Some(peer)) = target {
+                    spawn_stream(me, peer, addr, sv.inner.clone(), sv.stream_stop.clone(), sv.quality, m);
+                }
+            }
             Action::ViewAllScreens => {
                 let ids: Vec<String> = {
                     let s = lock(&self.shared);
                     s.paired.iter().filter(|p| is_online(&s.status(p))).map(|p| p.id.clone()).collect()
                 };
                 for id in ids {
-                    self.open_screen(id);
+                    self.open_screen(id, 0, false);
                 }
             }
             Action::CloseScreen(id) => {
-                if let Some(i) = self.screens.iter().position(|s| s.peer_id == id) {
+                if let Some(i) = self.screens.iter().position(|s| s.key == id) {
                     let sv = self.screens.remove(i);
                     sv.stream_stop.store(true, Ordering::Relaxed);
                     sv.inner.lock().unwrap_or_else(|e| e.into_inner()).closed = true;
                 }
             }
-            Action::SetQuality(id, q) => {
-                let target = (self.addr_of(&id), self.peer_of(&id));
+            Action::SetQuality(key, q) => {
+                let Some(peer_id) = self.screens.iter().find(|s| s.key == key).map(|s| s.peer_id.clone()) else {
+                    return;
+                };
+                let target = (self.addr_of(&peer_id), self.peer_of(&peer_id));
                 let me = self.me.clone();
-                if let Some(sv) = self.screens.iter_mut().find(|s| s.peer_id == id) {
+                if let Some(sv) = self.screens.iter_mut().find(|s| s.key == key) {
                     if sv.quality != q {
                         sv.quality = q;
                         sv.stream_stop.store(true, Ordering::Relaxed);
                         sv.stream_stop = Arc::new(AtomicBool::new(false));
                         if let (Some(addr), Some(peer)) = target {
-                            spawn_stream(me, peer, addr, sv.inner.clone(), sv.stream_stop.clone(), q);
+                            spawn_stream(me, peer, addr, sv.inner.clone(), sv.stream_stop.clone(), q, sv.monitor);
                         }
                     }
                 }
             }
             Action::SetFullscreen(id, on) => {
                 for sv in &mut self.screens {
-                    sv.fullscreen = on && sv.peer_id == id;
+                    sv.fullscreen = on && sv.key == id;
                 }
             }
             Action::OpenMonitor(id) => self.open_monitor(id),
@@ -505,8 +560,9 @@ impl NexusApp {
 
     /// Opens a live screen view of a paired device (if it is not open already) and
     /// starts its picture stream and remote-control link.
-    fn open_screen(&mut self, id: String) {
-        if self.screens.iter().any(|s| s.peer_id == id) {
+    fn open_screen(&mut self, id: String, monitor: usize, open_rest: bool) {
+        let key = format!("{id}#{monitor}");
+        if self.screens.iter().any(|s| s.key == key) {
             return;
         }
         let name = self.peer_of(&id).map(|p| p.name).unwrap_or_else(|| "Device".into());
@@ -516,6 +572,10 @@ impl NexusApp {
         let mut sv = ScreenView {
             peer_id: id.clone(),
             peer_name: name,
+            monitor,
+            key,
+            mons: 1,
+            open_rest,
             inner: inner.clone(),
             stream_stop: stream_stop.clone(),
             tex: None,
@@ -554,7 +614,7 @@ impl NexusApp {
                         }
                     }
                 }));
-                spawn_stream(self.me.clone(), peer, addr, inner, stream_stop, sv.quality);
+                spawn_stream(self.me.clone(), peer, addr, inner, stream_stop, sv.quality, monitor);
             }
             _ => {
                 inner.lock().unwrap_or_else(|e| e.into_inner()).error =
@@ -1102,10 +1162,7 @@ impl NexusApp {
                     actions.push(Action::OpenAutomation);
                 }
                 ui.add_space(6.0);
-                ui.label(
-                    RichText::new("Coming next: Other networks · More monitors · Floating screen · Better wake")
-                        .size(12.0),
-                );
+                ui.label(RichText::new("Coming next: Floating screen · Better wake").size(12.0));
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
                     ui.label(
                         RichText::new(format!("key {}", identity::fingerprint(&self.me.public_hex())))
@@ -1383,6 +1440,16 @@ impl NexusApp {
                     if ui.add(secondary("View screen").min_size(Vec2::new(0.0, 36.0))).clicked() {
                         actions.push(Action::ViewScreen(r.peer.id.clone()));
                     }
+                    if !matches!(r.peer.os.as_str(), "Android" | "iOS") {
+                        ui.add_space(2.0);
+                        if ui
+                            .add(secondary("View all monitors").min_size(Vec2::new(0.0, 36.0)))
+                            .on_hover_text("One window for each monitor of this PC")
+                            .clicked()
+                        {
+                            actions.push(Action::ViewAllMonitors(r.peer.id.clone()));
+                        }
+                    }
                     ui.add_space(2.0);
                     if ui.add(secondary("Apps and monitoring").min_size(Vec2::new(0.0, 36.0))).clicked() {
                         actions.push(Action::OpenMonitor(r.peer.id.clone()));
@@ -1489,9 +1556,19 @@ impl NexusApp {
         let sv = &mut self.screens[i];
         let (new_jpeg, dims, error, frames, cur_seq, ctl_ready, ctl_error) = {
             let g = sv.inner.lock().unwrap_or_else(|e| e.into_inner());
+            if g.mons > 0 {
+                sv.mons = g.mons;
+            }
             let nj = if g.jpeg.is_some() && g.seq != sv.shown_seq { g.jpeg.clone() } else { None };
             (nj, g.dims, g.error.clone(), g.frames, g.seq, g.control_ready, g.control_error.clone())
         };
+        // "All monitors": once we know how many there are, open the others too.
+        if sv.open_rest && frames > 0 {
+            sv.open_rest = false;
+            for m in (0..sv.mons).filter(|m| *m != sv.monitor) {
+                actions.push(Action::ViewMonitor(sv.peer_id.clone(), m));
+            }
+        }
         if let Some(bytes) = new_jpeg {
             if let Ok(decoded) = image::load_from_memory(&bytes) {
                 let rgba = decoded.to_rgba8();
@@ -1500,11 +1577,8 @@ impl NexusApp {
                 match &mut sv.tex {
                     Some(t) => t.set(color, egui::TextureOptions::LINEAR),
                     None => {
-                        sv.tex = Some(ctx.load_texture(
-                            format!("screen-{}", sv.peer_id),
-                            color,
-                            egui::TextureOptions::LINEAR,
-                        ))
+                        sv.tex =
+                            Some(ctx.load_texture(format!("screen-{}", sv.key), color, egui::TextureOptions::LINEAR))
                     }
                 }
                 sv.shown_seq = cur_seq;
@@ -1523,7 +1597,7 @@ impl NexusApp {
         let mut pic: Option<(egui::Rect, egui::LayerId)> = None;
         if sv.fullscreen {
             let screen = ctx.screen_rect();
-            egui::Area::new(egui::Id::new(("screen-full", sv.peer_id.clone())))
+            egui::Area::new(egui::Id::new(("screen-full", sv.key.clone())))
                 .order(egui::Order::Foreground)
                 .fixed_pos(screen.min)
                 .show(ctx, |ui| {
@@ -1538,8 +1612,13 @@ impl NexusApp {
                 });
         } else {
             let mut open = true;
-            egui::Window::new(RichText::new(sv.peer_name.as_str()).size(16.0).strong())
-                .id(egui::Id::new(("screen", sv.peer_id.clone())))
+            let title = if sv.mons > 1 {
+                format!("{} — monitor {}", sv.peer_name, sv.monitor + 1)
+            } else {
+                sv.peer_name.clone()
+            };
+            egui::Window::new(RichText::new(title).size(16.0).strong())
+                .id(egui::Id::new(("screen", sv.key.clone())))
                 .open(&mut open)
                 .collapsible(false)
                 .default_size(Vec2::new(960.0, 640.0))
@@ -1551,14 +1630,18 @@ impl NexusApp {
                     pic = screen_picture(ui, sv, &error, h).map(|r| (r, ui.layer_id()));
                 });
             if !open {
-                actions.push(Action::CloseScreen(sv.peer_id.clone()));
+                actions.push(Action::CloseScreen(sv.key.clone()));
             }
         }
         if let Some((rect, layer)) = pic {
             screen_input(ctx, sv, rect, layer, &mut out, actions);
         }
         if let Some(tx) = &sv.control {
-            for v in out {
+            for mut v in out {
+                // Tell the other PC which of its monitors this position is on.
+                if let Some(o) = v.as_object_mut() {
+                    o.insert("m".into(), serde_json::json!(sv.monitor));
+                }
                 let _ = tx.send(v);
             }
         }
@@ -1784,6 +1867,7 @@ fn spawn_stream(
     inner: Arc<Mutex<ScreenInner>>,
     stop: Arc<AtomicBool>,
     quality: Quality,
+    monitor: usize,
 ) {
     let (fps, max_w, q) = quality.params();
     std::thread::spawn(move || {
@@ -1793,11 +1877,13 @@ fn spawn_stream(
             &me,
             &peer,
             addr,
+            monitor,
             fps,
             max_w,
             q,
             move |f| {
                 let mut g = frames.lock().unwrap_or_else(|e| e.into_inner());
+                g.mons = f.mons;
                 g.jpeg = Some(f.jpeg);
                 g.seq = f.seq;
                 g.dims = (f.w, f.h);
@@ -1862,7 +1948,7 @@ fn screen_toolbar(
         ui.label(RichText::new("Quality").size(12.0).color(OFF));
         for q in Quality::ALL {
             if ui.selectable_label(sv.quality == q, q.label()).clicked() && sv.quality != q {
-                actions.push(Action::SetQuality(sv.peer_id.clone(), q));
+                actions.push(Action::SetQuality(sv.key.clone(), q));
             }
         }
         ui.separator();
@@ -1885,7 +1971,19 @@ fn screen_toolbar(
         }
         let label = if sv.fullscreen { "Exit fullscreen" } else { "Fullscreen" };
         if ui.add(secondary(label)).clicked() {
-            actions.push(Action::SetFullscreen(sv.peer_id.clone(), !sv.fullscreen));
+            actions.push(Action::SetFullscreen(sv.key.clone(), !sv.fullscreen));
+        }
+        if sv.mons > 1 {
+            ui.separator();
+            ui.label(RichText::new("Monitor").size(12.0).color(OFF));
+            for m in 0..sv.mons {
+                if ui.selectable_label(sv.monitor == m, format!(" {} ", m + 1)).clicked() && sv.monitor != m {
+                    actions.push(Action::SwitchMonitor(sv.key.clone(), m));
+                }
+            }
+            if ui.small_button("Show all").on_hover_text("Open every monitor of this PC").clicked() {
+                actions.push(Action::ViewAllMonitors(sv.peer_id.clone()));
+            }
         }
     });
     if sv.control_on {
@@ -2032,7 +2130,7 @@ fn screen_input(
                 out.push(serde_json::json!({ "op": "button", "b": b, "down": pressed, "x": n.0, "y": n.1 }));
             }
             egui::Event::Key { key: egui::Key::Escape, pressed: true, .. } if !sv.typing && sv.fullscreen => {
-                actions.push(Action::SetFullscreen(sv.peer_id.clone(), false));
+                actions.push(Action::SetFullscreen(sv.key.clone(), false));
             }
             egui::Event::Text(t) if sv.control_on && sv.typing => out.push(serde_json::json!({ "op": "text", "s": t })),
             egui::Event::Paste(t) if sv.control_on && sv.typing => {

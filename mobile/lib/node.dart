@@ -132,12 +132,15 @@ class ScreenControl {
   late final Timer _ping;
   bool _closed = false;
 
+  /// Which monitor of the other PC positions are on (0 = its main monitor).
+  int monitor = 0;
+
   bool get isOpen => !_closed;
 
   void send(Map<String, Object?> m) {
     if (_closed) return;
     try {
-      _c.send(m);
+      _c.send({...m, 'm': monitor});
     } catch (_) {
       close();
     }
@@ -242,10 +245,14 @@ class AutoLink {
 
 /// One decoded screen frame: its source size and the JPEG bytes.
 class ScreenFrame {
-  ScreenFrame(this.w, this.h, this.jpeg);
+  ScreenFrame(this.w, this.h, this.jpeg, {this.mon = 0, this.mons = 1});
   final int w;
   final int h;
   final Uint8List jpeg;
+
+  /// Which monitor this is (0 = main) and how many the other device has.
+  final int mon;
+  final int mons;
 }
 
 enum StatusKind { verified, checking, notAnswering, identityChanged, offline }
@@ -813,10 +820,11 @@ class NexusNode extends ChangeNotifier {
 
   /// Streams a paired device's screen as JPEG frames. Closing the subscription
   /// tears the connection down, which stops the other device capturing.
-  Stream<ScreenFrame> screenStream(PairedPeer p, {int fps = 12, int maxW = 1920, int quality = 75}) async* {
+  Stream<ScreenFrame> screenStream(PairedPeer p,
+      {int fps = 12, int maxW = 1920, int quality = 75, int monitor = 0}) async* {
     final c = await _screenOpen(p);
     try {
-      c.send({'op': 'start', 'fps': fps, 'maxw': maxW, 'quality': quality});
+      c.send({'op': 'start', 'fps': fps, 'maxw': maxW, 'quality': quality, 'monitor': monitor});
       while (true) {
         final v = await c.recv(const Duration(seconds: 20));
         if (v['error'] != null) throw NexusError('${v['error']}');
@@ -826,6 +834,8 @@ class NexusNode extends ChangeNotifier {
           (v['w'] as num?)?.toInt() ?? 0,
           (v['h'] as num?)?.toInt() ?? 0,
           base64Decode(data),
+          mon: (v['mon'] as num?)?.toInt() ?? 0,
+          mons: ((v['mons'] as num?)?.toInt() ?? 1).clamp(1, 16),
         );
       }
     } finally {

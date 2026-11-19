@@ -493,6 +493,21 @@ class _HomePageState extends State<HomePage> {
                     },
                   ),
                 ),
+                if (p.controllable) ...[
+                  const SizedBox(height: 8),
+                  SizedBox(
+                    width: double.infinity,
+                    child: _SecondaryButton(
+                      label: 'View all monitors',
+                      onPressed: () {
+                        Navigator.pop(ctx);
+                        Navigator.of(context).push(
+                          MaterialPageRoute<void>(builder: (_) => ScreenGridPage(node: node, onlyPeer: p)),
+                        );
+                      },
+                    ),
+                  ),
+                ],
                 const SizedBox(height: 8),
                 SizedBox(
                   width: double.infinity,
@@ -1168,10 +1183,13 @@ class _PairOverlay extends StatelessWidget {
 /// Live view of a paired device's screen. Keeps this phone's screen awake while
 /// open (as requested), and shows incoming JPEG frames as they arrive.
 class ScreenViewPage extends StatefulWidget {
-  const ScreenViewPage({super.key, required this.node, required this.peer});
+  const ScreenViewPage({super.key, required this.node, required this.peer, this.monitor = 0});
 
   final NexusNode node;
   final PairedPeer peer;
+
+  /// Which monitor of a PC to show first (0 = its main monitor).
+  final int monitor;
 
   @override
   State<ScreenViewPage> createState() => _ScreenViewPageState();
@@ -1192,6 +1210,8 @@ enum ViewQuality {
 
 class _ScreenViewPageState extends State<ScreenViewPage> {
   StreamSubscription<ScreenFrame>? _sub;
+  late int _monitor = widget.monitor;
+  int _mons = 1;
   Uint8List? _frame;
   int _w = 0, _h = 0, _count = 0;
   String? _error;
@@ -1239,11 +1259,13 @@ class _ScreenViewPageState extends State<ScreenViewPage> {
   void _listen() {
     _sub?.cancel();
     _sub = widget.node
-        .screenStream(widget.peer, fps: _quality.fps, maxW: _quality.maxW, quality: _quality.quality)
+        .screenStream(widget.peer,
+            fps: _quality.fps, maxW: _quality.maxW, quality: _quality.quality, monitor: _monitor)
         .listen(
       (f) {
         if (!mounted) return;
         setState(() {
+          _mons = f.mons;
           _frame = f.jpeg;
           _w = f.w;
           _h = f.h;
@@ -1267,6 +1289,25 @@ class _ScreenViewPageState extends State<ScreenViewPage> {
       _error = null;
     });
     _listen();
+  }
+
+  /// Shows another monitor of the same PC.
+  void _setMonitor(int m) {
+    if (m == _monitor) return;
+    setState(() {
+      _monitor = m;
+      _frame = null;
+      _error = null;
+    });
+    _ctl?.monitor = m;
+    _zoom.value = Matrix4.identity();
+    _listen();
+  }
+
+  void _showAllMonitors() {
+    Navigator.of(context).push(
+      MaterialPageRoute<void>(builder: (_) => ScreenGridPage(node: widget.node, onlyPeer: widget.peer)),
+    );
   }
 
   void _setFullscreen(bool on) {
@@ -1300,6 +1341,7 @@ class _ScreenViewPageState extends State<ScreenViewPage> {
         c.close();
         return;
       }
+      c.monitor = _monitor;
       setState(() => _ctl = c);
     } catch (e) {
       if (mounted) {
@@ -1419,6 +1461,26 @@ class _ScreenViewPageState extends State<ScreenViewPage> {
             style: TextStyle(color: live ? online : off, fontSize: 12, fontWeight: FontWeight.w600),
           ),
         ),
+        if (_mons > 1)
+          PopupMenuButton<int>(
+            tooltip: 'Monitor',
+            initialValue: _monitor,
+            onSelected: (m) => m < 0 ? _showAllMonitors() : _setMonitor(m),
+            color: box,
+            itemBuilder: (_) => [
+              for (var m = 0; m < _mons; m++)
+                PopupMenuItem(value: m, child: Text('Monitor ${m + 1}', style: const TextStyle(color: white))),
+              const PopupMenuItem(value: -1, child: Text('Show all monitors', style: TextStyle(color: white))),
+            ],
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+              child: Row(children: [
+                const Icon(Icons.monitor, color: white, size: 20),
+                const SizedBox(width: 4),
+                Text('${_monitor + 1}/$_mons', style: const TextStyle(color: white, fontSize: 13)),
+              ]),
+            ),
+          ),
         PopupMenuButton<ViewQuality>(
           tooltip: 'Picture quality',
           initialValue: _quality,
@@ -1579,7 +1641,7 @@ class _ScreenViewPageState extends State<ScreenViewPage> {
       appBar: AppBar(
         backgroundColor: bg,
         foregroundColor: white,
-        title: Text(widget.peer.name),
+        title: Text(_mons > 1 ? '${widget.peer.name} · ${_monitor + 1}' : widget.peer.name),
         actions: [
           Text(_ctlBusy ? 'Connecting…' : 'Control', style: const TextStyle(color: white)),
           Switch(
@@ -1637,17 +1699,22 @@ class _RoundIcon extends StatelessWidget {
   }
 }
 
-/// Several screens at once: a live tile for every online paired device.
+/// Several screens at once: a live tile for every online paired device, or (with
+/// [onlyPeer]) one tile for every monitor of one PC.
 class ScreenGridPage extends StatefulWidget {
-  const ScreenGridPage({super.key, required this.node});
+  const ScreenGridPage({super.key, required this.node, this.onlyPeer});
 
   final NexusNode node;
+  final PairedPeer? onlyPeer;
 
   @override
   State<ScreenGridPage> createState() => _ScreenGridPageState();
 }
 
 class _ScreenGridPageState extends State<ScreenGridPage> {
+  /// How many monitors the one PC has (learned from its first picture).
+  int _count = 1;
+
   @override
   void initState() {
     super.initState();
@@ -1664,8 +1731,12 @@ class _ScreenGridPageState extends State<ScreenGridPage> {
   Widget build(BuildContext context) {
     return Scaffold(
       backgroundColor: Colors.black,
-      appBar: AppBar(backgroundColor: bg, foregroundColor: white, title: const Text('All screens')),
-      body: ListenableBuilder(
+      appBar: AppBar(
+        backgroundColor: bg,
+        foregroundColor: white,
+        title: Text(widget.onlyPeer == null ? 'All screens' : '${widget.onlyPeer!.name} — all monitors'),
+      ),
+      body: widget.onlyPeer != null ? _onePc(widget.onlyPeer!) : ListenableBuilder(
         listenable: widget.node,
         builder: (context, _) {
           final peers = widget.node.paired.where((p) {
@@ -1691,14 +1762,49 @@ class _ScreenGridPageState extends State<ScreenGridPage> {
       ),
     );
   }
+
+  Widget _onePc(PairedPeer p) {
+    return LayoutBuilder(builder: (context, area) {
+      final columns = (area.maxWidth / 340).floor().clamp(1, 4);
+      return GridView.count(
+        crossAxisCount: columns,
+        padding: const EdgeInsets.all(10),
+        mainAxisSpacing: 10,
+        crossAxisSpacing: 10,
+        childAspectRatio: 16 / 11,
+        children: [
+          for (var m = 0; m < _count; m++)
+            _LiveTile(
+              key: ValueKey('${p.id}#$m'),
+              node: widget.node,
+              peer: p,
+              monitor: m,
+              fixed: true,
+              onMons: m == 0
+                  ? (n) {
+                      if (n != _count && mounted) setState(() => _count = n);
+                    }
+                  : null,
+            ),
+        ],
+      );
+    });
+  }
 }
 
 /// One small live screen in the grid; tap it to open the full viewer.
 class _LiveTile extends StatefulWidget {
-  const _LiveTile({super.key, required this.node, required this.peer});
+  const _LiveTile({super.key, required this.node, required this.peer, this.monitor = 0, this.fixed = false, this.onMons});
 
   final NexusNode node;
   final PairedPeer peer;
+
+  /// Which monitor to show; with [fixed] false a button switches between them.
+  final int monitor;
+  final bool fixed;
+
+  /// Told how many monitors the PC has.
+  final void Function(int)? onMons;
 
   @override
   State<_LiveTile> createState() => _LiveTileState();
@@ -1706,6 +1812,8 @@ class _LiveTile extends StatefulWidget {
 
 class _LiveTileState extends State<_LiveTile> {
   StreamSubscription<ScreenFrame>? _sub;
+  late int _monitor = widget.monitor;
+  int _mons = 1;
   Uint8List? _frame;
   String? _error;
 
@@ -1717,9 +1825,14 @@ class _LiveTileState extends State<_LiveTile> {
 
   void _start() {
     _sub?.cancel();
-    _sub = widget.node.screenStream(widget.peer, fps: 5, maxW: 960, quality: 60).listen(
+    _sub = widget.node.screenStream(widget.peer, fps: 5, maxW: 960, quality: 60, monitor: _monitor).listen(
       (f) {
-        if (mounted) setState(() => _frame = f.jpeg);
+        if (!mounted) return;
+        if (f.mons != _mons) widget.onMons?.call(f.mons);
+        setState(() {
+          _frame = f.jpeg;
+          _mons = f.mons;
+        });
       },
       onError: (Object e) {
         if (mounted) setState(() => _error = '$e');
@@ -1740,7 +1853,9 @@ class _LiveTileState extends State<_LiveTile> {
       onTap: () async {
         _sub?.cancel(); // free the connection while the big viewer is open
         await Navigator.of(context).push(
-          MaterialPageRoute<void>(builder: (_) => ScreenViewPage(node: widget.node, peer: widget.peer)),
+          MaterialPageRoute<void>(
+            builder: (_) => ScreenViewPage(node: widget.node, peer: widget.peer, monitor: _monitor),
+          ),
         );
         if (mounted) {
           setState(() => _error = null);
@@ -1780,10 +1895,30 @@ class _LiveTileState extends State<_LiveTile> {
                 Icon(Icons.circle, size: 9, color: _frame != null ? online : off),
                 const SizedBox(width: 6),
                 Expanded(
-                  child: Text(widget.peer.name,
+                  child: Text(
+                      _mons > 1 ? '${widget.peer.name} · monitor ${_monitor + 1}/$_mons' : widget.peer.name,
                       overflow: TextOverflow.ellipsis,
                       style: const TextStyle(color: white, fontWeight: FontWeight.w700)),
                 ),
+                if (_mons > 1 && !widget.fixed)
+                  GestureDetector(
+                    onTap: () {
+                      setState(() {
+                        _monitor = (_monitor + 1) % _mons;
+                        _frame = null;
+                        _error = null;
+                      });
+                      _start();
+                    },
+                    child: const Padding(
+                      padding: EdgeInsets.symmetric(horizontal: 8),
+                      child: Row(children: [
+                        Icon(Icons.monitor, size: 16, color: online),
+                        SizedBox(width: 3),
+                        Text('Next', style: TextStyle(color: online, fontSize: 12, fontWeight: FontWeight.w700)),
+                      ]),
+                    ),
+                  ),
                 const Icon(Icons.open_in_full, size: 16, color: white),
               ]),
             ),

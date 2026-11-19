@@ -1,5 +1,6 @@
 //! Turns remote-control events from a paired viewer into real mouse and keyboard
-//! input on this PC. Positions arrive as fractions (0..1) of the shared screen.
+//! input on this PC. Positions arrive as fractions (0..1) of the shared screen;
+//! an optional `m` says which monitor (0 = the main one).
 //!
 //! Event lines (JSON, field `op`):
 //!   move   {x, y}                       – move the pointer
@@ -79,6 +80,7 @@ mod win {
     const M_WHEEL: u32 = 0x0800;
     const M_HWHEEL: u32 = 0x1000;
     const M_ABSOLUTE: u32 = 0x8000;
+    const M_VIRTUALDESK: u32 = 0x4000;
     const K_EXTENDED: u32 = 0x0001;
     const K_UP: u32 = 0x0002;
     const K_UNICODE: u32 = 0x0004;
@@ -115,11 +117,14 @@ mod win {
         }
     }
 
-    /// Absolute pointer position (0..65535 across the primary monitor), if given.
+    /// Absolute pointer position, if given: x and y are fractions (0..1) of monitor
+    /// `m` (0 = the main monitor), placed on the whole desktop.
     fn at(v: &Value) -> Option<INPUT> {
         let x = v.get("x")?.as_f64()?.clamp(0.0, 1.0);
         let y = v.get("y")?.as_f64()?.clamp(0.0, 1.0);
-        Some(mouse(M_MOVE | M_ABSOLUTE, (x * 65535.0).round() as i32, (y * 65535.0).round() as i32, 0))
+        let m = v.get("m").and_then(|m| m.as_u64()).unwrap_or(0) as usize;
+        let (dx, dy) = crate::screen::to_desktop(m, x, y);
+        Some(mouse(M_MOVE | M_ABSOLUTE | M_VIRTUALDESK, dx, dy, 0))
     }
 
     fn buttons(v: &Value) -> (u32, u32) {
