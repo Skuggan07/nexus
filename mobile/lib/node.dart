@@ -36,6 +36,7 @@ class PairedPeer {
     this.icon = '',
     this.group = '',
     this.lastSeen = 0,
+    this.labelsT = 0,
   }) : deviceName = name;
 
   final String id;
@@ -54,6 +55,9 @@ class PairedPeer {
 
   /// When it last answered (seconds since 1970), 0 if never.
   int lastSeen;
+
+  /// When its nickname, icon or group last changed on any device (0 = never).
+  int labelsT;
 
   /// The name to show: the nickname if one is set, with its icon in front.
   String get name {
@@ -79,6 +83,7 @@ class PairedPeer {
         if (icon.isNotEmpty) 'icon': icon,
         if (group.isNotEmpty) 'group': group,
         if (lastSeen > 0) 'last_seen': lastSeen,
+        if (labelsT > 0) 'labels_t': labelsT,
       };
 
   static PairedPeer fromJson(Map<String, dynamic> j) => PairedPeer(
@@ -93,6 +98,7 @@ class PairedPeer {
         icon: (j['icon'] as String?) ?? '',
         group: (j['group'] as String?) ?? '',
         lastSeen: (j['last_seen'] as num?)?.toInt() ?? 0,
+        labelsT: (j['labels_t'] as num?)?.toInt() ?? 0,
       );
 
   bool get controllable => os != 'Android' && os != 'iOS';
@@ -575,6 +581,7 @@ class NexusNode extends ChangeNotifier {
         _fsRoot = _dir;
       }
       await _loadPrefs();
+      await _loadMyLabels();
       _life = _Life(this);
       WidgetsBinding.instance.addObserver(_life!);
       final state = WidgetsBinding.instance.lifecycleState;
@@ -669,20 +676,143 @@ class NexusNode extends ChangeNotifier {
   /// Gives a paired device your own name, an icon and a group (only on this phone).
   Future<void> setLabels(PairedPeer p, {required String nick, required String icon, required String group}) async {
     p
-      ..nick = nick.trim().length > 40 ? nick.trim().substring(0, 40) : nick.trim()
+      ..nick = _cut(nick, 40)
       ..icon = icon
-      ..group = group.trim().length > 30 ? group.trim().substring(0, 30) : group.trim();
+      ..group = _cut(group, 30)
+      ..labelsT = _nowSecs();
     try {
       await _savePeers();
     } catch (e) {
       addLog('Could not save: $e');
     }
     notifyListeners();
+    unawaited(_shareLabels());
+  }
+
+  static String _cut(String v, int max) => v.trim().length > max ? v.trim().substring(0, max) : v.trim();
+  static int _nowSecs() => DateTime.now().millisecondsSinceEpoch ~/ 1000;
+
+  /* --------------------------------------- shared names and groups */
+
+  // This phone's own nickname, icon and group, shared with paired devices like
+  // everyone else's: the newest version of each device's labels wins everywhere.
+  String myNick = '', myIcon = '', myGroup = '';
+  int myLabelsT = 0;
+
+  /// This phone's name as shown: its nickname and icon if it has them.
+  String get myLabel {
+    final n = myNick.isEmpty ? name : myNick;
+    return myIcon.isEmpty ? n : '$myIcon $n';
+  }
+
+  Future<void> _loadMyLabels() async {
+    try {
+      final f = File('${_dir.path}/labels.json');
+      if (await f.exists()) {
+        final m = jsonDecode(await f.readAsString()) as Map<String, dynamic>;
+        myNick = (m['nick'] as String?) ?? '';
+        myIcon = (m['icon'] as String?) ?? '';
+        myGroup = (m['group'] as String?) ?? '';
+        myLabelsT = (m['t'] as num?)?.toInt() ?? 0;
+      }
+    } catch (_) {}
+  }
+
+  Future<void> _saveMyLabels() async {
+    try {
+      await File('${_dir.path}/labels.json')
+          .writeAsString(jsonEncode({'nick': myNick, 'icon': myIcon, 'group': myGroup, 't': myLabelsT}));
+    } catch (_) {}
+  }
+
+  /// Gives this phone a nickname, icon and group (shared with paired devices).
+  Future<void> setMyLabels({required String nick, required String icon, required String group}) async {
+    myNick = _cut(nick, 40);
+    myIcon = icon;
+    myGroup = _cut(group, 30);
+    myLabelsT = _nowSecs();
+    await _saveMyLabels();
+    notifyListeners();
+    unawaited(_shareLabels());
+  }
+
+  List<Map<String, Object>> _labelsAll() => [
+        {'id': id, 'nick': myNick, 'icon': myIcon, 'group': myGroup, 't': myLabelsT},
+        for (final p in paired)
+          if (p.labelsT > 0) {'id': p.id, 'nick': p.nick, 'icon': p.icon, 'group': p.group, 't': p.labelsT},
+      ];
+
+  /// Takes in labels from another device; newer ones replace ours. True if anything changed.
+  Future<bool> _mergeLabels(List<dynamic> entries) async {
+    var mine = false, peers = false;
+    String text(Map e, String k, int max) => _cut('${e[k] ?? ''}', max);
+    for (final e in entries) {
+      if (e is! Map) continue;
+      final eid = e['id'];
+      final t = (e['t'] as num?)?.toInt() ?? 0;
+      if (eid == id) {
+        if (t > myLabelsT) {
+          myNick = text(e, 'nick', 40);
+          myIcon = text(e, 'icon', 8);
+          myGroup = text(e, 'group', 30);
+          myLabelsT = t;
+          mine = true;
+        }
+        continue;
+      }
+      for (final p in paired.where((p) => p.id == eid)) {
+        if (t > p.labelsT) {
+          p
+            ..nick = text(e, 'nick', 40)
+            ..icon = text(e, 'icon', 8)
+            ..group = text(e, 'group', 30)
+            ..labelsT = t;
+          peers = true;
+        }
+      }
+    }
+    if (mine) await _saveMyLabels();
+    if (peers) {
+      try {
+        await _savePeers();
+      } catch (_) {}
+    }
+    if (mine || peers) notifyListeners();
+    return mine || peers;
+  }
+
+  Future<void> _shareLabelsWith(PairedPeer p) async {
+    Conn? c;
+    try {
+      c = await _screenOpen(p);
+      c.send({'op': 'labels', 'labels': _labelsAll()});
+      await c.recv(const Duration(seconds: 10));
+    } catch (_) {
+      // An older Nexus there, or it went away; it catches up next time it comes online.
+    } finally {
+      c?.close();
+    }
+  }
+
+  Future<void> _shareLabels() async {
+    for (final p in List.of(paired)) {
+      final k = statusOf(p).kind;
+      if (k == StatusKind.verified || k == StatusKind.checking) await _shareLabelsWith(p);
+    }
+  }
+
+  Future<void> _labelsServe(Conn c, Map<String, dynamic> m, String who) async {
+    final entries = m['labels'];
+    if (entries is List && await _mergeLabels(entries)) addLog('Names and groups updated from $who');
+    try {
+      c.send({'op': 'ok'});
+    } catch (_) {}
+    c.close();
   }
 
   /// The groups in use, in order.
   List<String> get groups {
-    final out = <String>[];
+    final out = <String>[if (myGroup.isNotEmpty) myGroup];
     for (final p in paired) {
       if (p.group.isNotEmpty && !out.contains(p.group)) out.add(p.group);
     }
@@ -753,6 +883,11 @@ class NexusNode extends ChangeNotifier {
     try {
       final list = jsonDecode(await f.readAsString()) as List<dynamic>;
       paired.addAll(list.map((e) => PairedPeer.fromJson(e as Map<String, dynamic>)));
+      // Labels made before they were shared get the oldest possible time, so they
+      // still reach devices that have none.
+      for (final p in paired) {
+        if (p.labelsT == 0 && (p.nick.isNotEmpty || p.icon.isNotEmpty || p.group.isNotEmpty)) p.labelsT = 1;
+      }
     } catch (_) {}
   }
 
@@ -1539,7 +1674,8 @@ class NexusNode extends ChangeNotifier {
       p
         ..nick = old.nick
         ..icon = old.icon
-        ..group = old.group;
+        ..group = old.group
+        ..labelsT = old.labelsT;
     }
     paired.removeWhere((x) => x.id == p.id);
     paired.add(p);
@@ -1774,6 +1910,8 @@ class NexusNode extends ChangeNotifier {
       await _clipFilesServe(c, first, peer.name);
     } else if (first['op'] == 'ring') {
       await _ringServe(c, first, peer.name);
+    } else if (first['op'] == 'labels') {
+      await _labelsServe(c, first, peer.name);
     } else if (first['op'] == 'auto') {
       c.send({'error': 'Automations run on computers, not on phones'});
       c.close();
@@ -2257,7 +2395,11 @@ class NexusNode extends ChangeNotifier {
         final wasOk = checks[p.id]?.ok ?? false;
         try {
           final (rtt, stats) = await _ping(p, host, port);
-          if (!wasOk) addLog('${p.name} is online and verified ($rtt ms)');
+          if (!wasOk) {
+            addLog('${p.name} is online and verified ($rtt ms)');
+            // It just came online: bring its names and groups up to date.
+            unawaited(_shareLabelsWith(p));
+          }
           if (waking.remove(p.id) != null) addLog('${p.name} woke up ✓');
           wakeFailed.remove(p.id);
           if (stats?.wake != null) wakeHints[p.id] = stats!.wake!;

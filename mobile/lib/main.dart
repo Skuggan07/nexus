@@ -98,6 +98,13 @@ class _HomePageState extends State<HomePage> {
         out.add((p.group, [p]));
       }
     }
+    // A place for this phone's own group, even when no other device is in it.
+    final my = node.myGroup;
+    if (my.isNotEmpty && !out.any((x) => x.$1 == my)) {
+      var at = out.indexWhere((x) => x.$1.isEmpty || x.$1.toLowerCase().compareTo(my.toLowerCase()) > 0);
+      if (at < 0) at = out.length;
+      out.insert(at, (my, <PairedPeer>[]));
+    }
     return out;
   }
 
@@ -150,7 +157,7 @@ class _HomePageState extends State<HomePage> {
           Text(group.isEmpty ? 'OTHER DEVICES' : group.toUpperCase(),
               style: const TextStyle(color: online, fontSize: 13, fontWeight: FontWeight.w800, letterSpacing: 1.2)),
           const SizedBox(width: 8),
-          Text('$onlineCount of ${members.length} online', style: const TextStyle(fontSize: 12)),
+          if (members.isNotEmpty) Text('$onlineCount of ${members.length} online', style: const TextStyle(fontSize: 12)),
         ]),
         if (group.isNotEmpty && (on.isNotEmpty || asleep.isNotEmpty)) ...[
           const SizedBox(height: 6),
@@ -196,12 +203,33 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
-  /// Your own name, an icon and a group for a device (only on this phone).
-  Future<void> _editLabels(BuildContext context, PairedPeer p) async {
+  /// "This phone" inside its own group.
+  Widget _thisPhoneRow(BuildContext context) => Padding(
+        padding: const EdgeInsets.only(bottom: 10),
+        child: _Box(
+          padding: const EdgeInsets.fromLTRB(18, 12, 12, 12),
+          child: Row(children: [
+            const _Dot(color: online),
+            const SizedBox(width: 14),
+            Expanded(
+              child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                Text(node.myLabel, style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w700)),
+                const Text('THIS PHONE', style: TextStyle(color: online, fontSize: 11, letterSpacing: 1.2)),
+              ]),
+            ),
+            _SecondaryButton(label: 'Edit', onPressed: () => _editLabels(context, null)),
+          ]),
+        ),
+      );
+
+  /// A nickname, an icon and a group for a device, or for this phone when [p] is null.
+  /// Shared with all paired devices.
+  Future<void> _editLabels(BuildContext context, PairedPeer? p) async {
     const icons = ['', '🖥', '💻', '📱', '🎮', '📺', '🏠', '💼', '⭐'];
-    final nickCtl = TextEditingController(text: p.nick);
-    final groupCtl = TextEditingController(text: p.group);
-    var icon = p.icon;
+    final nickCtl = TextEditingController(text: p?.nick ?? node.myNick);
+    final groupCtl = TextEditingController(text: p?.group ?? node.myGroup);
+    var icon = p?.icon ?? node.myIcon;
+    final reported = p?.deviceName ?? node.name;
     final groups = node.groups;
     final ok = await showDialog<bool>(
       context: context,
@@ -211,13 +239,16 @@ class _HomePageState extends State<HomePage> {
           title: const Text('Name, icon & group'),
           content: SingleChildScrollView(
             child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
-              Text('It calls itself “${p.deviceName}”.', style: const TextStyle(fontSize: 12)),
+              Text(p == null ? 'This phone: “$reported”.' : 'It calls itself “$reported”.',
+                  style: const TextStyle(fontSize: 12)),
               const SizedBox(height: 10),
-              TextField(
-                controller: nickCtl,
-                maxLength: 40,
-                decoration: InputDecoration(labelText: 'Nickname', hintText: p.deviceName),
-              ),
+              // This phone's own name is changed with Rename.
+              if (p != null)
+                TextField(
+                  controller: nickCtl,
+                  maxLength: 40,
+                  decoration: InputDecoration(labelText: 'Nickname', hintText: reported),
+                ),
               const Text('Icon', style: TextStyle(fontWeight: FontWeight.w700)),
               const SizedBox(height: 6),
               Wrap(spacing: 6, runSpacing: 6, children: [
@@ -242,7 +273,7 @@ class _HomePageState extends State<HomePage> {
                   ActionChip(label: const Text('No group'), onPressed: () => setLocal(() => groupCtl.text = '')),
                 ]),
               const SizedBox(height: 8),
-              const Text('Only this phone uses these names. The device itself is not changed.',
+              const Text('Shared with all your paired devices, so they show the same names and groups.',
                   style: TextStyle(fontSize: 12)),
             ]),
           ),
@@ -253,7 +284,13 @@ class _HomePageState extends State<HomePage> {
         ),
       ),
     );
-    if (ok == true) await node.setLabels(p, nick: nickCtl.text, icon: icon, group: groupCtl.text);
+    if (ok == true) {
+      if (p == null) {
+        await node.setMyLabels(nick: nickCtl.text, icon: icon, group: groupCtl.text);
+      } else {
+        await node.setLabels(p, nick: nickCtl.text, icon: icon, group: groupCtl.text);
+      }
+    }
     nickCtl.dispose();
     groupCtl.dispose();
   }
@@ -380,7 +417,8 @@ class _HomePageState extends State<HomePage> {
           ),
         ),
       for (final (g, members) in _grouped(peers)) ...[
-      if (peers.any((p) => p.group.isNotEmpty)) _groupHeader(g, members),
+      if (peers.any((p) => p.group.isNotEmpty) || node.myGroup.isNotEmpty) _groupHeader(g, members),
+      if (g.isNotEmpty && g == node.myGroup) _thisPhoneRow(context),
       for (final p in members) ...[
         _Box(
           padding: const EdgeInsets.fromLTRB(18, 12, 12, 12),
@@ -418,7 +456,13 @@ class _HomePageState extends State<HomePage> {
       Center(
         child: TextButton(
           onPressed: () => _rename(context),
-          child: Text('This phone: ${node.name}', style: const TextStyle(color: white)),
+          child: Text('This phone: ${node.myLabel}', style: const TextStyle(color: white)),
+        ),
+      ),
+      Center(
+        child: TextButton(
+          onPressed: () => _editLabels(context, null),
+          child: const Text('Icon & group for this phone', style: TextStyle(color: online)),
         ),
       ),
     ];
@@ -444,7 +488,8 @@ class _HomePageState extends State<HomePage> {
       if (peers.isEmpty)
         const _Box(child: Text('No paired devices yet. Press “ALLOW PAIRING” on one device, then “Pair” on the other.')),
       for (final (g, members) in _grouped(peers)) ...[
-        if (peers.any((p) => p.group.isNotEmpty)) _groupHeader(g, members),
+        if (peers.any((p) => p.group.isNotEmpty) || node.myGroup.isNotEmpty) _groupHeader(g, members),
+        if (g.isNotEmpty && g == node.myGroup) _thisPhoneRow(context),
         for (final p in members) ...[_deviceCard(context, p), const SizedBox(height: 12)],
       ],
       for (final s in node.nearby) ...[
@@ -476,11 +521,15 @@ class _HomePageState extends State<HomePage> {
           Expanded(
             child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
               const Text('● THIS PHONE', style: TextStyle(color: online, fontSize: 11, letterSpacing: 1.5)),
-              Text(node.name, style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 16)),
+              Text(node.myLabel, style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 16)),
               Text('key ${node.fingerprintText}', style: const TextStyle(fontFamily: 'monospace', fontSize: 12)),
             ]),
           ),
-          _SecondaryButton(label: 'Rename', onPressed: () => _rename(context)),
+          Column(children: [
+            _SecondaryButton(label: 'Rename', onPressed: () => _rename(context)),
+            const SizedBox(height: 6),
+            _SecondaryButton(label: 'Icon & group', onPressed: () => _editLabels(context, null)),
+          ]),
         ]),
       ),
     ];
