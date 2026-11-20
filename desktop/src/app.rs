@@ -188,6 +188,8 @@ pub struct NexusApp {
     /// A restart/shutdown awaiting the user's confirmation: (device id, command).
     confirm_cmd: Option<(String, Command)>,
     details: Option<String>,
+    /// The "Name, icon & group" window, while it's open.
+    edit_dev: Option<EditDev>,
     browser: Option<Browser>,
     screens: Vec<ScreenView>,
     fullscreen_on: bool,
@@ -219,6 +221,10 @@ enum Action {
     CancelCommand,
     RunCommand(String, Command),
     Wake(String),
+    /// Open the "Name, icon & group" window for a device.
+    EditDevice(String),
+    SaveDevice,
+    CancelEdit,
     /// Make a phone ring (true) or stop it (false).
     Ring(String, bool),
     OpenBrowser(String),
@@ -266,6 +272,7 @@ impl NexusApp {
             confirm_remove: None,
             confirm_cmd: None,
             details: None,
+            edit_dev: None,
             browser: None,
             screens: Vec::new(),
             fullscreen_on: false,
@@ -342,6 +349,32 @@ impl NexusApp {
                 self.confirm_cmd = None;
             }
             Action::AskCommand(id, cmd) => self.confirm_cmd = Some((id, cmd)),
+            Action::EditDevice(id) => {
+                let s = lock(&self.shared);
+                self.edit_dev = s.paired.iter().find(|p| p.id == id).map(|p| EditDev {
+                    id: p.id.clone(),
+                    reported: p.name.clone(),
+                    nick: p.nick.clone(),
+                    icon: p.icon.clone(),
+                    group: p.group.clone(),
+                });
+            }
+            Action::CancelEdit => self.edit_dev = None,
+            Action::SaveDevice => {
+                if let Some(e) = self.edit_dev.take() {
+                    let mut s = lock(&self.shared);
+                    if let Some(p) = s.paired.iter_mut().find(|p| p.id == e.id) {
+                        p.nick = e.nick.trim().chars().take(40).collect();
+                        p.icon = e.icon;
+                        p.group = e.group.trim().chars().take(30).collect();
+                    }
+                    let saved = store::save_peers(&self.dir, &s.paired);
+                    match saved {
+                        Ok(()) => s.log(format!("Saved the name and group of {}", e.reported)),
+                        Err(err) => s.log(format!("Could not save: {err}")),
+                    }
+                }
+            }
             Action::CancelCommand => self.confirm_cmd = None,
             Action::RunCommand(id, cmd) => {
                 self.confirm_cmd = None;
@@ -991,13 +1024,15 @@ impl eframe::App for NexusApp {
                     addr: s.seen.get(&p.id).filter(|x| x.fresh()).map(|x| x.addr.to_string()).or_else(|| {
                         p.last_addr.as_deref().and_then(|a| a.parse::<SocketAddr>().ok()).map(|a| a.ip().to_string())
                     }),
-                    peer: p.clone(),
+                    // Show your nickname and icon everywhere instead of its own name.
+                    peer: PairedPeer { name: p.label(), ..p.clone() },
                     wake_hint: s.wake_hints.get(&p.id).cloned(),
                     waking: s.waking.get(&p.id).map(|t| t.elapsed()),
                     wake_failed: s.wake_failed.contains(&p.id),
                 })
                 .collect();
-            rows.sort_by_key(|r| r.peer.name.to_lowercase());
+            // Grouped devices first (by group), then the rest; by name inside each.
+            rows.sort_by_key(|r| (r.peer.group.is_empty(), r.peer.group.to_lowercase(), r.peer.name.to_lowercase()));
             let mut nearby: Vec<Near> = s
                 .seen
                 .values()
@@ -1058,6 +1093,15 @@ impl eframe::App for NexusApp {
                 Some(r) => self.details_window(ctx, r, &mut actions),
                 None => actions.push(Action::ShowDetails(None)),
             }
+        }
+        if self.edit_dev.is_some() {
+            let mut groups: Vec<String> = Vec::new();
+            for r in &rows {
+                if !r.peer.group.is_empty() && !groups.contains(&r.peer.group) {
+                    groups.push(r.peer.group.clone());
+                }
+            }
+            self.edit_window(ctx, &groups, &mut actions);
         }
         if let Some(p) = &session {
             pair_dialog(ctx, p, &mut actions);
@@ -1194,7 +1238,13 @@ impl NexusApp {
                         ui.label("Open Nexus on your phone, press “+ ADD DEVICE” here, then tap “Pair” on the phone.");
                     });
                 }
-                for r in rows {
+                let groups = group_rows(rows);
+                let any_group = groups.iter().any(|(g, _)| !g.is_empty());
+                for (g, members) in &groups {
+                if any_group {
+                    group_header(ui, g, members, actions);
+                }
+                for r in members.iter().copied() {
                     let (color, text) = status_line(&r.status);
                     box_frame().inner_margin(Margin::symmetric(20.0, 16.0)).show(ui, |ui| {
                         ui.set_width(ui.available_width());
@@ -1217,6 +1267,7 @@ impl NexusApp {
                             });
                         });
                     });
+                }
                 }
                 for n in nearby {
                     ui.add_space(8.0);
@@ -1352,11 +1403,18 @@ impl NexusApp {
         } else {
             let cols = ((ui.available_width() + 10.0) / 330.0).floor().max(1.0) as usize;
             let confirm_cmd = self.confirm_cmd.clone();
-            ui.columns(cols, |c| {
-                for (i, r) in rows.iter().enumerate() {
-                    device_card(&mut c[i % cols], r, self.confirm_remove.as_deref(), confirm_cmd.as_ref(), actions);
+            let groups = group_rows(rows);
+            let any_group = groups.iter().any(|(g, _)| !g.is_empty());
+            for (g, members) in &groups {
+                if any_group {
+                    group_header(ui, g, members, actions);
                 }
-            });
+                ui.columns(cols, |c| {
+                    for (i, r) in members.iter().enumerate() {
+                        device_card(&mut c[i % cols], r, self.confirm_remove.as_deref(), confirm_cmd.as_ref(), actions);
+                    }
+                });
+            }
         }
 
         for n in nearby {
@@ -1636,10 +1694,79 @@ impl NexusApp {
                     }
                 }
                 ui.add_space(2.0);
+                if ui.add(secondary("Name, icon & group").min_size(Vec2::new(0.0, 36.0))).clicked() {
+                    actions.push(Action::EditDevice(r.peer.id.clone()));
+                }
+                ui.add_space(2.0);
                 remove_controls(ui, r, self.confirm_remove.as_deref(), actions);
             });
         if !open {
             actions.push(Action::ShowDetails(None));
+        }
+    }
+
+    /// Give a device your own name, an icon, and a group.
+    fn edit_window(&mut self, ctx: &egui::Context, groups: &[String], actions: &mut Vec<Action>) {
+        let Some(e) = self.edit_dev.as_mut() else { return };
+        let mut open = true;
+        egui::Window::new(RichText::new("Name, icon & group").size(17.0).strong())
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .frame(box_frame().inner_margin(Margin::same(20.0)))
+            .show(ctx, |ui| {
+                ui.set_width(380.0);
+                ui.label(RichText::new(format!("It calls itself “{}”.", e.reported)).size(12.5));
+                ui.add_space(8.0);
+                ui.label(RichText::new("Nickname").strong());
+                ui.add(egui::TextEdit::singleline(&mut e.nick).hint_text(e.reported.as_str()).desired_width(f32::INFINITY));
+                ui.add_space(8.0);
+                ui.label(RichText::new("Icon").strong());
+                ui.horizontal_wrapped(|ui| {
+                    for icon in DEVICE_ICONS {
+                        let on = e.icon == icon;
+                        let text = if icon.is_empty() { "None" } else { icon };
+                        let b = egui::Button::new(RichText::new(text).size(if icon.is_empty() { 13.0 } else { 20.0 }))
+                            .fill(if on { ACCENT } else { BOX2 })
+                            .min_size(Vec2::new(40.0, 36.0));
+                        if ui.add(b).clicked() {
+                            e.icon = icon.to_string();
+                        }
+                    }
+                });
+                ui.add_space(8.0);
+                ui.label(RichText::new("Group").strong());
+                ui.add(
+                    egui::TextEdit::singleline(&mut e.group)
+                        .hint_text("For example Home or Office (empty: no group)")
+                        .desired_width(f32::INFINITY),
+                );
+                if !groups.is_empty() {
+                    ui.horizontal_wrapped(|ui| {
+                        for g in groups {
+                            if ui.add(secondary(g)).clicked() {
+                                e.group = g.clone();
+                            }
+                        }
+                        if !e.group.is_empty() && ui.add(secondary("No group")).clicked() {
+                            e.group.clear();
+                        }
+                    });
+                }
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if ui.add(primary("Save")).clicked() {
+                        actions.push(Action::SaveDevice);
+                    }
+                    if ui.add(secondary("Cancel")).clicked() {
+                        actions.push(Action::CancelEdit);
+                    }
+                });
+                ui.label(RichText::new("Only this PC uses these names. The device itself is not changed.").size(12.0));
+            });
+        if !open {
+            actions.push(Action::CancelEdit);
         }
     }
 
@@ -2682,6 +2809,9 @@ fn device_card(
         if online && ui.add(secondary("Monitor")).clicked() {
             actions.push(Action::OpenMonitor(r.peer.id.clone()));
         }
+        if ui.add(secondary("Name, icon & group")).clicked() {
+            actions.push(Action::EditDevice(r.peer.id.clone()));
+        }
         remove_controls(ui, r, confirm, actions);
     });
     // Teal stripe along the top of online cards.
@@ -2693,6 +2823,70 @@ fn device_card(
         );
     }
     ui.add_space(4.0);
+}
+
+/// The icons you can give a device.
+const DEVICE_ICONS: [&str; 9] = ["", "🖥", "💻", "📱", "🎮", "📺", "🏠", "💼", "⭐"];
+
+struct EditDev {
+    id: String,
+    /// The name the device itself reports.
+    reported: String,
+    nick: String,
+    icon: String,
+    group: String,
+}
+
+/// Rows split by group, in order ("" = no group, last). Rows are already sorted.
+fn group_rows(rows: &[Row]) -> Vec<(String, Vec<&Row>)> {
+    let mut out: Vec<(String, Vec<&Row>)> = Vec::new();
+    for r in rows {
+        match out.last_mut() {
+            Some((g, list)) if *g == r.peer.group => list.push(r),
+            _ => out.push((r.peer.group.clone(), vec![r])),
+        }
+    }
+    out
+}
+
+/// A group's title with Lock / Sleep / Wake buttons for all its computers at once.
+fn group_header(ui: &mut egui::Ui, group: &str, members: &[&Row], actions: &mut Vec<Action>) {
+    let pcs: Vec<&&Row> = members.iter().filter(|r| !matches!(r.peer.os.as_str(), "Android" | "iOS")).collect();
+    let on: Vec<&&Row> = pcs.iter().copied().filter(|r| is_online(&r.status)).collect();
+    let asleep: Vec<&&Row> =
+        pcs.iter().copied().filter(|r| !is_online(&r.status) && !r.peer.macs.is_empty()).collect();
+    let online = members.iter().filter(|r| is_online(&r.status)).count();
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        let title = if group.is_empty() { "OTHER DEVICES".to_string() } else { group.to_uppercase() };
+        ui.label(RichText::new(title).size(15.0).strong().color(ONLINE));
+        ui.label(RichText::new(format!("{online} of {} online", members.len())).size(12.5));
+        if group.is_empty() {
+            return;
+        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if !asleep.is_empty()
+                && ui.add(secondary("Wake all")).on_hover_text("Wake every computer in this group").clicked()
+            {
+                for r in &asleep {
+                    actions.push(Action::Wake(r.peer.id.clone()));
+                }
+            }
+            if !on.is_empty() {
+                if ui.add(secondary("Sleep all")).clicked() {
+                    for r in &on {
+                        actions.push(Action::RunCommand(r.peer.id.clone(), Command::Sleep));
+                    }
+                }
+                if ui.add(secondary("Lock all")).clicked() {
+                    for r in &on {
+                        actions.push(Action::RunCommand(r.peer.id.clone(), Command::Lock));
+                    }
+                }
+            }
+        });
+    });
+    ui.add_space(2.0);
 }
 
 fn activity(ui: &mut egui::Ui, log: &[(u64, String)]) {

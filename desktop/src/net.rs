@@ -1378,6 +1378,9 @@ fn host_pair(
                     paired_at: store::now_unix(),
                     last_addr,
                     macs: Vec::new(),
+                    nick: String::new(),
+                    icon: String::new(),
+                    group: String::new(),
                 },
             );
             s.window = None;
@@ -1456,8 +1459,14 @@ fn agree(shared: &SharedState, sid: u64, c: Conn, code: String, peer_name: &str)
     result
 }
 
-fn save_peer(s: &mut crate::state::Shared, dir: &Path, peer: PairedPeer) {
+fn save_peer(s: &mut crate::state::Shared, dir: &Path, mut peer: PairedPeer) {
     let name = peer.name.clone();
+    // Pairing again keeps the nickname, icon and group you gave it.
+    if let Some(old) = s.paired.iter().find(|p| p.id == peer.id) {
+        peer.nick = old.nick.clone();
+        peer.icon = old.icon.clone();
+        peer.group = old.group.clone();
+    }
     s.paired.retain(|p| p.id != peer.id);
     s.paired.push(peer);
     if let Err(e) = store::save_peers(dir, &s.paired) {
@@ -1562,6 +1571,9 @@ pub(crate) fn pair_client(
         paired_at: store::now_unix(),
         last_addr: Some(target.addr.to_string()),
         macs: Vec::new(),
+        nick: String::new(),
+        icon: String::new(),
+        group: String::new(),
     })
 }
 
@@ -1939,6 +1951,9 @@ mod tests {
             paired_at: 0,
             last_addr: None,
             macs: vec![],
+            nick: String::new(),
+            icon: String::new(),
+            group: String::new(),
         };
         assert!(wake(&peer).is_err());
         let ok = PairedPeer { macs: vec!["aa:bb:cc:dd:ee:ff".into()], ..peer };

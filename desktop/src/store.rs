@@ -19,6 +19,27 @@ pub struct PairedPeer {
     /// The device's MAC addresses, learned from its announcements, for Wake-on-LAN.
     #[serde(default)]
     pub macs: Vec<String>,
+    /// Your own name for it on this PC ("Gaming PC"), instead of the name it reports.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub nick: String,
+    /// A small picture shown before its name (an emoji), or empty.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub icon: String,
+    /// The group it belongs to ("Home", "Office"), or empty.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub group: String,
+}
+
+impl PairedPeer {
+    /// The name to show: the nickname if one is set, with its icon in front.
+    pub fn label(&self) -> String {
+        let name = if self.nick.trim().is_empty() { self.name.as_str() } else { self.nick.trim() };
+        if self.icon.is_empty() {
+            name.to_string()
+        } else {
+            format!("{} {name}", self.icon)
+        }
+    }
 }
 
 /// `%APPDATA%\Nexus\Nexus\data` on Windows. Override with `NEXUS_DATA_DIR`
