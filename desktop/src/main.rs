@@ -8,6 +8,7 @@ mod clipboard;
 mod discovery;
 mod identity;
 mod input;
+mod labels;
 mod monitor;
 mod net;
 mod screen;
@@ -35,7 +36,10 @@ fn main() -> eframe::Result<()> {
             std::process::exit(1);
         }
     };
-    let shared = Arc::new(Mutex::new(state::Shared::new(store::load_peers(&dir))));
+    let mut peers = store::load_peers(&dir);
+    labels::upgrade(&mut peers);
+    let shared = Arc::new(Mutex::new(state::Shared::new(peers)));
+    state::lock(&shared).my_labels = labels::load_mine(&dir);
     state::lock(&shared).allow_control = store::load_allow_control(&dir);
     state::lock(&shared).share_clipboard = store::load_share_clipboard(&dir);
 

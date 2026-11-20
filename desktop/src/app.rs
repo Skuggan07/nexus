@@ -190,6 +190,8 @@ pub struct NexusApp {
     details: Option<String>,
     /// The "Name, icon & group" window, while it's open.
     edit_dev: Option<EditDev>,
+    /// This PC's own nickname, icon and group (a copy, refreshed every frame).
+    mine: crate::labels::Labels,
     browser: Option<Browser>,
     screens: Vec<ScreenView>,
     fullscreen_on: bool,
@@ -273,6 +275,7 @@ impl NexusApp {
             confirm_cmd: None,
             details: None,
             edit_dev: None,
+            mine: crate::labels::Labels::default(),
             browser: None,
             screens: Vec::new(),
             fullscreen_on: false,
@@ -349,6 +352,16 @@ impl NexusApp {
                 self.confirm_cmd = None;
             }
             Action::AskCommand(id, cmd) => self.confirm_cmd = Some((id, cmd)),
+            Action::EditDevice(id) if id == self.me.id => {
+                let l = lock(&self.shared).my_labels.clone();
+                self.edit_dev = Some(EditDev {
+                    id,
+                    reported: self.me.name.clone(),
+                    nick: l.nick,
+                    icon: l.icon,
+                    group: l.group,
+                });
+            }
             Action::EditDevice(id) => {
                 let s = lock(&self.shared);
                 self.edit_dev = s.paired.iter().find(|p| p.id == id).map(|p| EditDev {
@@ -362,17 +375,28 @@ impl NexusApp {
             Action::CancelEdit => self.edit_dev = None,
             Action::SaveDevice => {
                 if let Some(e) = self.edit_dev.take() {
+                    let (nick, group): (String, String) =
+                        (e.nick.trim().chars().take(40).collect(), e.group.trim().chars().take(30).collect());
+                    let now = store::now_unix();
                     let mut s = lock(&self.shared);
-                    if let Some(p) = s.paired.iter_mut().find(|p| p.id == e.id) {
-                        p.nick = e.nick.trim().chars().take(40).collect();
-                        p.icon = e.icon;
-                        p.group = e.group.trim().chars().take(30).collect();
-                    }
-                    let saved = store::save_peers(&self.dir, &s.paired);
+                    let saved = if e.id == self.me.id {
+                        s.my_labels = crate::labels::Labels { nick, icon: e.icon, group, t: now };
+                        crate::labels::save_mine(&self.dir, &s.my_labels)
+                    } else {
+                        if let Some(p) = s.paired.iter_mut().find(|p| p.id == e.id) {
+                            p.nick = nick;
+                            p.icon = e.icon;
+                            p.group = group;
+                            p.labels_t = now;
+                        }
+                        store::save_peers(&self.dir, &s.paired)
+                    };
                     match saved {
-                        Ok(()) => s.log(format!("Saved the name and group of {}", e.reported)),
+                        Ok(()) => s.log(format!("Saved the name and group of {} — sharing with your other devices", e.reported)),
                         Err(err) => s.log(format!("Could not save: {err}")),
                     }
+                    drop(s);
+                    crate::labels::share_all(self.me.clone(), self.shared.clone());
                 }
             }
             Action::CancelCommand => self.confirm_cmd = None,
@@ -1053,6 +1077,7 @@ impl eframe::App for NexusApp {
                 s.log.iter().take(80).map(|(t, m)| (t.elapsed().as_secs(), m.clone())).collect();
             (rows, nearby, window, s.pair.clone(), log)
         };
+        self.mine = lock(&self.shared).my_labels.clone();
         let online = rows.iter().filter(|r| is_online(&r.status)).count();
         let busy = session.is_some();
         let mut actions = Vec::new();
@@ -1096,6 +1121,9 @@ impl eframe::App for NexusApp {
         }
         if self.edit_dev.is_some() {
             let mut groups: Vec<String> = Vec::new();
+            if !self.mine.group.is_empty() {
+                groups.push(self.mine.group.clone());
+            }
             for r in &rows {
                 if !r.peer.group.is_empty() && !groups.contains(&r.peer.group) {
                     groups.push(r.peer.group.clone());
@@ -1238,11 +1266,14 @@ impl NexusApp {
                         ui.label("Open Nexus on your phone, press “+ ADD DEVICE” here, then tap “Pair” on the phone.");
                     });
                 }
-                let groups = group_rows(rows);
+                let groups = self.sections(rows);
                 let any_group = groups.iter().any(|(g, _)| !g.is_empty());
                 for (g, members) in &groups {
                 if any_group {
                     group_header(ui, g, members, actions);
+                }
+                if !g.is_empty() && *g == self.mine.group {
+                    self.this_device_row(ui, actions);
                 }
                 for r in members.iter().copied() {
                     let (color, text) = status_line(&r.status);
@@ -1293,7 +1324,10 @@ impl NexusApp {
                 }
                 ui.add_space(24.0);
                 ui.vertical_centered(|ui| {
-                    ui.label(RichText::new(format!("This PC: {}", self.me.name)).size(13.0));
+                    ui.label(RichText::new(format!("This PC: {}", self.my_label())).size(13.0));
+                    if ui.add(secondary("Name, icon & group for this PC")).clicked() {
+                        actions.push(Action::EditDevice(self.me.id.clone()));
+                    }
                 });
             });
         });
@@ -1339,7 +1373,10 @@ impl NexusApp {
                             .size(12.0)
                             .monospace(),
                     );
-                    ui.label(RichText::new(&self.me.name).strong());
+                    if ui.add(secondary("Name, icon & group").min_size(Vec2::new(ui.available_width(), 28.0))).clicked() {
+                        actions.push(Action::EditDevice(self.me.id.clone()));
+                    }
+                    ui.label(RichText::new(self.my_label()).strong());
                     ui.label(RichText::new("● THIS PC").size(11.0).color(ONLINE));
                     ui.separator();
                 });
@@ -1403,11 +1440,17 @@ impl NexusApp {
         } else {
             let cols = ((ui.available_width() + 10.0) / 330.0).floor().max(1.0) as usize;
             let confirm_cmd = self.confirm_cmd.clone();
-            let groups = group_rows(rows);
+            let groups = self.sections(rows);
             let any_group = groups.iter().any(|(g, _)| !g.is_empty());
             for (g, members) in &groups {
                 if any_group {
                     group_header(ui, g, members, actions);
+                }
+                if !g.is_empty() && *g == self.mine.group {
+                    self.this_device_row(ui, actions);
+                }
+                if members.is_empty() {
+                    continue;
                 }
                 ui.columns(cols, |c| {
                     for (i, r) in members.iter().enumerate() {
@@ -1708,6 +1751,51 @@ impl NexusApp {
         }
     }
 
+    /// This PC's name as shown: its nickname and icon if it has them.
+    fn my_label(&self) -> String {
+        let name = if self.mine.nick.is_empty() { self.me.name.as_str() } else { self.mine.nick.as_str() };
+        if self.mine.icon.is_empty() {
+            name.to_string()
+        } else {
+            format!("{} {name}", self.mine.icon)
+        }
+    }
+
+    /// The device list split by group, with a place for this PC's own group even when
+    /// no other device is in it.
+    fn sections<'a>(&self, rows: &'a [Row]) -> Vec<(String, Vec<&'a Row>)> {
+        let mut g = group_rows(rows);
+        let my = self.mine.group.as_str();
+        if !my.is_empty() && !g.iter().any(|(n, _)| n == my) {
+            let at = g
+                .iter()
+                .position(|(n, _)| n.is_empty() || n.to_lowercase() > my.to_lowercase())
+                .unwrap_or(g.len());
+            g.insert(at, (my.to_string(), Vec::new()));
+        }
+        g
+    }
+
+    /// "This PC" inside its own group.
+    fn this_device_row(&self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+        box_frame().inner_margin(Margin::symmetric(20.0, 12.0)).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                dot(ui, ONLINE, 6.0);
+                ui.add_space(6.0);
+                ui.vertical(|ui| {
+                    ui.label(RichText::new(self.my_label()).size(17.0).strong());
+                    ui.label(RichText::new("THIS PC").size(11.5).color(ONLINE));
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.add(secondary("Name, icon & group")).clicked() {
+                        actions.push(Action::EditDevice(self.me.id.clone()));
+                    }
+                });
+            });
+        });
+    }
+
     /// Give a device your own name, an icon, and a group.
     fn edit_window(&mut self, ctx: &egui::Context, groups: &[String], actions: &mut Vec<Action>) {
         let Some(e) = self.edit_dev.as_mut() else { return };
@@ -1766,7 +1854,10 @@ impl NexusApp {
                         actions.push(Action::CancelEdit);
                     }
                 });
-                ui.label(RichText::new("Only this PC uses these names. The device itself is not changed.").size(12.0));
+                ui.label(
+                    RichText::new("Shared with all your paired devices, so they show the same names and groups.")
+                        .size(12.0),
+                );
             });
         if !open {
             actions.push(Action::CancelEdit);
@@ -2906,7 +2997,9 @@ fn group_header(ui: &mut egui::Ui, group: &str, members: &[&Row], actions: &mut 
     ui.horizontal(|ui| {
         let title = if group.is_empty() { "OTHER DEVICES".to_string() } else { group.to_uppercase() };
         ui.label(RichText::new(title).size(15.0).strong().color(ONLINE));
-        ui.label(RichText::new(format!("{online} of {} online", members.len())).size(12.5));
+        if !members.is_empty() {
+            ui.label(RichText::new(format!("{online} of {} online", members.len())).size(12.5));
+        }
         if group.is_empty() {
             return;
         }

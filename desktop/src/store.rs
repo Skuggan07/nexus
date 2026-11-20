@@ -31,6 +31,9 @@ pub struct PairedPeer {
     /// When it last answered (seconds since 1970), 0 if never.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub last_seen: u64,
+    /// When its nickname, icon or group last changed on any device (0 = never).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub labels_t: u64,
 }
 
 fn is_zero(v: &u64) -> bool {

@@ -76,7 +76,7 @@ pub fn start(me: Arc<Identity>, shared: SharedState, dir: PathBuf) {
 }
 
 /// Paired devices that are online right now, with an address to reach them.
-fn online_targets(shared: &SharedState) -> Vec<(crate::store::PairedPeer, SocketAddr)> {
+pub(crate) fn online_targets(shared: &SharedState) -> Vec<(crate::store::PairedPeer, SocketAddr)> {
     let s = lock(shared);
     s.paired
         .iter()

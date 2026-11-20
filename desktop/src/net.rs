@@ -556,6 +556,14 @@ fn screen_serve(mut c: Conn, me: &Arc<Identity>, shared: &SharedState, dir: &Pat
         Some("clip") => return clip_serve(c, shared, &id, &start),
         Some("clipfiles") => return clipfiles_serve(c, shared, dir, &id, &start),
         Some("audio") => return audio_serve(c, shared, &id),
+        Some("labels") => {
+            let entries = start.get("labels").and_then(|l| l.as_array()).cloned().unwrap_or_default();
+            if crate::labels::merge(me, shared, dir, &entries) {
+                lock(shared).log(format!("Names and groups updated from {}", peer_name(shared, &id)));
+            }
+            let _ = c.send_val(&serde_json::json!({ "op": "ok" }));
+            return;
+        }
         _ => {}
     }
     let fps = start.get("fps").and_then(|x| x.as_u64()).unwrap_or(8).clamp(1, 30);
@@ -714,6 +722,17 @@ const CLIP_CHUNK: usize = 256 * 1024;
 
 /// Sends files copied on this PC to a paired device, which puts them on its clipboard
 /// (a phone also saves them to its Gallery or Downloads).
+/// Sends nicknames, icons and groups to a paired device (see labels.rs).
+pub fn labels_send(me: &Identity, peer: &PairedPeer, addr: SocketAddr, entries: &[serde_json::Value]) -> Result<(), String> {
+    let mut c = screen_open(me, peer, addr)?;
+    c.send_val(&serde_json::json!({ "op": "labels", "labels": entries }))?;
+    let r = c.recv_val()?;
+    match fs_err(&r) {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
 /// Makes a paired phone ring loudly (even on silent), or stops it.
 pub fn ring(me: &Identity, peer: &PairedPeer, addr: SocketAddr, on: bool) -> Result<(), String> {
     let mut c = screen_open(me, peer, addr)?;
@@ -1382,6 +1401,7 @@ fn host_pair(
                     icon: String::new(),
                     group: String::new(),
                     last_seen: 0,
+                    labels_t: 0,
                 },
             );
             s.window = None;
@@ -1467,6 +1487,7 @@ fn save_peer(s: &mut crate::state::Shared, dir: &Path, mut peer: PairedPeer) {
         peer.nick = old.nick.clone();
         peer.icon = old.icon.clone();
         peer.group = old.group.clone();
+        peer.labels_t = old.labels_t;
     }
     s.paired.retain(|p| p.id != peer.id);
     s.paired.push(peer);
@@ -1576,6 +1597,7 @@ pub(crate) fn pair_client(
         icon: String::new(),
         group: String::new(),
         last_seen: 0,
+        labels_t: 0,
     })
 }
 
@@ -1818,6 +1840,9 @@ pub fn start_status_checker(me: Arc<Identity>, shared: SharedState, dir: PathBuf
                 Ok((rtt_ms, stats)) => {
                     if !was_ok {
                         s.log(format!("{} is online and verified ({rtt_ms} ms)", p.name));
+                        // It just came online: bring its names and groups up to date.
+                        let (me2, shared2, p2) = (me.clone(), shared.clone(), p.clone());
+                        thread::spawn(move || crate::labels::share_with(&me2, &shared2, &p2, addr));
                     }
                     if s.waking.remove(&p.id).is_some() {
                         s.log(format!("{} woke up ✓", p.name));
@@ -1970,6 +1995,7 @@ mod tests {
             icon: String::new(),
             group: String::new(),
             last_seen: 0,
+            labels_t: 0,
         };
         assert!(wake(&peer).is_err());
         let ok = PairedPeer { macs: vec!["aa:bb:cc:dd:ee:ff".into()], ..peer };

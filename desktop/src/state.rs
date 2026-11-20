@@ -126,6 +126,8 @@ pub struct Shared {
     pub waking: HashMap<String, Instant>,
     /// Devices that did not wake up after the last try.
     pub wake_failed: std::collections::HashSet<String>,
+    /// This PC's own nickname, icon and group (shared with paired devices).
+    pub my_labels: crate::labels::Labels,
     next_session: u64,
 }
 
@@ -145,6 +147,7 @@ impl Shared {
             wake_hints: HashMap::new(),
             waking: HashMap::new(),
             wake_failed: std::collections::HashSet::new(),
+            my_labels: crate::labels::Labels::default(),
             next_session: 1,
         }
     }
