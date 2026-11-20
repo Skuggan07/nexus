@@ -18,6 +18,10 @@ perms = [
     "RECORD_AUDIO",
     "FOREGROUND_SERVICE_MICROPHONE",
     "REQUEST_IGNORE_BATTERY_OPTIMIZATIONS",
+    "FOREGROUND_SERVICE_CONNECTED_DEVICE",
+    "CHANGE_NETWORK_STATE",
+    "RECEIVE_BOOT_COMPLETED",
+    "VIBRATE",
 ]
 add = "".join(
     f'\n    <uses-permission android:name="android.permission.{p}"/>'
@@ -78,5 +82,28 @@ share = """
 if "ShareActivity" not in s:
     s = s.replace("</application>", share + "    </application>", 1)
 
+# "Stay connected" (reachable with Nexus closed), starting again after a restart,
+# and the Stop button of Find my phone.
+background = """
+        <service
+            android:name=".KeepAliveService"
+            android:exported="false"
+            android:foregroundServiceType="connectedDevice" />
+        <receiver
+            android:name=".BootReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.QUICKBOOT_POWERON" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
+        <receiver
+            android:name=".RingStopReceiver"
+            android:exported="false" />
+"""
+if "KeepAliveService" not in s:
+    s = s.replace("</application>", background + "    </application>", 1)
+
 open(path, "w", encoding="utf-8").write(s)
-print("Manifest patched:", ", ".join(perms), "+ screen sharing, remote-control services and Share → Nexus")
+print("Manifest patched:", ", ".join(perms), "+ screen sharing, remote control, Share → Nexus and Stay connected")
