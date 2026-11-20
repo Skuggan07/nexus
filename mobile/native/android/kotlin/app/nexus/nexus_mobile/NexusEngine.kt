@@ -1,9 +1,12 @@
 package app.nexus.nexus_mobile
 
+import android.app.AppOpsManager
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
+import android.os.Build
+import android.os.Process
 import android.provider.Settings
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.embedding.engine.FlutterEngineCache
@@ -41,6 +44,7 @@ object NexusEngine {
                     result.success(true)
                 }
                 "keepAliveRunning" -> result.success(KeepAliveService.running)
+                "autostart" -> result.success(autostart(app))
                 "openAutostart" -> {
                     openAutostart(app)
                     result.success(true)
@@ -51,6 +55,24 @@ object NexusEngine {
         engine.dartExecutor.executeDartEntrypoint(DartExecutor.DartEntrypoint.createDefault())
         cache.put("nexus", engine)
         return engine
+    }
+
+    /**
+     * Whether Xiaomi's Autostart is on for Nexus: true/false, or null when the phone
+     * doesn't say (not a Xiaomi phone, or the check isn't available). Xiaomi keeps it
+     * as a hidden app permission (number 10008), which only this roundabout way can read.
+     */
+    private fun autostart(ctx: Context): Boolean? {
+        if (!Build.MANUFACTURER.equals("Xiaomi", ignoreCase = true)) return null
+        return try {
+            val ops = ctx.getSystemService(Context.APP_OPS_SERVICE) as AppOpsManager
+            val check = AppOpsManager::class.java.getMethod(
+                "checkOpNoThrow", Int::class.javaPrimitiveType, Int::class.javaPrimitiveType, String::class.java,
+            )
+            (check.invoke(ops, 10008, Process.myUid(), ctx.packageName) as Int) == AppOpsManager.MODE_ALLOWED
+        } catch (e: Throwable) {
+            null
+        }
     }
 
     /** Xiaomi's Autostart list (other phones: Nexus's app settings). */
