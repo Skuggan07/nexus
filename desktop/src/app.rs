@@ -1295,7 +1295,8 @@ impl NexusApp {
                 let any_group = groups.iter().any(|(g, _)| !g.is_empty());
                 for (g, members) in &groups {
                 if any_group {
-                    group_header(ui, g, members, self.confirm_group.as_deref() == Some(g.as_str()), actions);
+                    let me_in = !g.is_empty() && *g == self.mine.group;
+                    group_header(ui, g, members, me_in, self.confirm_group.as_deref() == Some(g.as_str()), actions);
                 }
                 if !g.is_empty() && *g == self.mine.group {
                     self.this_device_row(ui, actions);
@@ -1469,7 +1470,8 @@ impl NexusApp {
             let any_group = groups.iter().any(|(g, _)| !g.is_empty());
             for (g, members) in &groups {
                 if any_group {
-                    group_header(ui, g, members, self.confirm_group.as_deref() == Some(g.as_str()), actions);
+                    let me_in = !g.is_empty() && *g == self.mine.group;
+                    group_header(ui, g, members, me_in, self.confirm_group.as_deref() == Some(g.as_str()), actions);
                 }
                 if !g.is_empty() && *g == self.mine.group {
                     self.this_device_row(ui, actions);
@@ -3012,18 +3014,20 @@ fn group_rows(rows: &[Row]) -> Vec<(String, Vec<&Row>)> {
 }
 
 /// A group's title with Lock / Sleep / Wake buttons for all its computers at once.
-fn group_header(ui: &mut egui::Ui, group: &str, members: &[&Row], confirm: bool, actions: &mut Vec<Action>) {
+/// `me_in`: this PC is in the group too, so it counts as one more online device.
+fn group_header(ui: &mut egui::Ui, group: &str, members: &[&Row], me_in: bool, confirm: bool, actions: &mut Vec<Action>) {
     let pcs: Vec<&&Row> = members.iter().filter(|r| !matches!(r.peer.os.as_str(), "Android" | "iOS")).collect();
     let on: Vec<&&Row> = pcs.iter().copied().filter(|r| is_online(&r.status)).collect();
     let asleep: Vec<&&Row> =
         pcs.iter().copied().filter(|r| !is_online(&r.status) && !r.peer.macs.is_empty()).collect();
-    let online = members.iter().filter(|r| is_online(&r.status)).count();
+    let online = members.iter().filter(|r| is_online(&r.status)).count() + usize::from(me_in);
+    let total = members.len() + usize::from(me_in);
     ui.add_space(8.0);
     ui.horizontal(|ui| {
         let title = if group.is_empty() { "OTHER DEVICES".to_string() } else { group.to_uppercase() };
         ui.label(RichText::new(title).size(15.0).strong().color(ONLINE));
-        if !members.is_empty() {
-            ui.label(RichText::new(format!("{online} of {} online", members.len())).size(12.5));
+        if total > 0 {
+            ui.label(RichText::new(format!("{online} of {total} online")).size(12.5));
         }
         if group.is_empty() {
             return;
