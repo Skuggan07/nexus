@@ -67,14 +67,7 @@ class MainActivity : FlutterActivity() {
      * away) then doesn't stop Nexus, so screen sharing, sound and the clipboard keep
      * working in the background while sharing is on.
      */
-    override fun provideFlutterEngine(context: Context): FlutterEngine? {
-        val cache = FlutterEngineCache.getInstance()
-        cache.get("nexus")?.let { return it }
-        val engine = FlutterEngine(context.applicationContext)
-        engine.dartExecutor.executeDartEntrypoint(DartExecutor.DartEntrypoint.createDefault())
-        cache.put("nexus", engine)
-        return engine
-    }
+    override fun provideFlutterEngine(context: Context): FlutterEngine? = NexusEngine.get(context)
 
     override fun shouldDestroyEngineWithHost(): Boolean = false
 
@@ -354,6 +347,8 @@ class MainActivity : FlutterActivity() {
 
     override fun onResume() {
         super.onResume()
+        // Opening Nexus means the phone was found.
+        if (Ringer.ringing) Ringer.stop(this)
         // In case the Dart side missed the news while Nexus was starting.
         val waiting = synchronized(NexusFiles.pending) { NexusFiles.pending.isNotEmpty() } || NexusFiles.pendingText != null
         if (waiting) notifyShared()
