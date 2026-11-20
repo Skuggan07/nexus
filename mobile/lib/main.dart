@@ -81,8 +81,151 @@ class _HomePageState extends State<HomePage> {
     super.dispose();
   }
 
-  List<PairedPeer> get _sorted =>
-      [...node.paired]..sort((a, b) => a.name.toLowerCase().compareTo(b.name.toLowerCase()));
+  /// Grouped devices first (by group), then the rest; by name inside each.
+  List<PairedPeer> get _sorted => [...node.paired]..sort((a, b) {
+      if (a.group.isEmpty != b.group.isEmpty) return a.group.isEmpty ? 1 : -1;
+      final g = a.group.toLowerCase().compareTo(b.group.toLowerCase());
+      return g != 0 ? g : a.name.toLowerCase().compareTo(b.name.toLowerCase());
+    });
+
+  /// The sorted devices split by group ("" = no group, last).
+  List<(String, List<PairedPeer>)> _grouped(List<PairedPeer> peers) {
+    final out = <(String, List<PairedPeer>)>[];
+    for (final p in peers) {
+      if (out.isNotEmpty && out.last.$1 == p.group) {
+        out.last.$2.add(p);
+      } else {
+        out.add((p.group, [p]));
+      }
+    }
+    return out;
+  }
+
+  bool _isOnline(PairedPeer p) {
+    final k = node.statusOf(p).kind;
+    return k == StatusKind.verified || k == StatusKind.checking;
+  }
+
+  /// A group's title, with Lock / Sleep / Wake for all its computers at once.
+  Widget _groupHeader(String group, List<PairedPeer> members) {
+    final pcs = members.where((p) => p.controllable).toList();
+    final on = pcs.where(_isOnline).toList();
+    final asleep = pcs.where((p) => !_isOnline(p) && p.macs.isNotEmpty).toList();
+    final onlineCount = members.where(_isOnline).length;
+    return Padding(
+      padding: const EdgeInsets.only(top: 6, bottom: 8),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Row(children: [
+          Text(group.isEmpty ? 'OTHER DEVICES' : group.toUpperCase(),
+              style: const TextStyle(color: online, fontSize: 13, fontWeight: FontWeight.w800, letterSpacing: 1.2)),
+          const SizedBox(width: 8),
+          Text('$onlineCount of ${members.length} online', style: const TextStyle(fontSize: 12)),
+        ]),
+        if (group.isNotEmpty && (on.isNotEmpty || asleep.isNotEmpty)) ...[
+          const SizedBox(height: 6),
+          Row(children: [
+            if (on.isNotEmpty) ...[
+              Expanded(
+                child: _SecondaryButton(
+                  label: 'Lock all',
+                  onPressed: () {
+                    for (final p in on) {
+                      node.sendCommand(p, 'lock');
+                    }
+                  },
+                ),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: _SecondaryButton(
+                  label: 'Sleep all',
+                  onPressed: () {
+                    for (final p in on) {
+                      node.sendCommand(p, 'sleep');
+                    }
+                  },
+                ),
+              ),
+            ],
+            if (on.isNotEmpty && asleep.isNotEmpty) const SizedBox(width: 8),
+            if (asleep.isNotEmpty)
+              Expanded(
+                child: _SecondaryButton(
+                  label: 'Wake all',
+                  onPressed: () {
+                    for (final p in asleep) {
+                      node.wake(p);
+                    }
+                  },
+                ),
+              ),
+          ]),
+        ],
+      ]),
+    );
+  }
+
+  /// Your own name, an icon and a group for a device (only on this phone).
+  Future<void> _editLabels(BuildContext context, PairedPeer p) async {
+    const icons = ['', '🖥', '💻', '📱', '🎮', '📺', '🏠', '💼', '⭐'];
+    final nickCtl = TextEditingController(text: p.nick);
+    final groupCtl = TextEditingController(text: p.group);
+    var icon = p.icon;
+    final groups = node.groups;
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setLocal) => AlertDialog(
+          backgroundColor: box,
+          title: const Text('Name, icon & group'),
+          content: SingleChildScrollView(
+            child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Text('It calls itself “${p.deviceName}”.', style: const TextStyle(fontSize: 12)),
+              const SizedBox(height: 10),
+              TextField(
+                controller: nickCtl,
+                maxLength: 40,
+                decoration: InputDecoration(labelText: 'Nickname', hintText: p.deviceName),
+              ),
+              const Text('Icon', style: TextStyle(fontWeight: FontWeight.w700)),
+              const SizedBox(height: 6),
+              Wrap(spacing: 6, runSpacing: 6, children: [
+                for (final i in icons)
+                  ChoiceChip(
+                    label: Text(i.isEmpty ? 'None' : i, style: TextStyle(fontSize: i.isEmpty ? 13 : 20)),
+                    selected: icon == i,
+                    selectedColor: accent,
+                    onSelected: (_) => setLocal(() => icon = i),
+                  ),
+              ]),
+              const SizedBox(height: 10),
+              TextField(
+                controller: groupCtl,
+                maxLength: 30,
+                decoration: const InputDecoration(labelText: 'Group', hintText: 'For example Home or Office'),
+              ),
+              if (groups.isNotEmpty)
+                Wrap(spacing: 6, runSpacing: 6, children: [
+                  for (final g in groups)
+                    ActionChip(label: Text(g), onPressed: () => setLocal(() => groupCtl.text = g)),
+                  ActionChip(label: const Text('No group'), onPressed: () => setLocal(() => groupCtl.text = '')),
+                ]),
+              const SizedBox(height: 8),
+              const Text('Only this phone uses these names. The device itself is not changed.',
+                  style: TextStyle(fontSize: 12)),
+            ]),
+          ),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel', style: TextStyle(color: white))),
+            FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Save')),
+          ],
+        ),
+      ),
+    );
+    if (ok == true) await node.setLabels(p, nick: nickCtl.text, icon: icon, group: groupCtl.text);
+    nickCtl.dispose();
+    groupCtl.dispose();
+  }
 
   int get _onlineCount => node.paired.where((p) {
         final k = node.statusOf(p).kind;
@@ -205,7 +348,9 @@ class _HomePageState extends State<HomePage> {
             'No devices yet. Open Nexus on your PC, press “+ ADD DEVICE” on one of them, then tap “Pair” on the other.',
           ),
         ),
-      for (final p in peers) ...[
+      for (final (g, members) in _grouped(peers)) ...[
+      if (peers.any((p) => p.group.isNotEmpty)) _groupHeader(g, members),
+      for (final p in members) ...[
         _Box(
           padding: const EdgeInsets.fromLTRB(18, 12, 12, 12),
           child: Row(children: [
@@ -221,6 +366,7 @@ class _HomePageState extends State<HomePage> {
           ]),
         ),
         const SizedBox(height: 10),
+      ],
       ],
       if (_onlineCount > 0) ...[
         const SizedBox(height: 4),
@@ -266,7 +412,10 @@ class _HomePageState extends State<HomePage> {
       const SizedBox(height: 14),
       if (peers.isEmpty)
         const _Box(child: Text('No paired devices yet. Press “ALLOW PAIRING” on one device, then “Pair” on the other.')),
-      for (final p in peers) ...[_deviceCard(context, p), const SizedBox(height: 12)],
+      for (final (g, members) in _grouped(peers)) ...[
+        if (peers.any((p) => p.group.isNotEmpty)) _groupHeader(g, members),
+        for (final p in members) ...[_deviceCard(context, p), const SizedBox(height: 12)],
+      ],
       for (final s in node.nearby) ...[
         _NearbyBox(
           label: 'NEW SIGNAL',
@@ -541,6 +690,17 @@ class _HomePageState extends State<HomePage> {
                   ),
                 ],
               ],
+              const SizedBox(height: 8),
+              SizedBox(
+                width: double.infinity,
+                child: _SecondaryButton(
+                  label: 'Name, icon & group',
+                  onPressed: () {
+                    Navigator.pop(ctx);
+                    _editLabels(context, p);
+                  },
+                ),
+              ),
               const SizedBox(height: 8),
               _SecondaryButton(
                 label: 'Remove device',

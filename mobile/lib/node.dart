@@ -26,16 +26,37 @@ String get osLabel => Platform.isAndroid ? 'Android' : Platform.operatingSystem;
 class PairedPeer {
   PairedPeer({
     required this.id,
-    required this.name,
+    required String name,
     required this.os,
     required this.publicKey,
     required this.pairedAt,
     this.lastAddr,
     this.macs = const [],
-  });
+    this.nick = '',
+    this.icon = '',
+    this.group = '',
+  }) : deviceName = name;
 
   final String id;
-  final String name;
+
+  /// The name the device itself reports.
+  final String deviceName;
+
+  /// Your own name for it on this phone ("Gaming PC"), or empty.
+  String nick;
+
+  /// A small picture shown before its name (an emoji), or empty.
+  String icon;
+
+  /// The group it belongs to ("Home", "Office"), or empty.
+  String group;
+
+  /// The name to show: the nickname if one is set, with its icon in front.
+  String get name {
+    final n = nick.trim().isEmpty ? deviceName : nick.trim();
+    return icon.isEmpty ? n : '$icon $n';
+  }
+
   final String os;
   final String publicKey;
   final int pairedAt;
@@ -44,12 +65,15 @@ class PairedPeer {
 
   Map<String, Object?> toJson() => {
         'id': id,
-        'name': name,
+        'name': deviceName,
         'os': os,
         'public_key': publicKey,
         'paired_at': pairedAt,
         'last_addr': lastAddr,
         'macs': macs,
+        if (nick.isNotEmpty) 'nick': nick,
+        if (icon.isNotEmpty) 'icon': icon,
+        if (group.isNotEmpty) 'group': group,
       };
 
   static PairedPeer fromJson(Map<String, dynamic> j) => PairedPeer(
@@ -60,6 +84,9 @@ class PairedPeer {
         pairedAt: (j['paired_at'] as num?)?.toInt() ?? 0,
         lastAddr: j['last_addr'] as String?,
         macs: (j['macs'] as List<dynamic>?)?.map((e) => '$e').toList() ?? const [],
+        nick: (j['nick'] as String?) ?? '',
+        icon: (j['icon'] as String?) ?? '',
+        group: (j['group'] as String?) ?? '',
       );
 
   bool get controllable => os != 'Android' && os != 'iOS';
@@ -609,6 +636,30 @@ class NexusNode extends ChangeNotifier {
   Future<bool> keepAlive() async => await _bg('keepAlive') == true;
   Future<void> setKeepAlive(bool on) async => _bg('setKeepAlive', on);
   Future<void> openAutostart() async => _bg('openAutostart');
+
+  /// Gives a paired device your own name, an icon and a group (only on this phone).
+  Future<void> setLabels(PairedPeer p, {required String nick, required String icon, required String group}) async {
+    p
+      ..nick = nick.trim().length > 40 ? nick.trim().substring(0, 40) : nick.trim()
+      ..icon = icon
+      ..group = group.trim().length > 30 ? group.trim().substring(0, 30) : group.trim();
+    try {
+      await _savePeers();
+    } catch (e) {
+      addLog('Could not save: $e');
+    }
+    notifyListeners();
+  }
+
+  /// The groups in use, in order.
+  List<String> get groups {
+    final out = <String>[];
+    for (final p in paired) {
+      if (p.group.isNotEmpty && !out.contains(p.group)) out.add(p.group);
+    }
+    out.sort((a, b) => a.toLowerCase().compareTo(b.toLowerCase()));
+    return out;
+  }
 
   /// Whether Xiaomi's Autostart is on for Nexus (null: the phone doesn't say).
   Future<bool?> autostart() async {
@@ -1444,6 +1495,13 @@ class NexusNode extends ChangeNotifier {
   }
 
   Future<void> _savePeer(PairedPeer p) async {
+    // Pairing again keeps the nickname, icon and group you gave it.
+    for (final old in paired.where((x) => x.id == p.id)) {
+      p
+        ..nick = old.nick
+        ..icon = old.icon
+        ..group = old.group;
+    }
     paired.removeWhere((x) => x.id == p.id);
     paired.add(p);
     try {
