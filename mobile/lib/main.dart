@@ -2248,6 +2248,7 @@ class _StayConnectedBox extends StatefulWidget {
 class _StayConnectedBoxState extends State<_StayConnectedBox> with WidgetsBindingObserver {
   bool _on = false;
   bool _battery = true;
+  bool? _autostart;
 
   @override
   void initState() {
@@ -2270,10 +2271,12 @@ class _StayConnectedBoxState extends State<_StayConnectedBox> with WidgetsBindin
   Future<void> _refresh() async {
     final on = await widget.node.keepAlive();
     final battery = await widget.node.batteryFree();
-    if (mounted && (on != _on || battery != _battery)) {
+    final autostart = await widget.node.autostart();
+    if (mounted && (on != _on || battery != _battery || autostart != _autostart)) {
       setState(() {
         _on = on;
         _battery = battery;
+        _autostart = autostart;
       });
     }
   }
@@ -2332,9 +2335,13 @@ class _StayConnectedBoxState extends State<_StayConnectedBox> with WidgetsBindin
           ),
           _step(
             'Autostart',
-            'On Xiaomi phones, turn on Nexus in the Autostart list so it starts again after a restart.',
-            false,
-            'Open',
+            switch (_autostart) {
+              true => 'Done.',
+              false => 'Turn on Nexus in the Autostart list so it starts again after a restart.',
+              null => "Nexus can't check this on your phone. If you turned it on, you're done.",
+            },
+            _autostart ?? false,
+            _autostart == true ? 'Settings' : 'Open',
             () => widget.node.openAutostart(),
           ),
         ],

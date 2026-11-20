@@ -610,6 +610,12 @@ class NexusNode extends ChangeNotifier {
   Future<void> setKeepAlive(bool on) async => _bg('setKeepAlive', on);
   Future<void> openAutostart() async => _bg('openAutostart');
 
+  /// Whether Xiaomi's Autostart is on for Nexus (null: the phone doesn't say).
+  Future<bool?> autostart() async {
+    final r = await _bg('autostart');
+    return r is bool ? r : null;
+  }
+
   @override
   void dispose() {
     _loop?.cancel();
