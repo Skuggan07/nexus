@@ -12,6 +12,10 @@ use std::{
 pub const ONLINE_WINDOW: Duration = Duration::from_secs(7);
 /// How long a status check result stays valid.
 pub const CHECK_VALID: Duration = Duration::from_secs(15);
+/// A phone saving battery in the background is checked about once a minute, so its
+/// last answer counts for longer.
+pub const IDLE_CHECK_EVERY: Duration = Duration::from_secs(60);
+pub const IDLE_CHECK_VALID: Duration = Duration::from_secs(150);
 /// How long "Allow pairing" stays open, and how many requests it accepts.
 pub const PAIR_WINDOW: Duration = Duration::from_secs(120);
 pub const PAIR_ATTEMPTS: u8 = 3;
@@ -160,7 +164,10 @@ impl Shared {
             return Status::IdentityChanged;
         }
         match self.checks.get(&p.id) {
-            Some(Check::Ok { rtt_ms, at, stats }) if at.elapsed() < CHECK_VALID => {
+            Some(Check::Ok { rtt_ms, at, stats })
+                if at.elapsed()
+                    < if stats.as_ref().is_some_and(|s| s.idle) { IDLE_CHECK_VALID } else { CHECK_VALID } =>
+            {
                 Status::Verified { rtt_ms: *rtt_ms, stats: stats.clone() }
             }
             Some(Check::Failed { reason, at }) if at.elapsed() < CHECK_VALID && seen.is_some() => {

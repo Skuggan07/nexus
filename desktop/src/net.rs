@@ -714,6 +714,17 @@ const CLIP_CHUNK: usize = 256 * 1024;
 
 /// Sends files copied on this PC to a paired device, which puts them on its clipboard
 /// (a phone also saves them to its Gallery or Downloads).
+/// Makes a paired phone ring loudly (even on silent), or stops it.
+pub fn ring(me: &Identity, peer: &PairedPeer, addr: SocketAddr, on: bool) -> Result<(), String> {
+    let mut c = screen_open(me, peer, addr)?;
+    c.send_val(&serde_json::json!({ "op": "ring", "on": on }))?;
+    let r = c.recv_val()?;
+    match fs_err(&r) {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
 pub(crate) fn clipfiles_send(
     me: &Identity,
     peer: &PairedPeer,
@@ -1775,6 +1786,14 @@ pub fn start_status_checker(me: Arc<Identity>, shared: SharedState, dir: PathBuf
         };
         for (p, addr) in targets {
             let Some(addr) = addr else { continue };
+            // Phones saving battery in the background are only checked about once a minute.
+            let resting = matches!(
+                lock(&shared).checks.get(&p.id),
+                Some(Check::Ok { at, stats: Some(st), .. }) if st.idle && at.elapsed() < crate::state::IDLE_CHECK_EVERY
+            );
+            if resting {
+                continue;
+            }
             let result = ping(&me, &p, addr);
             let mut s = lock(&shared);
             let was_ok = matches!(s.checks.get(&p.id), Some(Check::Ok { .. }));

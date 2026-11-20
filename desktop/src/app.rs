@@ -219,6 +219,8 @@ enum Action {
     CancelCommand,
     RunCommand(String, Command),
     Wake(String),
+    /// Make a phone ring (true) or stop it (false).
+    Ring(String, bool),
     OpenBrowser(String),
     CloseBrowser,
     BrowseTo(Vec<String>),
@@ -367,6 +369,34 @@ impl NexusApp {
                     });
                 } else {
                     lock(&self.shared).log("That device is not reachable right now");
+                }
+            }
+            Action::Ring(id, on) => {
+                let me = self.me.clone();
+                let shared = self.shared.clone();
+                let resolved = {
+                    let s = lock(&self.shared);
+                    s.paired.iter().find(|p| p.id == id).cloned().map(|p| {
+                        let addr = s
+                            .seen
+                            .get(&p.id)
+                            .filter(|x| x.fresh())
+                            .map(|x| SocketAddr::new(x.addr, x.tcp_port))
+                            .or_else(|| p.last_addr.as_deref().and_then(|a| a.parse().ok()));
+                        (p, addr)
+                    })
+                };
+                if let Some((peer, Some(addr))) = resolved {
+                    std::thread::spawn(move || {
+                        let msg = match net::ring(&me, &peer, addr, on) {
+                            Ok(()) if on => format!("{} is ringing — tap Stop on the phone when you find it", peer.name),
+                            Ok(()) => format!("{} stopped ringing", peer.name),
+                            Err(e) => format!("Could not reach {}: {e}", peer.name),
+                        };
+                        lock(&shared).log(msg);
+                    });
+                } else {
+                    lock(&self.shared).log("That phone is not reachable right now");
                 }
             }
             Action::Wake(id) => {
@@ -2471,8 +2501,23 @@ fn pair_action(n: &Near) -> Action {
 
 /// Lock / Sleep / Restart / Shut down when the device is online; Wake when it is offline and its MAC is known.
 fn power_controls(ui: &mut egui::Ui, r: &Row, confirm_cmd: Option<&(String, Command)>, actions: &mut Vec<Action>) {
-    // Phones can't be locked/restarted/woken remotely, so only offer this for computers.
+    // Phones can't be locked/restarted/woken remotely; they get Find my phone instead.
     if matches!(r.peer.os.as_str(), "Android" | "iOS") {
+        if is_online(&r.status) {
+            let id = r.peer.id.clone();
+            ui.horizontal(|ui| {
+                if ui
+                    .add(primary("Ring phone"))
+                    .on_hover_text("Rings loudly, even on silent — to find the phone")
+                    .clicked()
+                {
+                    actions.push(Action::Ring(id.clone(), true));
+                }
+                if ui.add(secondary("Stop ringing")).clicked() {
+                    actions.push(Action::Ring(id.clone(), false));
+                }
+            });
+        }
         return;
     }
     let id = r.peer.id.clone();

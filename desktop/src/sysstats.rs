@@ -21,6 +21,9 @@ pub struct Stats {
     /// network announcements, but some phones never receive those.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub macs: Vec<String>,
+    /// A phone that is saving battery in the background: check on it less often.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub idle: bool,
 }
 
 static LATEST: OnceLock<Mutex<Option<String>>> = OnceLock::new();
@@ -50,6 +53,7 @@ pub fn start_sampler() {
                 battery: battery_percent(),
                 wake: crate::wakeup::code(),
                 macs: macs.clone(),
+                idle: false,
             };
             if let (Ok(json), Ok(mut g)) = (serde_json::to_string(&s), slot().lock()) {
                 *g = Some(json);
