@@ -192,6 +192,8 @@ pub struct NexusApp {
     edit_dev: Option<EditDev>,
     /// This PC's own nickname, icon and group (a copy, refreshed every frame).
     mine: crate::labels::Labels,
+    /// A group waiting for "Yes, delete" to be pressed.
+    confirm_group: Option<String>,
     browser: Option<Browser>,
     screens: Vec<ScreenView>,
     fullscreen_on: bool,
@@ -225,6 +227,9 @@ enum Action {
     Wake(String),
     /// Open the "Name, icon & group" window for a device.
     EditDevice(String),
+    /// Ask before deleting a group (None = cancel), then delete it.
+    AskDeleteGroup(Option<String>),
+    DeleteGroup(String),
     SaveDevice,
     CancelEdit,
     /// Make a phone ring (true) or stop it (false).
@@ -276,6 +281,7 @@ impl NexusApp {
             details: None,
             edit_dev: None,
             mine: crate::labels::Labels::default(),
+            confirm_group: None,
             browser: None,
             screens: Vec::new(),
             fullscreen_on: false,
@@ -373,6 +379,25 @@ impl NexusApp {
                 });
             }
             Action::CancelEdit => self.edit_dev = None,
+            Action::AskDeleteGroup(g) => self.confirm_group = g,
+            Action::DeleteGroup(g) => {
+                self.confirm_group = None;
+                let now = store::now_unix();
+                let mut s = lock(&self.shared);
+                for p in s.paired.iter_mut().filter(|p| p.group == g) {
+                    p.group.clear();
+                    p.labels_t = now;
+                }
+                if s.my_labels.group == g {
+                    s.my_labels.group.clear();
+                    s.my_labels.t = now;
+                    let _ = crate::labels::save_mine(&self.dir, &s.my_labels);
+                }
+                let _ = store::save_peers(&self.dir, &s.paired);
+                s.log(format!("Deleted the group {g} — the devices in it are kept"));
+                drop(s);
+                crate::labels::share_all(self.me.clone(), self.shared.clone());
+            }
             Action::SaveDevice => {
                 if let Some(e) = self.edit_dev.take() {
                     let (nick, group): (String, String) =
@@ -1270,7 +1295,7 @@ impl NexusApp {
                 let any_group = groups.iter().any(|(g, _)| !g.is_empty());
                 for (g, members) in &groups {
                 if any_group {
-                    group_header(ui, g, members, actions);
+                    group_header(ui, g, members, self.confirm_group.as_deref() == Some(g.as_str()), actions);
                 }
                 if !g.is_empty() && *g == self.mine.group {
                     self.this_device_row(ui, actions);
@@ -1444,7 +1469,7 @@ impl NexusApp {
             let any_group = groups.iter().any(|(g, _)| !g.is_empty());
             for (g, members) in &groups {
                 if any_group {
-                    group_header(ui, g, members, actions);
+                    group_header(ui, g, members, self.confirm_group.as_deref() == Some(g.as_str()), actions);
                 }
                 if !g.is_empty() && *g == self.mine.group {
                     self.this_device_row(ui, actions);
@@ -2987,7 +3012,7 @@ fn group_rows(rows: &[Row]) -> Vec<(String, Vec<&Row>)> {
 }
 
 /// A group's title with Lock / Sleep / Wake buttons for all its computers at once.
-fn group_header(ui: &mut egui::Ui, group: &str, members: &[&Row], actions: &mut Vec<Action>) {
+fn group_header(ui: &mut egui::Ui, group: &str, members: &[&Row], confirm: bool, actions: &mut Vec<Action>) {
     let pcs: Vec<&&Row> = members.iter().filter(|r| !matches!(r.peer.os.as_str(), "Android" | "iOS")).collect();
     let on: Vec<&&Row> = pcs.iter().copied().filter(|r| is_online(&r.status)).collect();
     let asleep: Vec<&&Row> =
@@ -3004,6 +3029,22 @@ fn group_header(ui: &mut egui::Ui, group: &str, members: &[&Row], actions: &mut 
             return;
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if confirm {
+                if ui.add(secondary("Cancel")).clicked() {
+                    actions.push(Action::AskDeleteGroup(None));
+                }
+                if ui
+                    .add(egui::Button::new(RichText::new("Yes, delete").strong().color(TEXT)).fill(BAD.gamma_multiply(0.85)))
+                    .clicked()
+                {
+                    actions.push(Action::DeleteGroup(group.to_string()));
+                }
+                ui.label(RichText::new("Delete this group? The devices stay paired.").strong());
+                return;
+            }
+            if ui.add(secondary("Delete group")).on_hover_text("Takes every device out of this group").clicked() {
+                actions.push(Action::AskDeleteGroup(Some(group.to_string())));
+            }
             if !asleep.is_empty()
                 && ui.add(secondary("Wake all")).on_hover_text("Wake every computer in this group").clicked()
             {
