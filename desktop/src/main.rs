@@ -48,7 +48,7 @@ fn main() -> eframe::Result<()> {
     if let Err(e) = discovery::start(me.clone(), shared.clone(), dir.clone(), tcp_port) {
         problems.push(e);
     }
-    sysstats::start_sampler();
+    sysstats::start_sampler(dir.clone());
     wakeup::start();
     net::start_status_checker(me.clone(), shared.clone(), dir.clone());
     automation::start(me.clone(), shared.clone(), dir.clone());

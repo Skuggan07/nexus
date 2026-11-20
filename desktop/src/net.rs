@@ -1381,6 +1381,7 @@ fn host_pair(
                     nick: String::new(),
                     icon: String::new(),
                     group: String::new(),
+                    last_seen: 0,
                 },
             );
             s.window = None;
@@ -1574,6 +1575,7 @@ pub(crate) fn pair_client(
         nick: String::new(),
         icon: String::new(),
         group: String::new(),
+        last_seen: 0,
     })
 }
 
@@ -1780,7 +1782,10 @@ pub fn local_macs() -> Vec<String> {
 
 /// Checks every paired device every few seconds.
 pub fn start_status_checker(me: Arc<Identity>, shared: SharedState, dir: PathBuf) {
-    let _ = thread::Builder::new().name("nexus-status".into()).spawn(move || loop {
+    let _ = thread::Builder::new().name("nexus-status".into()).spawn(move || {
+    // "Last seen" times are written to disk about once a minute, not on every check.
+    let mut last_save = Instant::now();
+    loop {
         let targets: Vec<(PairedPeer, Option<SocketAddr>)> = {
             let s = lock(&shared);
             s.paired
@@ -1834,6 +1839,14 @@ pub fn start_status_checker(me: Arc<Identity>, shared: SharedState, dir: PathBuf
                         }
                     }
                     s.checks.insert(p.id.clone(), Check::Ok { rtt_ms, at: Instant::now(), stats });
+                    let now = store::now_unix();
+                    if let Some(x) = s.paired.iter_mut().find(|x| x.id == p.id) {
+                        x.last_seen = now;
+                    }
+                    if last_save.elapsed() > Duration::from_secs(60) {
+                        let _ = store::save_peers(&dir, &s.paired);
+                        last_save = Instant::now();
+                    }
                     let a = addr.to_string();
                     let changed = s.paired.iter_mut().find(|x| x.id == p.id).is_some_and(|x| {
                         let c = x.last_addr.as_deref() != Some(a.as_str());
@@ -1847,12 +1860,14 @@ pub fn start_status_checker(me: Arc<Identity>, shared: SharedState, dir: PathBuf
                 Err(reason) => {
                     if was_ok {
                         s.log(format!("{} stopped answering", p.name));
+                        let _ = store::save_peers(&dir, &s.paired);
                     }
                     s.checks.insert(p.id.clone(), Check::Failed { reason, at: Instant::now() });
                 }
             }
         }
         thread::sleep(CHECK_INTERVAL);
+    }
     });
 }
 
@@ -1954,6 +1969,7 @@ mod tests {
             nick: String::new(),
             icon: String::new(),
             group: String::new(),
+            last_seen: 0,
         };
         assert!(wake(&peer).is_err());
         let ok = PairedPeer { macs: vec!["aa:bb:cc:dd:ee:ff".into()], ..peer };

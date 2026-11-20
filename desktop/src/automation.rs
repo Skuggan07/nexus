@@ -264,7 +264,7 @@ pub fn replace(shared: &SharedState, dir: &Path, rules: Vec<Rule>) -> Result<Vec
 
 /// Local wall-clock time: (weekday 0 = Monday, hour, minute, a key unique to this minute).
 #[cfg(windows)]
-fn local_now() -> (u8, u8, u8, String) {
+pub(crate) fn local_now() -> (u8, u8, u8, String) {
     use windows_sys::Win32::{Foundation::SYSTEMTIME, System::SystemInformation::GetLocalTime};
     let mut t: SYSTEMTIME = unsafe { std::mem::zeroed() };
     unsafe { GetLocalTime(&mut t) };
@@ -276,7 +276,7 @@ fn local_now() -> (u8, u8, u8, String) {
 
 /// Other systems: UTC is close enough for development builds.
 #[cfg(not(windows))]
-fn local_now() -> (u8, u8, u8, String) {
+pub(crate) fn local_now() -> (u8, u8, u8, String) {
     let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     let days = secs / 86_400;
     // 1 Jan 1970 was a Thursday (3 when Monday is 0).

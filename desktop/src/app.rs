@@ -1664,6 +1664,9 @@ impl NexusApp {
                     gauge(ui, stats.battery, "BATTERY");
                 });
                 ui.label(format!("{} · {}", r.peer.os, r.addr.as_deref().unwrap_or("address unknown")));
+                for line in activity_lines(r) {
+                    ui.label(line);
+                }
                 ui.label(
                     RichText::new(format!("key {}", identity::fingerprint(&r.peer.public_key))).monospace().size(12.5),
                 );
@@ -2798,6 +2801,9 @@ fn device_card(
                     ui.vertical_centered(|ui| ui.label("Not reachable right now"));
                 });
         }
+        for line in activity_lines(r) {
+            ui.label(RichText::new(line).size(12.5));
+        }
         ui.label(RichText::new(format!("key {}", identity::fingerprint(&r.peer.public_key))).monospace().size(12.0));
         power_controls(ui, r, confirm_cmd, actions);
         if online && ui.add(secondary("Browse files")).clicked() {
@@ -2823,6 +2829,46 @@ fn device_card(
         );
     }
     ui.add_space(4.0);
+}
+
+/// "2 h 15 min", "3 days 4 h", "12 min", "under a minute".
+fn fmt_span(secs: u64) -> String {
+    let (d, h, m) = (secs / 86_400, secs / 3600 % 24, secs / 60 % 60);
+    if d > 0 {
+        format!("{d} day{} {h} h", if d == 1 { "" } else { "s" })
+    } else if h > 0 {
+        format!("{h} h {m} min")
+    } else if m > 0 {
+        format!("{m} min")
+    } else {
+        "under a minute".into()
+    }
+}
+
+/// Who is signed in, how long it's been used, how long it's been on — or when it was last seen.
+fn activity_lines(r: &Row) -> Vec<String> {
+    let mut out = Vec::new();
+    if is_online(&r.status) {
+        if let Some(st) = stats_of(&r.status) {
+            if let Some(u) = &st.user {
+                out.push(format!("Signed in: {u}"));
+            }
+            match (st.today, st.total) {
+                (Some(t), Some(all)) => out.push(format!("Used today: {} · in total: {}", fmt_span(t), fmt_span(all))),
+                (Some(t), None) => out.push(format!("Used today: {}", fmt_span(t))),
+                _ => {}
+            }
+            if let Some(up) = st.uptime {
+                out.push(format!("On for {} since the last restart", fmt_span(up)));
+            }
+        }
+    } else if r.peer.last_seen > 0 {
+        let ago = store::now_unix().saturating_sub(r.peer.last_seen);
+        out.push(if ago < 60 { "Last seen just now".into() } else { format!("Last seen {} ago", fmt_span(ago)) });
+    } else {
+        out.push("Not seen online yet".into());
+    }
+    out
 }
 
 /// The icons you can give a device.

@@ -28,6 +28,13 @@ pub struct PairedPeer {
     /// The group it belongs to ("Home", "Office"), or empty.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub group: String,
+    /// When it last answered (seconds since 1970), 0 if never.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub last_seen: u64,
+}
+
+fn is_zero(v: &u64) -> bool {
+    *v == 0
 }
 
 impl PairedPeer {
