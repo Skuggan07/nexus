@@ -101,6 +101,37 @@ class _HomePageState extends State<HomePage> {
     return out;
   }
 
+  /// "2 h 15 min", "3 days 4 h", "12 min", "under a minute".
+  static String _span(int secs) {
+    final d = secs ~/ 86400, h = secs ~/ 3600 % 24, m = secs ~/ 60 % 60;
+    if (d > 0) return '$d day${d == 1 ? '' : 's'} $h h';
+    if (h > 0) return '$h h $m min';
+    if (m > 0) return '$m min';
+    return 'under a minute';
+  }
+
+  /// Who is signed in, how long it's been used and on — or when it was last seen.
+  List<String> _activityLines(PairedPeer p, PeerStatus st) {
+    final out = <String>[];
+    final online = st.kind == StatusKind.verified || st.kind == StatusKind.checking;
+    final s = st.stats;
+    if (online && s != null) {
+      if (s.user != null) out.add('Signed in: ${s.user}');
+      if (s.today != null) {
+        out.add('Used today: ${_span(s.today!)}${s.total != null ? ' · in total: ${_span(s.total!)}' : ''}');
+      }
+      if (s.uptime != null) out.add('On for ${_span(s.uptime!)} since the last restart');
+    } else if (!online) {
+      if (p.lastSeen > 0) {
+        final ago = DateTime.now().millisecondsSinceEpoch ~/ 1000 - p.lastSeen;
+        out.add(ago < 60 ? 'Last seen just now' : 'Last seen ${_span(ago)} ago');
+      } else {
+        out.add('Not seen online yet');
+      }
+    }
+    return out;
+  }
+
   bool _isOnline(PairedPeer p) {
     final k = node.statusOf(p).kind;
     return k == StatusKind.verified || k == StatusKind.checking;
@@ -509,7 +540,9 @@ class _HomePageState extends State<HomePage> {
             decoration: BoxDecoration(border: Border.all(color: line), borderRadius: BorderRadius.circular(8)),
             child: const Text('Not reachable right now'),
           ),
-        const SizedBox(height: 12),
+        const SizedBox(height: 10),
+        for (final line in _activityLines(p, st)) Text(line, style: const TextStyle(fontSize: 12.5)),
+        const SizedBox(height: 6),
         Row(children: [
           Expanded(
             child: Text('key ${_fp(p.id)}', style: const TextStyle(fontFamily: 'monospace', fontSize: 11.5)),
@@ -616,6 +649,7 @@ class _HomePageState extends State<HomePage> {
               ]),
               const SizedBox(height: 18),
               Text('${p.os}${addr != null ? ' · $addr' : ''}'),
+              for (final line in _activityLines(p, st)) Text(line),
               Text('key ${_fp(p.id)}', style: const TextStyle(fontFamily: 'monospace', fontSize: 12)),
               const SizedBox(height: 16),
               ..._powerControls(context, p, st),

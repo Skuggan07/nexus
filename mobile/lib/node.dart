@@ -35,6 +35,7 @@ class PairedPeer {
     this.nick = '',
     this.icon = '',
     this.group = '',
+    this.lastSeen = 0,
   }) : deviceName = name;
 
   final String id;
@@ -50,6 +51,9 @@ class PairedPeer {
 
   /// The group it belongs to ("Home", "Office"), or empty.
   String group;
+
+  /// When it last answered (seconds since 1970), 0 if never.
+  int lastSeen;
 
   /// The name to show: the nickname if one is set, with its icon in front.
   String get name {
@@ -74,6 +78,7 @@ class PairedPeer {
         if (nick.isNotEmpty) 'nick': nick,
         if (icon.isNotEmpty) 'icon': icon,
         if (group.isNotEmpty) 'group': group,
+        if (lastSeen > 0) 'last_seen': lastSeen,
       };
 
   static PairedPeer fromJson(Map<String, dynamic> j) => PairedPeer(
@@ -87,6 +92,7 @@ class PairedPeer {
         nick: (j['nick'] as String?) ?? '',
         icon: (j['icon'] as String?) ?? '',
         group: (j['group'] as String?) ?? '',
+        lastSeen: (j['last_seen'] as num?)?.toInt() ?? 0,
       );
 
   bool get controllable => os != 'Android' && os != 'iOS';
@@ -103,7 +109,26 @@ class Seen {
 
 /// A device's CPU, RAM and battery in percent; null when that device can't tell.
 class Stats {
-  const Stats({this.cpu, this.ram, this.battery, this.wake, this.macs = const []});
+  const Stats({
+    this.cpu,
+    this.ram,
+    this.battery,
+    this.wake,
+    this.macs = const [],
+    this.user,
+    this.uptime,
+    this.today,
+    this.total,
+  });
+
+  /// For PCs: who is signed in.
+  final String? user;
+
+  /// Seconds since the device last started.
+  final int? uptime;
+
+  /// For PCs: seconds used today, and in total since Nexus started counting.
+  final int? today, total;
 
   /// For PCs: its network card addresses, for Wake.
   final List<String> macs;
@@ -126,6 +151,10 @@ class Stats {
         battery: _num(m['battery']),
         wake: wake is String ? wake : null,
         macs: macs is List ? macs.map((e) => '$e').toList() : const [],
+        user: m['user'] is String ? m['user'] as String : null,
+        uptime: (m['uptime'] as num?)?.toInt(),
+        today: (m['today'] as num?)?.toInt(),
+        total: (m['total'] as num?)?.toInt(),
       );
     } catch (_) {
       return null;
@@ -1087,7 +1116,17 @@ class NexusNode extends ChangeNotifier {
     try {
       battery = (await _battery.batteryLevel).toDouble();
     } catch (_) {}
-    _statsJson = jsonEncode({'cpu': null, 'ram': ram, 'battery': battery, if (resting) 'idle': true});
+    int? uptime;
+    try {
+      uptime = double.parse((await File('/proc/uptime').readAsString()).split(' ').first).round();
+    } catch (_) {}
+    _statsJson = jsonEncode({
+      'cpu': null,
+      'ram': ram,
+      'battery': battery,
+      if (uptime != null) 'uptime': uptime,
+      if (resting) 'idle': true,
+    });
   }
 
   void addLog(String text) {
@@ -2230,13 +2269,23 @@ class NexusNode extends ChangeNotifier {
             await _savePeers();
           }
           checks[p.id] = Check.ok(rtt, stats);
+          // "Last seen" is written to disk about once a minute, not on every check.
+          final now = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+          if (now - p.lastSeen > 60) {
+            p.lastSeen = now;
+            await _savePeers();
+          }
           final addr = '$host:$port';
           if (p.lastAddr != addr) {
             p.lastAddr = addr;
             await _savePeers();
           }
         } on NexusError catch (e) {
-          if (wasOk) addLog('${p.name} stopped answering');
+          if (wasOk) {
+            addLog('${p.name} stopped answering');
+            p.lastSeen = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+            await _savePeers();
+          }
           checks[p.id] = Check.failed(e.message);
         } catch (e) {
           checks[p.id] = Check.failed('$e');
