@@ -149,7 +149,10 @@ class _HomePageState extends State<HomePage> {
     final pcs = members.where((p) => p.controllable).toList();
     final on = pcs.where(_isOnline).toList();
     final asleep = pcs.where((p) => !_isOnline(p) && p.macs.isNotEmpty).toList();
-    final onlineCount = members.where(_isOnline).length;
+    // This phone counts too when it is in the group.
+    final meIn = group.isNotEmpty && group == node.myGroup ? 1 : 0;
+    final onlineCount = members.where(_isOnline).length + meIn;
+    final total = members.length + meIn;
     return Padding(
       padding: const EdgeInsets.only(top: 6, bottom: 8),
       child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
@@ -165,7 +168,7 @@ class _HomePageState extends State<HomePage> {
           Text(group.isEmpty ? 'OTHER DEVICES' : group.toUpperCase(),
               style: const TextStyle(color: online, fontSize: 13, fontWeight: FontWeight.w800, letterSpacing: 1.2)),
           const SizedBox(width: 8),
-          if (members.isNotEmpty) Text('$onlineCount of ${members.length} online', style: const TextStyle(fontSize: 12)),
+          if (total > 0) Text('$onlineCount of $total online', style: const TextStyle(fontSize: 12)),
         ]),
         if (group.isNotEmpty && (on.isNotEmpty || asleep.isNotEmpty)) ...[
           const SizedBox(height: 6),
