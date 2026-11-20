@@ -10,6 +10,7 @@ import 'package:battery_plus/battery_plus.dart';
 import 'package:cryptography/cryptography.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter/widgets.dart' show AppLifecycleState, WidgetsBinding, WidgetsBindingObserver;
 import 'package:path_provider/path_provider.dart';
 
 import 'protocol.dart';
@@ -518,10 +519,11 @@ class NexusNode extends ChangeNotifier {
         _fsRoot = _dir;
       }
       await _loadPrefs();
-      await _sampleStats();
-      _timers.add(Timer.periodic(const Duration(seconds: 5), (_) => _sampleStats()));
-      _timers.add(Timer.periodic(const Duration(seconds: 5), (_) => _checkAll()));
-      _timers.add(Timer.periodic(const Duration(seconds: 1), (_) => notifyListeners()));
+      _life = _Life(this);
+      WidgetsBinding.instance.addObserver(_life!);
+      final state = WidgetsBinding.instance.lifecycleState;
+      // Started in the background (by Stay connected) when there is no screen yet.
+      _setResting(state == AppLifecycleState.resumed ? false : (state == null ? !_hasScreen() : true));
       addLog('Nexus started as $name');
     } catch (e) {
       startupError = 'Nexus could not start: $e';
@@ -530,8 +532,88 @@ class NexusNode extends ChangeNotifier {
     notifyListeners();
   }
 
+  /* ------------------------------------------------- saving battery */
+
+  /// True while Nexus isn't on screen. Nexus then "rests": it checks in about once a
+  /// minute instead of every few seconds and tells the PCs to check on it less often,
+  /// but still answers them right away. Opening Nexus wakes it up again.
+  bool resting = false;
+  Timer? _loop;
+  _Life? _life;
+  Future<void> Function()? _announce;
+
+  /// Whether Nexus has a visible screen right now (false when started at boot).
+  bool _hasScreen() => WidgetsBinding.instance.platformDispatcher.views.isNotEmpty &&
+      WidgetsBinding.instance.platformDispatcher.views.first.physicalSize.width > 0;
+
+  void _setResting(bool r) {
+    final first = _loop == null;
+    if (!first && r == resting) return;
+    resting = r;
+    _loop?.cancel();
+    var tick = 0;
+    if (r) {
+      _loop = Timer.periodic(const Duration(seconds: 60), (_) async {
+        await _sampleStats();
+        await _announce?.call();
+      });
+    } else {
+      _loop = Timer.periodic(const Duration(seconds: 1), (_) {
+        tick++;
+        notifyListeners();
+        if (tick % 2 == 0) _announce?.call();
+        if (tick % 5 == 0) {
+          _sampleStats();
+          _checkAll();
+        }
+      });
+    }
+    // Right away, so the PCs and this screen catch up at once.
+    _sampleStats().then((_) {
+      _announce?.call();
+      if (!r) _checkAll();
+    });
+    notifyListeners();
+  }
+
+  /* ------------------------------------------------- find my phone */
+
+  static const _bgChannel = MethodChannel('nexus/bg');
+
+  Future<Object?> _bg(String method, [Object? args]) async {
+    try {
+      return await _bgChannel.invokeMethod<Object?>(method, args);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// Rings at full volume (even on silent) so the phone can be found, or stops it.
+  Future<void> _ringServe(Conn c, Map<String, dynamic> m, String who) async {
+    final on = m['on'] != false;
+    await _bg(on ? 'ring' : 'stopRing');
+    addLog(on ? '$who is ringing this phone' : '$who stopped the ringing');
+    c.send({'op': 'ok'});
+    c.close();
+    notifyListeners();
+  }
+
+  Future<void> stopRinging() async => _bg('stopRing');
+
+  /// The Nexus screen is showing: stop resting.
+  void onScreen() => _setResting(false);
+
+  /* ------------------------------------------------- stay connected */
+
+  /// Whether "Stay connected" is on (Nexus stays reachable while closed).
+  Future<bool> keepAlive() async => await _bg('keepAlive') == true;
+  Future<void> setKeepAlive(bool on) async => _bg('setKeepAlive', on);
+  Future<void> openAutostart() async => _bg('openAutostart');
+
   @override
   void dispose() {
+    _loop?.cancel();
+    if (_life != null) WidgetsBinding.instance.removeObserver(_life!);
     for (final t in _timers) {
       t.cancel();
     }
@@ -948,7 +1030,7 @@ class NexusNode extends ChangeNotifier {
     try {
       battery = (await _battery.batteryLevel).toDouble();
     } catch (_) {}
-    _statsJson = jsonEncode({'cpu': null, 'ram': ram, 'battery': battery});
+    _statsJson = jsonEncode({'cpu': null, 'ram': ram, 'battery': battery, if (resting) 'idle': true});
   }
 
   void addLog(String text) {
@@ -1397,8 +1479,8 @@ class NexusNode extends ChangeNotifier {
       }
     }
 
+    _announce = announce;
     await announce();
-    _timers.add(Timer.periodic(const Duration(seconds: 2), (_) => announce()));
   }
 
   /// 255.255.255.255 plus x.y.z.255 for every IPv4 address (Dart cannot read netmasks; /24 is typical).
@@ -1587,6 +1669,8 @@ class NexusNode extends ChangeNotifier {
       await _clipServe(c, first, peer.name);
     } else if (first['op'] == 'clipfiles') {
       await _clipFilesServe(c, first, peer.name);
+    } else if (first['op'] == 'ring') {
+      await _ringServe(c, first, peer.name);
     } else if (first['op'] == 'auto') {
       c.send({'error': 'Automations run on computers, not on phones'});
       c.close();
@@ -2098,5 +2182,16 @@ class NexusNode extends ChangeNotifier {
       _checking = false;
       notifyListeners();
     }
+  }
+}
+
+/// Follows whether Nexus is on screen, to rest in the background.
+class _Life with WidgetsBindingObserver {
+  _Life(this.node);
+  final NexusNode node;
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    node._setResting(state != AppLifecycleState.resumed);
   }
 }

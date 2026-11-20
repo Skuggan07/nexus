@@ -234,6 +234,8 @@ class _HomePageState extends State<HomePage> {
       const SizedBox(height: 16),
       _PhoneSharingBox(node: node),
       const SizedBox(height: 12),
+      _StayConnectedBox(node: node),
+      const SizedBox(height: 12),
       _ClipboardBox(node: node),
       const SizedBox(height: 24),
       Center(
@@ -284,6 +286,8 @@ class _HomePageState extends State<HomePage> {
       _activity(),
       const SizedBox(height: 12),
       _PhoneSharingBox(node: node),
+      const SizedBox(height: 12),
+      _StayConnectedBox(node: node),
       const SizedBox(height: 12),
       _ClipboardBox(node: node),
       const SizedBox(height: 12),
@@ -2106,7 +2110,13 @@ class _PhoneSharingBoxState extends State<_PhoneSharingBox> with WidgetsBindingO
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state == AppLifecycleState.resumed) _refresh();
+    // Only check while Nexus is on screen, to save battery.
+    _poll?.cancel();
+    _poll = null;
+    if (state == AppLifecycleState.resumed) {
+      _refresh();
+      _poll = Timer.periodic(const Duration(seconds: 3), (_) => _refresh());
+    }
   }
 
   Future<void> _refresh() async {
@@ -2225,6 +2235,114 @@ class _PhoneSharingBoxState extends State<_PhoneSharingBox> with WidgetsBindingO
   }
 }
 
+/// "Stay connected": keeps the phone reachable while Nexus is closed (to ring it, send
+/// files, see its battery), plus the two Android settings that stop it being closed.
+class _StayConnectedBox extends StatefulWidget {
+  const _StayConnectedBox({required this.node});
+  final NexusNode node;
+
+  @override
+  State<_StayConnectedBox> createState() => _StayConnectedBoxState();
+}
+
+class _StayConnectedBoxState extends State<_StayConnectedBox> with WidgetsBindingObserver {
+  bool _on = false;
+  bool _battery = true;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    _refresh();
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) _refresh();
+  }
+
+  Future<void> _refresh() async {
+    final on = await widget.node.keepAlive();
+    final battery = await widget.node.batteryFree();
+    if (mounted && (on != _on || battery != _battery)) {
+      setState(() {
+        _on = on;
+        _battery = battery;
+      });
+    }
+  }
+
+  Future<void> _toggle(bool on) async {
+    setState(() => _on = on);
+    await widget.node.setKeepAlive(on);
+    if (on && !_battery) await widget.node.askBatteryFree();
+  }
+
+  Widget _step(String title, String text, bool done, String button, VoidCallback onPressed) {
+    return Padding(
+      padding: const EdgeInsets.only(top: 10),
+      child: Row(children: [
+        Icon(done ? Icons.check_circle : Icons.radio_button_unchecked, size: 18, color: done ? online : off),
+        const SizedBox(width: 8),
+        Expanded(
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Text(title, style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 13)),
+            Text(text, style: const TextStyle(fontSize: 12)),
+          ]),
+        ),
+        _SecondaryButton(label: button, onPressed: onPressed),
+      ]),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return _Box(
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        const Text('STAY CONNECTED', style: TextStyle(color: online, fontSize: 11, letterSpacing: 1.5)),
+        const SizedBox(height: 6),
+        Row(children: [
+          Expanded(
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              const Text('Reachable when Nexus is closed', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 15)),
+              Text(
+                _on
+                    ? 'On — your PCs can ring this phone, send it files and see its battery, even with the '
+                        'screen off. Nexus rests in the background and uses very little battery.'
+                    : 'Off — your PCs can only reach this phone while Nexus is open.',
+                style: const TextStyle(fontSize: 12),
+              ),
+            ]),
+          ),
+          Switch(value: _on, activeTrackColor: accent, onChanged: _toggle),
+        ]),
+        if (_on) ...[
+          _step(
+            'Battery: No restrictions',
+            _battery ? 'Done.' : 'Otherwise Android stops Nexus to save battery.',
+            _battery,
+            _battery ? 'Settings' : 'Allow',
+            () => widget.node.askBatteryFree(),
+          ),
+          _step(
+            'Autostart',
+            'On Xiaomi phones, turn on Nexus in the Autostart list so it starts again after a restart.',
+            false,
+            'Open',
+            () => widget.node.openAutostart(),
+          ),
+        ],
+      ]),
+    );
+  }
+}
+
 /// Shared clipboard: on/off, "Send clipboard now", "Send photos & files", and the last
 /// thing that arrived. Android only lets the app in front read the clipboard, so new
 /// text or pictures are sent when Nexus is opened (or with the button). Things from
@@ -2244,6 +2362,7 @@ class _ClipboardBoxState extends State<_ClipboardBox> with WidgetsBindingObserve
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    widget.node.onScreen();
     widget.node.checkClipboard();
     widget.node.takeShared();
   }
