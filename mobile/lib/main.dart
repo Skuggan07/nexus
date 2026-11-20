@@ -154,6 +154,14 @@ class _HomePageState extends State<HomePage> {
       padding: const EdgeInsets.only(top: 6, bottom: 8),
       child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
         Row(children: [
+          if (group.isNotEmpty)
+            GestureDetector(
+              onTap: () => _confirmDeleteGroup(group),
+              child: const Padding(
+                padding: EdgeInsets.only(right: 6),
+                child: Icon(Icons.delete_outline, size: 20, color: off),
+              ),
+            ),
           Text(group.isEmpty ? 'OTHER DEVICES' : group.toUpperCase(),
               style: const TextStyle(color: online, fontSize: 13, fontWeight: FontWeight.w800, letterSpacing: 1.2)),
           const SizedBox(width: 8),
@@ -201,6 +209,26 @@ class _HomePageState extends State<HomePage> {
         ],
       ]),
     );
+  }
+
+  Future<void> _confirmDeleteGroup(String group) async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: box,
+        title: Text('Delete the group $group?'),
+        content: const Text('The devices stay paired. They are just no longer in this group, on all your devices.'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel', style: TextStyle(color: white))),
+          FilledButton(
+            style: FilledButton.styleFrom(backgroundColor: const Color(0xFFB4413A)),
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Delete'),
+          ),
+        ],
+      ),
+    );
+    if (ok == true) await node.deleteGroup(group);
   }
 
   /// "This phone" inside its own group.

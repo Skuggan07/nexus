@@ -810,6 +810,27 @@ class NexusNode extends ChangeNotifier {
     c.close();
   }
 
+  /// Deletes a group: every device in it (this phone too) is taken out of it, on all devices.
+  Future<void> deleteGroup(String g) async {
+    final now = _nowSecs();
+    for (final p in paired.where((p) => p.group == g)) {
+      p
+        ..group = ''
+        ..labelsT = now;
+    }
+    if (myGroup == g) {
+      myGroup = '';
+      myLabelsT = now;
+      await _saveMyLabels();
+    }
+    try {
+      await _savePeers();
+    } catch (_) {}
+    addLog('Deleted the group $g — the devices in it are kept');
+    notifyListeners();
+    unawaited(_shareLabels());
+  }
+
   /// The groups in use, in order.
   List<String> get groups {
     final out = <String>[if (myGroup.isNotEmpty) myGroup];
