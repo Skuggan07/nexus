@@ -1639,9 +1639,9 @@ class ScreenViewPage extends StatefulWidget {
 
 /// Picture presets for screen viewing.
 enum ViewQuality {
-  smooth('Smooth', 15, 1280, 60),
-  balanced('Balanced', 12, 1920, 75),
-  sharp('Sharp', 8, 2560, 88);
+  smooth('Smooth · 60 fps', 60, 1600, 65),
+  balanced('Balanced · 30 fps', 30, 1920, 75),
+  sharp('Sharp · 30 fps', 30, 2560, 85);
 
   const ViewQuality(this.label, this.fps, this.maxW, this.quality);
   final String label;
