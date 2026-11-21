@@ -22,6 +22,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      # NASM lets the video encoder build its fast (SIMD) code: up to 3x faster.
+      - uses: ilammy/setup-nasm@v1
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: desktop
