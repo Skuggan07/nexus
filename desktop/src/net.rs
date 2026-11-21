@@ -495,6 +495,11 @@ fn fs_serve(mut c: Conn, me: &Identity, shared: &SharedState, id: String, nonce_
             "list" => fs_do_list(&mut c, &root, &v),
             "get" => fs_do_get(&mut c, &root, &v),
             "put" => fs_do_put(&mut c, &root, &v),
+            "find" => {
+                let q = v.get("q").and_then(|x| x.as_str()).unwrap_or("");
+                let (found, partial) = find_under(&root, q);
+                c.send_val(&serde_json::json!({ "found": found, "partial": partial }))
+            }
             "bye" => break,
             _ => Err("Unknown request".into()),
         };
@@ -1211,6 +1216,72 @@ where
 
 fn fs_path_arg<'a>(v: &'a serde_json::Value) -> &'a str {
     v.get("path").and_then(|x| x.as_str()).unwrap_or("")
+}
+
+/// A file or folder found by a search: its path under the shared folder ("/" between
+/// folders), name, size, and whether it is a folder.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Found {
+    pub path: String,
+    pub name: String,
+    #[serde(default)]
+    pub size: u64,
+    #[serde(default)]
+    pub dir: bool,
+}
+
+/// Looks for files and folders whose name contains `q` (any case) under `root`.
+/// Stops after 200 matches, 300 000 entries or 8 seconds; `true` means it stopped early.
+/// Skips hidden folders and the big app folders nobody searches.
+pub fn find_under(root: &Path, q: &str) -> (Vec<Found>, bool) {
+    let q = q.trim().to_lowercase();
+    let mut out = Vec::new();
+    if q.is_empty() {
+        return (out, false);
+    }
+    let started = Instant::now();
+    let mut seen = 0usize;
+    let mut stack: Vec<(PathBuf, String)> = vec![(root.to_path_buf(), String::new())];
+    while let Some((dir, rel)) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        for e in rd.flatten() {
+            seen += 1;
+            if out.len() >= 200 || seen > 300_000 || started.elapsed() > Duration::from_secs(8) {
+                return (out, true);
+            }
+            let name = e.file_name().to_string_lossy().into_owned();
+            let Ok(ft) = e.file_type() else { continue };
+            if ft.is_symlink() {
+                continue;
+            }
+            let path = if rel.is_empty() { name.clone() } else { format!("{rel}/{name}") };
+            if name.to_lowercase().contains(&q) {
+                let size = if ft.is_dir() { 0 } else { e.metadata().map(|m| m.len()).unwrap_or(0) };
+                out.push(Found { path: path.clone(), name: name.clone(), size, dir: ft.is_dir() });
+            }
+            let skip = name.starts_with('.')
+                || name.starts_with('$')
+                || matches!(name.as_str(), "AppData" | "node_modules" | "Application Data" | "Local Settings");
+            if ft.is_dir() && !skip {
+                stack.push((e.path(), path));
+            }
+        }
+    }
+    (out, false)
+}
+
+/// Searches a paired device's shared files for names containing `q`.
+pub fn fs_find(me: &Identity, peer: &PairedPeer, addr: SocketAddr, q: &str) -> Result<(Vec<Found>, bool), String> {
+    let mut c = fs_open(me, peer, addr)?;
+    c.send_val(&serde_json::json!({ "op": "find", "q": q }))?;
+    let v = c.recv_val()?;
+    if let Some(e) = fs_err(&v) {
+        return Err(e);
+    }
+    let found: Vec<Found> = serde_json::from_value(v.get("found").cloned().unwrap_or_default()).map_err(|_| unexpected())?;
+    let partial = v.get("partial").and_then(|x| x.as_bool()).unwrap_or(false);
+    let _ = c.send_val(&serde_json::json!({ "op": "bye" }));
+    Ok((found, partial))
 }
 
 fn fs_do_list(c: &mut Conn, root: &Path, v: &serde_json::Value) -> Result<(), String> {

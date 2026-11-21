@@ -196,6 +196,8 @@ pub struct NexusApp {
     confirm_group: Option<String>,
     /// The Update center window, while it's open.
     upd: Option<UpdCenter>,
+    /// The "Find a file" window, while it's open.
+    find: Option<FindFiles>,
     browser: Option<Browser>,
     screens: Vec<ScreenView>,
     fullscreen_on: bool,
@@ -260,6 +262,14 @@ enum Action {
     CloseMonitor(String),
     EndApp(String, String),
     OpenAutomation,
+    /// Open (true) or close "Find a file".
+    FindOpen(bool),
+    /// Search every online device for this name.
+    FindRun(String),
+    /// Open the file browser of a device at a folder.
+    OpenBrowserAt(String, Vec<String>),
+    /// Show a file of this PC in File Explorer.
+    ShowInExplorer(String),
     /// Open (true) or close the Update center.
     UpdateCenter(bool),
     /// Tick or untick a device for "Update selected".
@@ -294,6 +304,7 @@ impl NexusApp {
             mine: crate::labels::Labels::default(),
             confirm_group: None,
             upd: None,
+            find: None,
             browser: None,
             screens: Vec::new(),
             fullscreen_on: false,
@@ -545,6 +556,65 @@ impl NexusApp {
                 self.start_list();
             }
             Action::CloseBrowser => self.browser = None,
+            Action::OpenBrowserAt(id, path) => {
+                let name = lock(&self.shared)
+                    .paired
+                    .iter()
+                    .find(|p| p.id == id)
+                    .map(|p| p.name.clone())
+                    .unwrap_or_else(|| "Device".into());
+                self.browser = Some(Browser {
+                    peer_id: id,
+                    peer_name: name,
+                    path,
+                    upload_input: String::new(),
+                    inner: Arc::new(Mutex::new(BrowserInner::default())),
+                });
+                self.start_list();
+            }
+            Action::ShowInExplorer(rel) => {
+                let full = net::fs_root().join(rel.replace('/', "\\"));
+                let _ = std::process::Command::new("explorer.exe").arg(format!("/select,{}", full.display())).spawn();
+            }
+            Action::FindOpen(true) => {
+                if self.find.is_none() {
+                    self.find = Some(FindFiles::default());
+                }
+            }
+            Action::FindOpen(false) => self.find = None,
+            Action::FindRun(q) => {
+                let q = q.trim().to_string();
+                if q.is_empty() || self.find.is_none() {
+                    return;
+                }
+                let results = Arc::new(Mutex::new(Vec::new()));
+                // This PC, then every online device, each in its own thread.
+                let mine = (self.me.id.clone(), format!("{} (this PC)", self.my_label()));
+                {
+                    let (results, q) = (results.clone(), q.clone());
+                    std::thread::spawn(move || {
+                        let r = net::find_under(&net::fs_root(), &q);
+                        if let Ok(mut v) = results.lock() {
+                            v.push((mine.0, mine.1, Ok(r)));
+                        }
+                    });
+                }
+                for (peer, addr) in crate::clipboard::online_targets(&self.shared) {
+                    let (results, q, me) = (results.clone(), q.clone(), self.me.clone());
+                    std::thread::spawn(move || {
+                        let r = net::fs_find(&me, &peer, addr, &q);
+                        if let Ok(mut v) = results.lock() {
+                            v.push((peer.id.clone(), peer.label(), r));
+                        }
+                    });
+                }
+                let waiting_for = 1 + crate::clipboard::online_targets(&self.shared).len();
+                if let Some(f) = self.find.as_mut() {
+                    f.results = results;
+                    f.searched = q;
+                    f.waiting_for = waiting_for;
+                }
+            }
             Action::BrowseTo(path) => {
                 if let Some(b) = self.browser.as_mut() {
                     b.path = path;
@@ -1260,6 +1330,9 @@ impl eframe::App for NexusApp {
         if self.upd.is_some() {
             self.update_center(ctx, &rows, &mut actions);
         }
+        if self.find.is_some() {
+            self.find_window(ctx, &mut actions);
+        }
         // Keep this PC's display awake while any screen is being watched.
         if !self.screens.is_empty() {
             crate::screen::keep_display_awake(true);
@@ -1370,6 +1443,9 @@ impl NexusApp {
                         }
                         if ui.add(secondary("Updates")).clicked() {
                             actions.push(Action::UpdateCenter(true));
+                        }
+                        if ui.add(secondary("Find a file")).clicked() {
+                            actions.push(Action::FindOpen(true));
                         }
                         if online > 0 && ui.add(secondary("Watch all screens")).clicked() {
                             actions.push(Action::ViewAllScreens);
@@ -1486,6 +1562,10 @@ impl NexusApp {
                 ui.add_space(6.0);
                 if ui.add(secondary("Update center").min_size(Vec2::new(ui.available_width(), 32.0))).clicked() {
                     actions.push(Action::UpdateCenter(true));
+                }
+                ui.add_space(6.0);
+                if ui.add(secondary("Find a file").min_size(Vec2::new(ui.available_width(), 32.0))).clicked() {
+                    actions.push(Action::FindOpen(true));
                 }
                 ui.add_space(6.0);
                 ui.label(RichText::new("Coming next: Floating screen · Better wake").size(12.0));
@@ -1871,6 +1951,104 @@ impl NexusApp {
             });
         if !open {
             actions.push(Action::ShowDetails(None));
+        }
+    }
+
+    /// "Find a file": one search over this PC and every online device.
+    fn find_window(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
+        let my_id = self.me.id.clone();
+        let Some(f) = self.find.as_mut() else { return };
+        let results = f.results.lock().map(|v| v.clone()).unwrap_or_default();
+        let mut open = true;
+        egui::Window::new(RichText::new("Find a file on all devices").size(18.0).strong())
+            .collapsible(false)
+            .resizable(true)
+            .default_width(620.0)
+            .open(&mut open)
+            .frame(box_frame().inner_margin(Margin::same(20.0)))
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    let r = ui.add(
+                        egui::TextEdit::singleline(&mut f.query)
+                            .hint_text("Part of the file name, like holiday or .pdf")
+                            .desired_width(420.0),
+                    );
+                    let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    if ui.add(primary("Search")).clicked() || enter {
+                        actions.push(Action::FindRun(f.query.clone()));
+                    }
+                });
+                ui.label(
+                    RichText::new("Searches your home folder on each PC and the shared storage on phones.").size(12.0),
+                );
+                if f.searched.is_empty() {
+                    return;
+                }
+                if results.len() < f.waiting_for {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(format!("Searching… {} of {} devices answered", results.len(), f.waiting_for));
+                    });
+                }
+                ui.separator();
+                egui::ScrollArea::vertical().max_height(520.0).show(ui, |ui| {
+                    let mut any = false;
+                    for (id, name, r) in &results {
+                        ui.label(RichText::new(name).size(15.0).strong().color(ONLINE));
+                        match r {
+                            Err(e) => {
+                                ui.label(RichText::new(e).color(BAD));
+                            }
+                            Ok((hits, partial)) => {
+                                if hits.is_empty() {
+                                    ui.label("Nothing found");
+                                }
+                                for h in hits.iter().take(100) {
+                                    any = true;
+                                    ui.horizontal(|ui| {
+                                        ui.label(if h.dir { "📁" } else { "📄" });
+                                        ui.vertical(|ui| {
+                                            ui.label(RichText::new(&h.name).strong());
+                                            ui.label(
+                                                RichText::new(if h.dir {
+                                                    h.path.clone()
+                                                } else {
+                                                    format!("{} · {}", h.path, human_size(h.size))
+                                                })
+                                                .size(12.0),
+                                            );
+                                        });
+                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                            if *id == my_id {
+                                                if ui.add(secondary("Show in Explorer")).clicked() {
+                                                    actions.push(Action::ShowInExplorer(h.path.clone()));
+                                                }
+                                            } else if ui.add(secondary("Open folder")).clicked() {
+                                                let mut parts: Vec<String> = h.path.split('/').map(String::from).collect();
+                                                if !h.dir {
+                                                    parts.pop();
+                                                }
+                                                actions.push(Action::OpenBrowserAt(id.clone(), parts));
+                                            }
+                                        });
+                                    });
+                                }
+                                if *partial || hits.len() > 100 {
+                                    ui.label(
+                                        RichText::new("More may exist — type more of the name to narrow it down.").size(12.0),
+                                    );
+                                }
+                            }
+                        }
+                        ui.add_space(8.0);
+                    }
+                    if !any && results.len() >= f.waiting_for {
+                        ui.label(format!("No file called “{}” on your online devices.", f.searched));
+                    }
+                });
+            });
+        if !open {
+            actions.push(Action::FindOpen(false));
         }
     }
 
@@ -3250,6 +3428,18 @@ fn activity_lines(r: &Row) -> Vec<String> {
         out.push("Not seen online yet".into());
     }
     out
+}
+
+/// The "Find a file" window's state.
+#[derive(Default)]
+struct FindFiles {
+    query: String,
+    /// What the shown results were searched for.
+    searched: String,
+    /// How many devices were asked (this PC included).
+    waiting_for: usize,
+    /// Answers as they come in: (device id, name, matches and whether the list was cut short).
+    results: Arc<Mutex<Vec<(String, String, Result<(Vec<net::Found>, bool), String>)>>>,
 }
 
 /// The Update center's state while it's open.
