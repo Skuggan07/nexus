@@ -49,6 +49,31 @@ object NexusEngine {
                     result.success(true)
                 }
                 "autostart" -> result.success(autostart(app))
+                // "All files access": lets paired devices browse this phone's photos and
+                // downloads (Android 11 and newer).
+                "allFiles" -> result.success(
+                    Build.VERSION.SDK_INT >= 30 && android.os.Environment.isExternalStorageManager()
+                )
+                "askAllFiles" -> {
+                    if (Build.VERSION.SDK_INT >= 30) {
+                        val i = try {
+                            Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION, Uri.parse("package:${app.packageName}"))
+                        } catch (e: Exception) {
+                            Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)
+                        }
+                        try {
+                            app.startActivity(i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                        } catch (e: Exception) {
+                            try {
+                                app.startActivity(
+                                    Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                )
+                            } catch (e2: Exception) {
+                            }
+                        }
+                    }
+                    result.success(Build.VERSION.SDK_INT >= 30)
+                }
                 "openAutostart" -> {
                     openAutostart(app)
                     result.success(true)
