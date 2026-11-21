@@ -713,6 +713,39 @@ class NexusNode extends ChangeNotifier {
   String myNick = '', myIcon = '', myGroup = '';
   int myLabelsT = 0;
 
+  /// The device id of your main PC ('' = none), shared by all your devices, and
+  /// when it was last chosen (the newest choice wins everywhere).
+  String mainPc = '';
+  int mainT = 0;
+
+  bool isMain(PairedPeer p) => mainPc.isNotEmpty && p.id == mainPc;
+
+  /// The main PC, if it is paired with this phone.
+  PairedPeer? get mainPeer {
+    for (final p in paired) {
+      if (isMain(p)) return p;
+    }
+    return null;
+  }
+
+  /// Makes a PC the main PC (or, with on = false, makes no PC the main one).
+  Future<void> setMain(PairedPeer p, bool on) async {
+    if (on == isMain(p)) return;
+    mainPc = on ? p.id : '';
+    mainT = _nowSecs();
+    await _saveMyLabels();
+    notifyListeners();
+    unawaited(_shareLabels());
+  }
+
+  /// PCs with the main PC first.
+  List<PairedPeer> mainFirst(Iterable<PairedPeer> pcs) {
+    final l = pcs.toList();
+    final i = l.indexWhere(isMain);
+    if (i > 0) l.insert(0, l.removeAt(i));
+    return l;
+  }
+
   /// This phone's name as shown: its nickname and icon if it has them.
   String get myLabel {
     final n = myNick.isEmpty ? name : myNick;
@@ -728,6 +761,8 @@ class NexusNode extends ChangeNotifier {
         myIcon = (m['icon'] as String?) ?? '';
         myGroup = (m['group'] as String?) ?? '';
         myLabelsT = (m['t'] as num?)?.toInt() ?? 0;
+        mainPc = (m['main'] as String?) ?? '';
+        mainT = (m['main_t'] as num?)?.toInt() ?? 0;
       }
     } catch (_) {}
   }
@@ -735,7 +770,14 @@ class NexusNode extends ChangeNotifier {
   Future<void> _saveMyLabels() async {
     try {
       await File('${_dir.path}/labels.json')
-          .writeAsString(jsonEncode({'nick': myNick, 'icon': myIcon, 'group': myGroup, 't': myLabelsT}));
+          .writeAsString(jsonEncode({
+            'nick': myNick,
+            'icon': myIcon,
+            'group': myGroup,
+            't': myLabelsT,
+            'main': mainPc,
+            'main_t': mainT,
+          }));
     } catch (_) {}
   }
 
@@ -752,6 +794,7 @@ class NexusNode extends ChangeNotifier {
 
   List<Map<String, Object>> _labelsAll() => [
         {'id': id, 'nick': myNick, 'icon': myIcon, 'group': myGroup, 't': myLabelsT},
+        if (mainT > 0) {'id': 'main', 'main': mainPc, 't': mainT},
         for (final p in paired)
           if (p.labelsT > 0) {'id': p.id, 'nick': p.nick, 'icon': p.icon, 'group': p.group, 't': p.labelsT},
       ];
@@ -764,6 +807,14 @@ class NexusNode extends ChangeNotifier {
       if (e is! Map) continue;
       final eid = e['id'];
       final t = (e['t'] as num?)?.toInt() ?? 0;
+      if (eid == 'main') {
+        if (t > mainT) {
+          mainPc = text(e, 'main', 200);
+          mainT = t;
+          mine = true;
+        }
+        continue;
+      }
       if (eid == id) {
         if (t > myLabelsT) {
           myNick = text(e, 'nick', 40);

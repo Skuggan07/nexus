@@ -110,12 +110,69 @@ class _HomePageState extends State<HomePage> {
         ),
       );
 
-  /// Grouped devices first (by group), then the rest; by name inside each.
+  /// The main PC's group first, then other groups, then the rest; inside each the
+  /// main PC first, then by name.
   List<PairedPeer> get _sorted => [...node.paired]..sort((a, b) {
+      final mg = node.mainPeer?.group;
+      if (mg != null && a.group != b.group && (a.group == mg || b.group == mg)) return a.group == mg ? -1 : 1;
+      if (node.isMain(a) != node.isMain(b)) return node.isMain(a) ? -1 : 1;
       if (a.group.isEmpty != b.group.isEmpty) return a.group.isEmpty ? 1 : -1;
       final g = a.group.toLowerCase().compareTo(b.group.toLowerCase());
       return g != 0 ? g : a.name.toLowerCase().compareTo(b.name.toLowerCase());
     });
+
+  /// A device's name, with a star when it is the main PC.
+  String _title(PairedPeer p) => node.isMain(p) ? '★ ${p.name}' : p.name;
+
+  /// A box at the top for the main PC: open it, lock it, or wake it.
+  List<Widget> _mainPcBox(BuildContext context) {
+    final p = node.mainPeer;
+    if (p == null) return const [];
+    final st = node.statusOf(p);
+    final on = st.kind == StatusKind.verified || st.kind == StatusKind.checking;
+    final waking = node.waking.containsKey(p.id);
+    return [
+      _Box(
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          const Text('★ MAIN PC', style: TextStyle(color: online, fontSize: 11, letterSpacing: 1.5)),
+          Row(children: [
+            _Dot(color: _statusLine(st).$1),
+            const SizedBox(width: 10),
+            Expanded(child: Text(p.name, style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w700))),
+            Text(_statusLine(st).$2, style: const TextStyle(fontSize: 12)),
+          ]),
+          const SizedBox(height: 10),
+          if (on)
+            Row(children: [
+              Expanded(
+                flex: 2,
+                child: FilledButton(
+                  style: FilledButton.styleFrom(backgroundColor: accent, minimumSize: const Size(0, 46)),
+                  onPressed: () => Navigator.of(context)
+                      .push(MaterialPageRoute<void>(builder: (_) => ScreenViewPage(node: node, peer: p))),
+                  child: const Text('Open main PC', style: TextStyle(fontWeight: FontWeight.w800)),
+                ),
+              ),
+              const SizedBox(width: 8),
+              Expanded(child: _SecondaryButton(label: 'Lock', onPressed: () => node.sendCommand(p, 'lock'))),
+            ])
+          else if (p.macs.isNotEmpty)
+            SizedBox(
+              width: double.infinity,
+              child: FilledButton(
+                style: FilledButton.styleFrom(backgroundColor: accent, minimumSize: const Size(0, 46)),
+                onPressed: waking ? null : () => node.wake(p),
+                child: Text(waking ? 'Waking…' : 'Wake main PC', style: const TextStyle(fontWeight: FontWeight.w800)),
+              ),
+            )
+          else
+            const Text("It's off. Turn it on once with Nexus open on it, then Wake works from here.",
+                style: TextStyle(fontSize: 12, color: off)),
+        ]),
+      ),
+      const SizedBox(height: 14),
+    ];
+  }
 
   /// The sorted devices split by group ("" = no group, last).
   List<(String, List<PairedPeer>)> _grouped(List<PairedPeer> peers) {
@@ -289,6 +346,7 @@ class _HomePageState extends State<HomePage> {
     final nickCtl = TextEditingController(text: p?.nick ?? node.myNick);
     final groupCtl = TextEditingController(text: p?.group ?? node.myGroup);
     var icon = p?.icon ?? node.myIcon;
+    var isMain = p != null && node.isMain(p);
     final reported = p?.deviceName ?? node.name;
     final groups = node.groups;
     final ok = await showDialog<bool>(
@@ -332,6 +390,16 @@ class _HomePageState extends State<HomePage> {
                     ActionChip(label: Text(g), onPressed: () => setLocal(() => groupCtl.text = g)),
                   ActionChip(label: const Text('No group'), onPressed: () => setLocal(() => groupCtl.text = '')),
                 ]),
+              if (p != null && p.controllable)
+                SwitchListTile(
+                  contentPadding: EdgeInsets.zero,
+                  activeColor: accent,
+                  title: const Text('★ My main PC'),
+                  subtitle: const Text('Shown first everywhere, with Open, Lock and Wake buttons at the top.',
+                      style: TextStyle(fontSize: 12)),
+                  value: isMain,
+                  onChanged: (v) => setLocal(() => isMain = v),
+                ),
               const SizedBox(height: 8),
               const Text('Shared with all your paired devices, so they show the same names and groups.',
                   style: TextStyle(fontSize: 12)),
@@ -349,6 +417,7 @@ class _HomePageState extends State<HomePage> {
         await node.setMyLabels(nick: nickCtl.text, icon: icon, group: groupCtl.text);
       } else {
         await node.setLabels(p, nick: nickCtl.text, icon: icon, group: groupCtl.text);
+        if (p.controllable) await node.setMain(p, isMain);
       }
     }
     nickCtl.dispose();
@@ -468,6 +537,7 @@ class _HomePageState extends State<HomePage> {
       const SizedBox(height: 18),
       _pairButton('ADD DEVICE'),
       const SizedBox(height: 18),
+      ..._mainPcBox(context),
       Text('$_onlineCount of ${peers.length} devices online', style: const TextStyle(fontSize: 15)),
       const SizedBox(height: 10),
       if (peers.isEmpty)
@@ -487,7 +557,7 @@ class _HomePageState extends State<HomePage> {
             const SizedBox(width: 14),
             Expanded(
               child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                Text(p.name, style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w700)),
+                Text(_title(p), style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w700)),
                 Text(_statusLine(node.statusOf(p)).$2),
               ]),
             ),
@@ -543,6 +613,7 @@ class _HomePageState extends State<HomePage> {
       const SizedBox(height: 16),
       _pairButton('ALLOW PAIRING'),
       const SizedBox(height: 14),
+      ..._mainPcBox(context),
       Row(children: [
         Expanded(child: _Tile(label: 'ONLINE', value: _onlineCount)),
         const SizedBox(width: 8),
@@ -640,7 +711,7 @@ class _HomePageState extends State<HomePage> {
         Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
           Expanded(
             child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-              Text(p.name.toUpperCase(), style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w800, letterSpacing: .5)),
+              Text(_title(p).toUpperCase(), style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w800, letterSpacing: .5)),
               Text('${p.os}${addr != null ? ' · $addr' : ''}', style: const TextStyle(fontSize: 12.5)),
             ]),
           ),
@@ -4152,10 +4223,10 @@ class _DownloadPageState extends State<DownloadPage> {
     super.dispose();
   }
 
-  List<PairedPeer> get _pcs => node.paired.where((p) {
+  List<PairedPeer> get _pcs => node.mainFirst(node.paired.where((p) {
         final k = node.statusOf(p).kind;
         return p.controllable && (k == StatusKind.verified || k == StatusKind.checking);
-      }).toList();
+      }));
 
   /// A link already on the clipboard is filled in.
   Future<void> _pasteIfLink() async {
@@ -4178,15 +4249,19 @@ class _DownloadPageState extends State<DownloadPage> {
   Future<void> _start() async {
     final url = _url.text.trim();
     final pcs = _pcs;
-    if (pcs.isEmpty || !url.startsWith('http')) return;
-    final pc = pcs.firstWhere((p) => p.id == _target, orElse: () => pcs.first);
+    final pc = pcs.where((p) => p.id == _target).toList();
+    if (pc.isEmpty || !url.startsWith('http')) {
+      setState(() => _note = pc.isEmpty ? 'Pick a PC first' : 'Paste a link that starts with http');
+      return;
+    }
+    final target = pc.first;
     FocusScope.of(context).unfocus();
-    setState(() => _note = 'Asking ${pc.name}…');
+    setState(() => _note = 'Asking ${target.name}…');
     try {
-      final r = await node.ask(pc, {'op': 'download', 'url': url});
+      final r = await node.ask(target, {'op': 'download', 'url': url});
       final name = (r['job'] is Map) ? '${(r['job'] as Map)['name']}' : 'the file';
       setState(() {
-        _note = '${pc.name} is downloading $name';
+        _note = '${target.name} is downloading $name';
         _url.clear();
       });
     } catch (e) {
@@ -4205,7 +4280,7 @@ class _DownloadPageState extends State<DownloadPage> {
   @override
   Widget build(BuildContext context) {
     final pcs = _pcs;
-    if (_target == null || !pcs.any((p) => p.id == _target)) _target = pcs.isEmpty ? null : pcs.first.id;
+    if (_target != null && !pcs.any((p) => p.id == _target)) _target = null;
     return Scaffold(
       backgroundColor: bg,
       appBar: AppBar(backgroundColor: bg, foregroundColor: white, title: const Text('Download on a PC')),
@@ -4239,7 +4314,7 @@ class _DownloadPageState extends State<DownloadPage> {
         Wrap(spacing: 8, runSpacing: 8, children: [
           for (final p in pcs)
             ChoiceChip(
-              label: Text(p.name),
+              label: Text(node.isMain(p) ? '★ ${p.name}' : p.name),
               selected: _target == p.id,
               selectedColor: accent,
               onSelected: (_) => setState(() => _target = p.id),
