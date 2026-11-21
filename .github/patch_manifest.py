@@ -22,6 +22,7 @@ perms = [
     "CHANGE_NETWORK_STATE",
     "RECEIVE_BOOT_COMPLETED",
     "VIBRATE",
+    "MANAGE_EXTERNAL_STORAGE",
 ]
 add = "".join(
     f'\n    <uses-permission android:name="android.permission.{p}"/>'
