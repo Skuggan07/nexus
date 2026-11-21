@@ -84,6 +84,14 @@ class _HomePageState extends State<HomePage> {
     super.dispose();
   }
 
+  Widget _downloadButton(BuildContext context) => SizedBox(
+        width: double.infinity,
+        child: _SecondaryButton(
+          label: 'Download on a PC',
+          onPressed: () => Navigator.of(context).push(MaterialPageRoute<void>(builder: (_) => DownloadPage(node: node))),
+        ),
+      );
+
   Widget _findButton(BuildContext context) => SizedBox(
         width: double.infinity,
         child: _SecondaryButton(
@@ -496,6 +504,8 @@ class _HomePageState extends State<HomePage> {
       ],
       _findButton(context),
       const SizedBox(height: 10),
+      _downloadButton(context),
+      const SizedBox(height: 10),
       _updateCenterButton(context),
       const SizedBox(height: 10),
       for (final s in node.nearby) ...[
@@ -565,6 +575,8 @@ class _HomePageState extends State<HomePage> {
         const SizedBox(height: 12),
       ],
       _findButton(context),
+      const SizedBox(height: 12),
+      _downloadButton(context),
       const SizedBox(height: 12),
       _updateCenterButton(context),
       const SizedBox(height: 12),
@@ -4096,6 +4108,189 @@ class _FindPageState extends State<FindPage> {
           if (r.partial || r.found.length > 100)
             const Text('More may exist — type more of the name to narrow it down.', style: TextStyle(fontSize: 12)),
         ],
+      ]),
+    );
+  }
+}
+
+/* ------------------------------------------------------------ download on a PC */
+
+/// Paste a link, pick a PC, and that PC downloads it into its Downloads folder.
+class DownloadPage extends StatefulWidget {
+  const DownloadPage({super.key, required this.node});
+  final NexusNode node;
+
+  @override
+  State<DownloadPage> createState() => _DownloadPageState();
+}
+
+class _DownloadPageState extends State<DownloadPage> {
+  NexusNode get node => widget.node;
+  final _url = TextEditingController();
+  String? _target;
+  String? _note;
+  final _jobs = <String, List<Map<String, dynamic>>>{};
+  Timer? _poll;
+
+  @override
+  void initState() {
+    super.initState();
+    _pasteIfLink();
+    _refresh();
+    _poll = Timer.periodic(const Duration(seconds: 2), (_) => _refresh());
+  }
+
+  @override
+  void dispose() {
+    _poll?.cancel();
+    _url.dispose();
+    super.dispose();
+  }
+
+  List<PairedPeer> get _pcs => node.paired.where((p) {
+        final k = node.statusOf(p).kind;
+        return p.controllable && (k == StatusKind.verified || k == StatusKind.checking);
+      }).toList();
+
+  /// A link already on the clipboard is filled in.
+  Future<void> _pasteIfLink() async {
+    try {
+      final t = (await Clipboard.getData(Clipboard.kTextPlain))?.text?.trim() ?? '';
+      if (t.startsWith('http') && !t.contains(' ') && mounted) setState(() => _url.text = t);
+    } catch (_) {}
+  }
+
+  Future<void> _refresh() async {
+    for (final p in _pcs) {
+      try {
+        final r = await node.ask(p, {'op': 'downloads'});
+        _jobs[p.id] = ((r['jobs'] as List?) ?? const []).whereType<Map>().map((m) => m.cast<String, dynamic>()).toList();
+      } catch (_) {}
+    }
+    if (mounted) setState(() {});
+  }
+
+  Future<void> _start() async {
+    final url = _url.text.trim();
+    final pcs = _pcs;
+    if (pcs.isEmpty || !url.startsWith('http')) return;
+    final pc = pcs.firstWhere((p) => p.id == _target, orElse: () => pcs.first);
+    FocusScope.of(context).unfocus();
+    setState(() => _note = 'Asking ${pc.name}…');
+    try {
+      final r = await node.ask(pc, {'op': 'download', 'url': url});
+      final name = (r['job'] is Map) ? '${(r['job'] as Map)['name']}' : 'the file';
+      setState(() {
+        _note = '${pc.name} is downloading $name';
+        _url.clear();
+      });
+    } catch (e) {
+      setState(() => _note = 'Could not start: ${e is NexusError ? e.message : e}');
+    }
+    _refresh();
+  }
+
+  static String _size(num b) {
+    if (b >= 1 << 30) return '${(b / (1 << 30)).toStringAsFixed(1)} GB';
+    if (b >= 1 << 20) return '${(b / (1 << 20)).toStringAsFixed(1)} MB';
+    if (b >= 1 << 10) return '${(b / (1 << 10)).toStringAsFixed(0)} KB';
+    return '$b B';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final pcs = _pcs;
+    if (_target == null || !pcs.any((p) => p.id == _target)) _target = pcs.isEmpty ? null : pcs.first.id;
+    return Scaffold(
+      backgroundColor: bg,
+      appBar: AppBar(backgroundColor: bg, foregroundColor: white, title: const Text('Download on a PC')),
+      body: ListView(padding: const EdgeInsets.all(16), children: [
+        const Text("Paste a download link, pick the PC, and it downloads into that PC's Downloads folder."),
+        const SizedBox(height: 10),
+        TextField(
+          controller: _url,
+          style: const TextStyle(color: white),
+          keyboardType: TextInputType.url,
+          decoration: InputDecoration(
+            hintText: 'https://…',
+            filled: true,
+            fillColor: box,
+            isDense: true,
+            suffixIcon: IconButton(
+              icon: const Icon(Icons.content_paste, color: white),
+              onPressed: () async {
+                final t = (await Clipboard.getData(Clipboard.kTextPlain))?.text?.trim() ?? '';
+                if (mounted) setState(() => _url.text = t);
+              },
+            ),
+            enabledBorder:
+                OutlineInputBorder(borderSide: const BorderSide(color: line), borderRadius: BorderRadius.circular(10)),
+            focusedBorder:
+                OutlineInputBorder(borderSide: const BorderSide(color: accent), borderRadius: BorderRadius.circular(10)),
+          ),
+        ),
+        const SizedBox(height: 10),
+        if (pcs.isEmpty) const Text('No PC is online right now.', style: TextStyle(color: off)),
+        Wrap(spacing: 8, runSpacing: 8, children: [
+          for (final p in pcs)
+            ChoiceChip(
+              label: Text(p.name),
+              selected: _target == p.id,
+              selectedColor: accent,
+              onSelected: (_) => setState(() => _target = p.id),
+            ),
+        ]),
+        const SizedBox(height: 10),
+        SizedBox(
+          width: double.infinity,
+          child: FilledButton(
+            style: FilledButton.styleFrom(backgroundColor: accent, minimumSize: const Size(0, 48)),
+            onPressed: pcs.isEmpty ? null : _start,
+            child: const Text('Download'),
+          ),
+        ),
+        if (_note != null) ...[const SizedBox(height: 8), Text(_note!, style: const TextStyle(fontSize: 13))],
+        const SizedBox(height: 18),
+        for (final p in pcs)
+          if ((_jobs[p.id] ?? const []).isNotEmpty) ...[
+            Text(p.name, style: const TextStyle(color: online, fontWeight: FontWeight.w800, fontSize: 15)),
+            const SizedBox(height: 6),
+            for (final j in _jobs[p.id]!)
+              _Box(
+                child: Builder(builder: (_) {
+                  final done = (j['done'] as num?) ?? 0, total = (j['total'] as num?) ?? 0;
+                  final state = '${j['state']}';
+                  final info = switch (state) {
+                    'downloading' when total > 0 => '${_size(done)} of ${_size(total)} · ${(done * 100 / total).floor()}%',
+                    'downloading' => '${_size(done)} so far',
+                    'done' => 'Done · ${_size(done)} · in Downloads',
+                    'cancelled' => 'Cancelled',
+                    _ => 'Failed: ${j['error'] ?? ''}',
+                  };
+                  return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                    Row(children: [
+                      Expanded(child: Text('${j['name']}', style: const TextStyle(fontWeight: FontWeight.w700))),
+                      if (state == 'downloading')
+                        _SecondaryButton(
+                          label: 'Stop',
+                          onPressed: () async {
+                            try {
+                              await node.ask(p, {'op': 'dlcancel', 'id': j['id']});
+                            } catch (_) {}
+                            _refresh();
+                          },
+                        ),
+                    ]),
+                    Text(info, style: const TextStyle(fontSize: 12.5)),
+                    if (state == 'downloading' && total > 0) ...[
+                      const SizedBox(height: 6),
+                      LinearProgressIndicator(value: (done / total).toDouble(), color: accent, backgroundColor: line),
+                    ],
+                  ]);
+                }),
+              ),
+            const SizedBox(height: 12),
+          ],
       ]),
     );
   }

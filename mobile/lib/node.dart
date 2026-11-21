@@ -843,6 +843,19 @@ class NexusNode extends ChangeNotifier {
     }
   }
 
+  /// One request/answer with a PC over an encrypted link (downloads and the like).
+  Future<Map<String, dynamic>> ask(PairedPeer p, Map<String, Object?> req) async {
+    final c = await _screenOpen(p);
+    try {
+      c.send(req);
+      final r = await c.recv(const Duration(seconds: 30));
+      if (r['error'] != null) throw NexusError('${r['error']}');
+      return r;
+    } finally {
+      c.close();
+    }
+  }
+
   /// Windows Update on a PC: 'status', 'check' or 'install'. Returns its status
   /// (busy, waiting, titles, restart, ready, no_surprise, note).
   Future<Map<String, dynamic>> windowsUpdate(PairedPeer p, String action) async {
@@ -2106,6 +2119,9 @@ class NexusNode extends ChangeNotifier {
       c.close();
     } else if (first['op'] == 'wu') {
       c.send({'error': 'Phones have no Windows Update'});
+      c.close();
+    } else if (first['op'] == 'download' || first['op'] == 'downloads' || first['op'] == 'dlcancel') {
+      c.send({'error': 'Downloads run on PCs'});
       c.close();
     } else if (first['op'] == 'auto') {
       c.send({'error': 'Automations run on computers, not on phones'});
