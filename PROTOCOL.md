@@ -80,6 +80,7 @@ B refuses the connection unless A is a paired device and `mac` checks out. After
 - `{op:"list", path}` → `{entries:[{name, dir, size}]}` — `path` is relative to the device's shared root (its home folder on a PC); `..` is refused.
 - `{op:"get", path}` → `{size}`, then repeated `{data:"<hex>"}` frames (up to 256 KiB each) ending with `{eof:true}`.
 - `{op:"put", name}` → `{ok:true}`; A then sends `{data:"<hex>"}` frames ending with `{end:true}`; B replies `{saved}`. Uploads land in a "Nexus Inbox" folder under the shared root.
+- `{op:"find", q}` → `{found:[{path, name, size, dir}], partial}` — every file and folder under the shared root whose name contains `q` (any case). Stops after 200 matches, 300 000 entries or 8 seconds (`partial:true`). Hidden folders, AppData and node_modules are skipped. A phone shares its whole storage once Android's "All files access" is on for Nexus, otherwise only its Nexus folder.
 - `{op:"bye"}` closes the connection.
 
 Any request may be answered with `{error:"…"}`. File transfers are authenticated so only paired devices can reach them, and everything after the handshake is encrypted as described above. The maximum JSON line is raised to 8 MiB so a data frame (or a sharp screen frame) fits.
