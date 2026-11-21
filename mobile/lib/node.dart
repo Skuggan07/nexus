@@ -127,7 +127,11 @@ class Stats {
     this.today,
     this.total,
     this.build,
+    this.disk = const [],
   });
+
+  /// For PCs: drives that are almost full or failing (empty = all fine).
+  final List<String> disk;
 
   /// Which Nexus build it runs (null: older than build 43).
   final int? build;
@@ -167,6 +171,7 @@ class Stats {
         today: (m['today'] as num?)?.toInt(),
         total: (m['total'] as num?)?.toInt(),
         build: (m['build'] as num?)?.toInt(),
+        disk: m['disk'] is List ? (m['disk'] as List).map((e) => '$e').toList() : const [],
       );
     } catch (_) {
       return null;
@@ -840,6 +845,23 @@ class NexusNode extends ChangeNotifier {
       return 'Could not update ${p.name}: $e';
     } finally {
       c?.close();
+    }
+  }
+
+  /// Disk warnings already shown as a notification, by device id.
+  final _diskNotified = <String, Set<String>>{};
+
+  /// A notification the first time a PC reports a new disk warning.
+  Future<void> _diskAlert(PairedPeer p, List<String> disk) async {
+    final seen = _diskNotified.putIfAbsent(p.id, () => <String>{});
+    String key(String w) => w.split(' — ').first;
+    final fresh = disk.where((w) => !seen.contains(key(w))).toList();
+    seen
+      ..clear()
+      ..addAll(disk.map(key));
+    for (final w in fresh) {
+      addLog('Disk warning on ${p.name}: $w');
+      await _bg('notify', {'title': 'Disk warning on ${p.name}', 'text': w});
     }
   }
 
@@ -2625,6 +2647,7 @@ class NexusNode extends ChangeNotifier {
             await _savePeers();
           }
           checks[p.id] = Check.ok(rtt, stats);
+          unawaited(_diskAlert(p, stats?.disk ?? const []));
           // "Last seen" is written to disk about once a minute, not on every check.
           final now = DateTime.now().millisecondsSinceEpoch ~/ 1000;
           if (now - p.lastSeen > 60) {

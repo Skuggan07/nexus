@@ -663,6 +663,9 @@ class _HomePageState extends State<HomePage> {
           ),
         const SizedBox(height: 10),
         for (final line in _activityLines(p, st)) Text(line, style: const TextStyle(fontSize: 12.5)),
+        if (isOnline)
+          for (final w in st.stats?.disk ?? const <String>[])
+            Text('⚠ $w', style: const TextStyle(fontSize: 12.5, color: bad, fontWeight: FontWeight.w700)),
         const SizedBox(height: 6),
         Row(children: [
           Expanded(
@@ -771,6 +774,8 @@ class _HomePageState extends State<HomePage> {
               const SizedBox(height: 18),
               Text('${p.os}${addr != null ? ' · $addr' : ''}'),
               for (final line in _activityLines(p, st)) Text(line),
+              for (final w in st.stats?.disk ?? const <String>[])
+                Text('⚠ $w', style: const TextStyle(color: bad, fontWeight: FontWeight.w700)),
               Text('key ${_fp(p.id)}', style: const TextStyle(fontFamily: 'monospace', fontSize: 12)),
               const SizedBox(height: 16),
               ..._powerControls(context, p, st),
