@@ -209,6 +209,8 @@ pub struct NexusApp {
     auto_draft: Option<AutoDraft>,
     updates: update::Shared,
     update_hidden: bool,
+    /// The disk warnings showing when "Hide" was pressed (shown again when they change).
+    disk_hidden: Vec<String>,
     detailed: bool,
     tab: Tab,
     styled: bool,
@@ -329,6 +331,7 @@ impl NexusApp {
                 u
             },
             update_hidden: false,
+            disk_hidden: Vec::new(),
             detailed,
             tab: Tab::Devices,
             styled: false,
@@ -1267,6 +1270,7 @@ impl eframe::App for NexusApp {
             self.styled = true;
         }
         self.update_banner(ctx);
+        self.disk_banner(ctx);
 
         let (rows, nearby, window, session, log) = {
             let mut s = lock(&self.shared);
@@ -1817,6 +1821,40 @@ impl NexusApp {
         ctx.request_repaint_after(Duration::from_millis(200));
     }
 
+    /// A red strip at the top when any drive, here or on a paired device, is almost full or failing.
+    fn disk_banner(&mut self, ctx: &egui::Context) {
+        let mut all: Vec<String> = crate::disks::warnings().into_iter().map(|w| format!("This PC: {w}")).collect();
+        {
+            let s = lock(&self.shared);
+            for p in &s.paired {
+                if let Status::Verified { stats: Some(st), .. } = s.status(p) {
+                    all.extend(st.disk.iter().map(|w| format!("{}: {w}", p.label())));
+                }
+            }
+        }
+        let keys: Vec<String> = all.iter().map(|w| crate::disks::key(w).to_string()).collect();
+        if all.is_empty() || keys == self.disk_hidden {
+            return;
+        }
+        egui::TopBottomPanel::top("disk-banner")
+            .frame(egui::Frame::none().fill(Color32::from_rgb(90, 24, 20)).inner_margin(Margin::symmetric(16.0, 8.0)))
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label(RichText::new("⚠ Disk warning").strong().color(BAD));
+                        for w in &all {
+                            ui.label(RichText::new(w).strong());
+                        }
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.add(secondary("Hide")).clicked() {
+                            self.disk_hidden = keys.clone();
+                        }
+                    });
+                });
+            });
+    }
+
     fn settings(&self, ui: &mut egui::Ui) {
         box_frame().show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -1984,6 +2022,9 @@ impl NexusApp {
                 ui.label(format!("{} · {}", r.peer.os, r.addr.as_deref().unwrap_or("address unknown")));
                 for line in activity_lines(r) {
                     ui.label(line);
+                }
+                for w in disk_lines(r) {
+                    ui.label(RichText::new(format!("⚠ {w}")).color(BAD).strong());
                 }
                 ui.label(
                     RichText::new(format!("key {}", identity::fingerprint(&r.peer.public_key))).monospace().size(12.5),
@@ -3535,6 +3576,9 @@ fn device_card(
         for line in activity_lines(r) {
             ui.label(RichText::new(line).size(12.5));
         }
+        for w in disk_lines(r) {
+            ui.label(RichText::new(format!("⚠ {w}")).size(12.5).color(BAD).strong());
+        }
         ui.label(RichText::new(format!("key {}", identity::fingerprint(&r.peer.public_key))).monospace().size(12.0));
         power_controls(ui, r, confirm_cmd, actions);
         if online && ui.add(secondary("Browse files")).clicked() {
@@ -3574,6 +3618,11 @@ fn fmt_span(secs: u64) -> String {
     } else {
         "under a minute".into()
     }
+}
+
+/// The device's disk warnings, while it is online.
+fn disk_lines(r: &Row) -> Vec<String> {
+    stats_of(&r.status).map(|s| s.disk.clone()).unwrap_or_default()
 }
 
 /// Who is signed in, how long it's been used, how long it's been on — or when it was last seen.

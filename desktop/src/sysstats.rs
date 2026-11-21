@@ -42,6 +42,9 @@ pub struct Stats {
     /// Which Nexus build it runs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build: Option<u32>,
+    /// Disk warnings: drives that are almost full or failing (empty = all fine).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disk: Vec<String>,
 }
 
 /// How long this PC has been used.
@@ -127,6 +130,7 @@ pub fn start_sampler(dir: PathBuf) {
                 today: Some(usage.today),
                 total: Some(usage.total),
                 build: Some(crate::update::build()),
+                disk: crate::disks::warnings(),
             };
             if let (Ok(json), Ok(mut g)) = (serde_json::to_string(&s), slot().lock()) {
                 *g = Some(json);

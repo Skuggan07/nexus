@@ -6,6 +6,7 @@ mod audio;
 mod automation;
 mod clipboard;
 mod discovery;
+mod disks;
 mod downloads;
 mod identity;
 mod input;
@@ -56,6 +57,7 @@ fn main() -> eframe::Result<()> {
     }
     sysstats::start_sampler(dir.clone());
     wakeup::start();
+    disks::start(shared.clone());
     net::start_status_checker(me.clone(), shared.clone(), dir.clone());
     automation::start(me.clone(), shared.clone(), dir.clone());
     clipboard::start(me.clone(), shared.clone(), dir.clone());
