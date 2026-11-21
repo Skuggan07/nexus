@@ -192,6 +192,8 @@ pub struct NexusApp {
     edit_dev: Option<EditDev>,
     /// This PC's own nickname, icon and group (a copy, refreshed every frame).
     mine: crate::labels::Labels,
+    /// The main PC's device id ("" = none).
+    main_pc: String,
     /// A group waiting for "Yes, delete" to be pressed.
     confirm_group: Option<String>,
     /// The Update center window, while it's open.
@@ -314,6 +316,7 @@ impl NexusApp {
             details: None,
             edit_dev: None,
             mine: crate::labels::Labels::default(),
+            main_pc: String::new(),
             confirm_group: None,
             upd: None,
             find: None,
@@ -397,12 +400,15 @@ impl NexusApp {
             Action::AskCommand(id, cmd) => self.confirm_cmd = Some((id, cmd)),
             Action::EditDevice(id) if id == self.me.id => {
                 let l = lock(&self.shared).my_labels.clone();
+                let main = lock(&self.shared).main_pc == id;
                 self.edit_dev = Some(EditDev {
                     id,
                     reported: self.me.name.clone(),
                     nick: l.nick,
                     icon: l.icon,
                     group: l.group,
+                    pc: true,
+                    main,
                 });
             }
             Action::EditDevice(id) => {
@@ -413,6 +419,8 @@ impl NexusApp {
                     nick: p.nick.clone(),
                     icon: p.icon.clone(),
                     group: p.group.clone(),
+                    pc: !matches!(p.os.as_str(), "Android" | "iOS"),
+                    main: s.main_pc == p.id,
                 });
             }
             Action::CancelEdit => self.edit_dev = None,
@@ -458,6 +466,14 @@ impl NexusApp {
                         Err(err) => s.log(format!("Could not save: {err}")),
                     }
                     drop(s);
+                    if e.pc && crate::labels::set_main(&self.shared, &self.dir, &e.id, e.main) {
+                        let msg = if e.main {
+                            format!("{} is now your main PC", e.reported)
+                        } else {
+                            format!("{} is no longer your main PC", e.reported)
+                        };
+                        lock(&self.shared).log(msg);
+                    }
                     crate::labels::share_all(self.me.clone(), self.shared.clone());
                 }
             }
@@ -1295,15 +1311,33 @@ impl eframe::App for NexusApp {
                     addr: s.seen.get(&p.id).filter(|x| x.fresh()).map(|x| x.addr.to_string()).or_else(|| {
                         p.last_addr.as_deref().and_then(|a| a.parse::<SocketAddr>().ok()).map(|a| a.ip().to_string())
                     }),
-                    // Show your nickname and icon everywhere instead of its own name.
-                    peer: PairedPeer { name: p.label(), ..p.clone() },
+                    // Show your nickname and icon everywhere instead of its own name,
+                    // with a star on the main PC.
+                    peer: PairedPeer {
+                        name: if p.id == s.main_pc { format!("★ {}", p.label()) } else { p.label() },
+                        ..p.clone()
+                    },
                     wake_hint: s.wake_hints.get(&p.id).cloned(),
                     waking: s.waking.get(&p.id).map(|t| t.elapsed()),
                     wake_failed: s.wake_failed.contains(&p.id),
                 })
                 .collect();
-            // Grouped devices first (by group), then the rest; by name inside each.
-            rows.sort_by_key(|r| (r.peer.group.is_empty(), r.peer.group.to_lowercase(), r.peer.name.to_lowercase()));
+            // The main PC's group first, then other groups, then the rest; inside each the
+            // main PC first, then by name.
+            let main_group = if s.main_pc == self.me.id {
+                Some(s.my_labels.group.clone())
+            } else {
+                s.paired.iter().find(|p| p.id == s.main_pc).map(|p| p.group.clone())
+            };
+            rows.sort_by_key(|r| {
+                (
+                    main_group.as_ref().is_some_and(|g| *g != r.peer.group),
+                    r.peer.group.is_empty(),
+                    r.peer.group.to_lowercase(),
+                    r.peer.id != s.main_pc,
+                    r.peer.name.to_lowercase(),
+                )
+            });
             let mut nearby: Vec<Near> = s
                 .seen
                 .values()
@@ -1324,7 +1358,10 @@ impl eframe::App for NexusApp {
                 s.log.iter().take(80).map(|(t, m)| (t.elapsed().as_secs(), m.clone())).collect();
             (rows, nearby, window, s.pair.clone(), log)
         };
-        self.mine = lock(&self.shared).my_labels.clone();
+        (self.mine, self.main_pc) = {
+            let s = lock(&self.shared);
+            (s.my_labels.clone(), s.main_pc.clone())
+        };
         let online = rows.iter().filter(|r| is_online(&r.status)).count();
         let busy = session.is_some();
         let mut actions = Vec::new();
@@ -2081,6 +2118,10 @@ impl NexusApp {
                 pcs.push((r.peer.id.clone(), r.peer.name.clone()));
             }
         }
+        if let Some(i) = pcs.iter().position(|(id, _)| *id == self.main_pc) {
+            let m = pcs.remove(i);
+            pcs.insert(0, m);
+        }
         if !pcs.iter().any(|(id, _)| *id == w.target) {
             w.target = my_id.clone();
         }
@@ -2435,10 +2476,11 @@ impl NexusApp {
     /// This PC's name as shown: its nickname and icon if it has them.
     fn my_label(&self) -> String {
         let name = if self.mine.nick.is_empty() { self.me.name.as_str() } else { self.mine.nick.as_str() };
+        let star = if self.main_pc == self.me.id { "★ " } else { "" };
         if self.mine.icon.is_empty() {
-            name.to_string()
+            format!("{star}{name}")
         } else {
-            format!("{} {name}", self.mine.icon)
+            format!("{star}{} {name}", self.mine.icon)
         }
     }
 
@@ -2525,6 +2567,11 @@ impl NexusApp {
                             e.group.clear();
                         }
                     });
+                }
+                if e.pc {
+                    ui.add_space(8.0);
+                    ui.checkbox(&mut e.main, RichText::new("★ My main PC").strong());
+                    ui.label(RichText::new("Shown first everywhere, and at the top of the lists of PCs.").size(12.0));
                 }
                 ui.add_space(12.0);
                 ui.horizontal(|ui| {
@@ -3773,6 +3820,9 @@ struct EditDev {
     nick: String,
     icon: String,
     group: String,
+    /// Whether it is a PC (only PCs can be the main PC), and whether it is the main PC.
+    pc: bool,
+    main: bool,
 }
 
 /// Rows split by group, in order ("" = no group, last). Rows are already sorted.

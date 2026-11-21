@@ -128,6 +128,10 @@ pub struct Shared {
     pub wake_failed: std::collections::HashSet<String>,
     /// This PC's own nickname, icon and group (shared with paired devices).
     pub my_labels: crate::labels::Labels,
+    /// Which device is your main PC ("" = none), shared by all your devices, and when
+    /// it was last chosen (the newest choice wins).
+    pub main_pc: String,
+    pub main_t: u64,
     next_session: u64,
 }
 
@@ -148,6 +152,8 @@ impl Shared {
             waking: HashMap::new(),
             wake_failed: std::collections::HashSet::new(),
             my_labels: crate::labels::Labels::default(),
+            main_pc: String::new(),
+            main_t: 0,
             next_session: 1,
         }
     }

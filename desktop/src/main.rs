@@ -43,6 +43,12 @@ fn main() -> eframe::Result<()> {
     labels::upgrade(&mut peers);
     let shared = Arc::new(Mutex::new(state::Shared::new(peers)));
     state::lock(&shared).my_labels = labels::load_mine(&dir);
+    {
+        let (main_pc, main_t) = labels::load_main(&dir);
+        let mut s = state::lock(&shared);
+        s.main_pc = main_pc;
+        s.main_t = main_t;
+    }
     state::lock(&shared).allow_control = store::load_allow_control(&dir);
     state::lock(&shared).share_clipboard = store::load_share_clipboard(&dir);
 

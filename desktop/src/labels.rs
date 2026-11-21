@@ -40,6 +40,42 @@ pub fn save_mine(dir: &Path, l: &Labels) -> Result<(), String> {
     std::fs::rename(&tmp, dir.join("labels.json")).map_err(|e| e.to_string())
 }
 
+/// Which device is the main PC, and when that was chosen.
+pub fn load_main(dir: &Path) -> (String, u64) {
+    std::fs::read_to_string(dir.join("main.json"))
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .map(|v| (v["main"].as_str().unwrap_or("").to_string(), v["t"].as_u64().unwrap_or(0)))
+        .unwrap_or_default()
+}
+
+pub fn save_main(dir: &Path, main: &str, t: u64) -> Result<(), String> {
+    let text = serde_json::json!({ "main": main, "t": t }).to_string();
+    let tmp = dir.join("main.json.tmp");
+    std::fs::write(&tmp, text).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, dir.join("main.json")).map_err(|e| e.to_string())
+}
+
+/// Makes a device the main PC (or, with on = false and it being the main PC, none).
+/// True if anything changed; the caller shares it with share_all.
+pub fn set_main(shared: &SharedState, dir: &Path, id: &str, on: bool) -> bool {
+    let mut s = lock(shared);
+    let new = if on {
+        id.to_string()
+    } else if s.main_pc == id {
+        String::new()
+    } else {
+        return false;
+    };
+    if new == s.main_pc {
+        return false;
+    }
+    s.main_pc = new;
+    s.main_t = store::now_unix();
+    let _ = save_main(dir, &s.main_pc, s.main_t);
+    true
+}
+
 /// Labels made before they were shared have no time yet; give them the oldest
 /// possible one so they still reach devices that have none.
 pub fn upgrade(peers: &mut [PairedPeer]) {
@@ -58,6 +94,9 @@ fn entry(id: &str, nick: &str, icon: &str, group: &str, t: u64) -> serde_json::V
 pub fn all(me: &Identity, shared: &SharedState) -> Vec<serde_json::Value> {
     let s = lock(shared);
     let mut out = vec![entry(&me.id, &s.my_labels.nick, &s.my_labels.icon, &s.my_labels.group, s.my_labels.t)];
+    if s.main_t > 0 {
+        out.push(serde_json::json!({ "id": "main", "main": s.main_pc, "t": s.main_t }));
+    }
     for p in &s.paired {
         if p.labels_t > 0 {
             out.push(entry(&p.id, &p.nick, &p.icon, &p.group, p.labels_t));
@@ -73,10 +112,18 @@ fn text(v: &serde_json::Value, k: &str, max: usize) -> String {
 /// Takes in labels from another device; newer ones replace ours. True if anything changed.
 pub fn merge(me: &Identity, shared: &SharedState, dir: &Path, entries: &[serde_json::Value]) -> bool {
     let mut s = lock(shared);
-    let (mut mine, mut peers) = (false, false);
+    let (mut mine, mut peers, mut main) = (false, false, false);
     for e in entries {
         let Some(id) = e.get("id").and_then(|x| x.as_str()) else { continue };
         let t = e.get("t").and_then(|x| x.as_u64()).unwrap_or(0);
+        if id == "main" {
+            if t > s.main_t {
+                s.main_pc = text(e, "main", 200);
+                s.main_t = t;
+                main = true;
+            }
+            continue;
+        }
         let (nick, icon, group) = (text(e, "nick", 40), text(e, "icon", 8), text(e, "group", 30));
         if id == me.id {
             if t > s.my_labels.t {
@@ -99,7 +146,10 @@ pub fn merge(me: &Identity, shared: &SharedState, dir: &Path, entries: &[serde_j
     if peers {
         let _ = store::save_peers(dir, &s.paired);
     }
-    mine || peers
+    if main {
+        let _ = save_main(dir, &s.main_pc, s.main_t);
+    }
+    mine || peers || main
 }
 
 /// Sends our labels to one device.
