@@ -44,6 +44,10 @@ object NexusEngine {
                     result.success(true)
                 }
                 "keepAliveRunning" -> result.success(KeepAliveService.running)
+                "notify" -> {
+                    notify(app, call.argument<String>("title") ?: "Nexus", call.argument<String>("text") ?: "")
+                    result.success(true)
+                }
                 "autostart" -> result.success(autostart(app))
                 "openAutostart" -> {
                     openAutostart(app)
@@ -72,6 +76,32 @@ object NexusEngine {
             (check.invoke(ops, 10008, Process.myUid(), ctx.packageName) as Int) == AppOpsManager.MODE_ALLOWED
         } catch (e: Throwable) {
             null
+        }
+    }
+
+    /** A plain notification that opens Nexus when tapped. */
+    private fun notify(ctx: Context, title: String, text: String) {
+        try {
+            val nm = ctx.getSystemService(Context.NOTIFICATION_SERVICE) as android.app.NotificationManager
+            if (Build.VERSION.SDK_INT >= 26) {
+                nm.createNotificationChannel(
+                    android.app.NotificationChannel("nexus_updates", "Updates", android.app.NotificationManager.IMPORTANCE_DEFAULT)
+                )
+            }
+            val open = android.app.PendingIntent.getActivity(
+                ctx, 5, Intent(ctx, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+                android.app.PendingIntent.FLAG_IMMUTABLE,
+            )
+            val b = if (Build.VERSION.SDK_INT >= 26) android.app.Notification.Builder(ctx, "nexus_updates") else {
+                @Suppress("DEPRECATION")
+                android.app.Notification.Builder(ctx)
+            }
+            nm.notify(
+                4715,
+                b.setContentTitle(title).setContentText(text).setSmallIcon(android.R.drawable.stat_sys_download_done)
+                    .setContentIntent(open).setAutoCancel(true).build(),
+            )
+        } catch (e: Exception) {
         }
     }
 
