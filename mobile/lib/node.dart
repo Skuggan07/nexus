@@ -549,6 +549,7 @@ class NexusNode extends ChangeNotifier {
   ServerSocket? _server;
   RawDatagramSocket? _udp;
   Directory? _fsRoot; // the folder this phone shares with paired devices
+  Directory? _appRoot; // Nexus's own folder, shared when "All files access" is off
 
   /* ------------------------------------------------------------ startup */
 
@@ -586,6 +587,8 @@ class NexusNode extends ChangeNotifier {
       } catch (_) {
         _fsRoot = _dir;
       }
+      _appRoot = _fsRoot;
+      await _refreshRoot();
       await _loadPrefs();
       await _loadMyLabels();
       _life = _Life(this);
@@ -1908,6 +1911,115 @@ class NexusNode extends ChangeNotifier {
     c.send({'t': 'command_ack', 'ok': false, 'message': message, 'mac': toHex(await commandAckMac(ss, nonce, message))});
   }
 
+  /* ---------------------------------------------- files on every device */
+
+  /// Whether paired devices can browse this phone's photos, downloads and folders
+  /// (Android's "All files access" for Nexus).
+  Future<bool> allFilesShared() async => await _bg('allFiles') == true;
+
+  /// Opens Android's "All files access" switch for Nexus.
+  Future<void> askAllFiles() async => _bg('askAllFiles');
+
+  /// The whole phone storage when "All files access" is on; otherwise Nexus's own folder.
+  Future<void> _refreshRoot() async {
+    if (await allFilesShared()) {
+      final storage = Directory('/storage/emulated/0');
+      if (await storage.exists()) {
+        _fsRoot = storage;
+        return;
+      }
+    }
+    if (_appRoot != null) _fsRoot = _appRoot;
+  }
+
+  /// Files and folders whose name contains [q] under [root] (at most 200, 8 seconds).
+  /// Returns the matches and whether the search stopped early.
+  static Future<(List<Map<String, Object?>>, bool)> _findUnder(String root, String q) async {
+    final needle = q.trim().toLowerCase();
+    final out = <Map<String, Object?>>[];
+    if (needle.isEmpty) return (out, false);
+    final started = DateTime.now();
+    var seen = 0;
+    final stack = <(String, String)>[(root, '')];
+    while (stack.isNotEmpty) {
+      final (dir, rel) = stack.removeLast();
+      List<FileSystemEntity> items;
+      try {
+        items = await Directory(dir).list(followLinks: false).toList();
+      } catch (_) {
+        continue;
+      }
+      for (final e in items) {
+        seen++;
+        if (out.length >= 200 || seen > 300000 || DateTime.now().difference(started).inSeconds > 8) {
+          return (out, true);
+        }
+        final name = e.path.split('/').last;
+        final path = rel.isEmpty ? name : '$rel/$name';
+        final isDir = e is Directory;
+        if (name.toLowerCase().contains(needle)) {
+          var size = 0;
+          if (!isDir) {
+            try {
+              size = await File(e.path).length();
+            } catch (_) {}
+          }
+          out.add({'path': path, 'name': name, 'size': size, 'dir': isDir});
+        }
+        // Android/data and Android/obb can't be read anyway; hidden folders aren't searched.
+        if (isDir && !name.startsWith('.') && !(rel.isEmpty && name == 'Android')) stack.add((e.path, path));
+      }
+    }
+    return (out, false);
+  }
+
+  Future<void> _fsFind(Conn c, String q) async {
+    final root = _fsRoot;
+    if (root == null) throw NexusError('Nothing is shared');
+    final (found, partial) = await _findUnder(root.path, q);
+    c.send({'found': found, 'partial': partial});
+  }
+
+  /// Searches a paired device's shared files.
+  Future<(List<Map<String, dynamic>>, bool)> fsFind(PairedPeer p, String q) async {
+    final c = await _fsOpen(p);
+    try {
+      c.send({'op': 'find', 'q': q});
+      final v = await c.recv(const Duration(seconds: 30));
+      if (v['error'] != null) throw NexusError('${v['error']}');
+      final list = (v['found'] as List?)?.whereType<Map>().map((m) => m.cast<String, dynamic>()).toList() ?? [];
+      c.send({'op': 'bye'});
+      return (list, v['partial'] == true);
+    } finally {
+      c.close();
+    }
+  }
+
+  /// Searches this phone (if "All files access" is on) and every online device at once.
+  /// Calls [onResult] as each device answers: (device or null for this phone, matches,
+  /// stopped early, error).
+  Future<int> findEverywhere(
+    String q,
+    void Function(PairedPeer? device, List<Map<String, dynamic>> found, bool partial, String? error) onResult,
+  ) async {
+    final targets = paired.where((p) {
+      final k = statusOf(p).kind;
+      return k == StatusKind.verified || k == StatusKind.checking;
+    }).toList();
+    final mine = await allFilesShared();
+    for (final p in targets) {
+      fsFind(p, q).then((r) => onResult(p, r.$1, r.$2, null), onError: (Object e) {
+        onResult(p, const [], false, e is NexusError ? e.message : '$e');
+      });
+    }
+    if (mine) {
+      await _refreshRoot();
+      final (found, partial) = await _findUnder(_fsRoot!.path, q);
+      onResult(null, found.map((m) => m.cast<String, dynamic>()).toList(), partial, null);
+    }
+    return targets.length + (mine ? 1 : 0);
+  }
+
   /// Joins a client-supplied relative path under the shared root, refusing anything that escapes it.
   String? _fsResolve(String rel) {
     final root = _fsRoot;
@@ -2176,6 +2288,7 @@ class NexusNode extends ChangeNotifier {
     }
     final (c2s, s2c) = await linkKeys(ss, nonceC, nonceS);
     c.secure(s2c, c2s);
+    await _refreshRoot();
     addLog('${peer.name} opened a file connection');
     notifyListeners();
     while (true) {
@@ -2188,6 +2301,8 @@ class NexusNode extends ChangeNotifier {
           await _fsGet(c, '${v['path'] ?? ''}');
         } else if (op == 'put') {
           await _fsPut(c, '${v['name'] ?? ''}');
+        } else if (op == 'find') {
+          await _fsFind(c, '${v['q'] ?? ''}');
         } else if (op == 'bye') {
           return;
         } else {

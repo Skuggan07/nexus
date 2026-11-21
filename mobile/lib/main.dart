@@ -84,6 +84,14 @@ class _HomePageState extends State<HomePage> {
     super.dispose();
   }
 
+  Widget _findButton(BuildContext context) => SizedBox(
+        width: double.infinity,
+        child: _SecondaryButton(
+          label: 'Find a file on all devices',
+          onPressed: () => Navigator.of(context).push(MaterialPageRoute<void>(builder: (_) => FindPage(node: node))),
+        ),
+      );
+
   Widget _updateCenterButton(BuildContext context) => SizedBox(
         width: double.infinity,
         child: _SecondaryButton(
@@ -486,6 +494,8 @@ class _HomePageState extends State<HomePage> {
         _watchAllButton(context),
         const SizedBox(height: 10),
       ],
+      _findButton(context),
+      const SizedBox(height: 10),
       _updateCenterButton(context),
       const SizedBox(height: 10),
       for (final s in node.nearby) ...[
@@ -554,6 +564,8 @@ class _HomePageState extends State<HomePage> {
         _watchAllButton(context),
         const SizedBox(height: 12),
       ],
+      _findButton(context),
+      const SizedBox(height: 12),
       _updateCenterButton(context),
       const SizedBox(height: 12),
       _activity(),
@@ -1212,9 +1224,12 @@ class _GaugePainter extends CustomPainter {
 
 /// Browse a paired device's files: navigate folders, download, and upload.
 class FileBrowserPage extends StatefulWidget {
-  const FileBrowserPage({super.key, required this.node, required this.peer});
+  const FileBrowserPage({super.key, required this.node, required this.peer, this.initialPath = const []});
   final NexusNode node;
   final PairedPeer peer;
+
+  /// The folder to open first (path parts), for example from a search result.
+  final List<String> initialPath;
 
   @override
   State<FileBrowserPage> createState() => _FileBrowserPageState();
@@ -1235,6 +1250,7 @@ class _FileBrowserPageState extends State<FileBrowserPage> {
   @override
   void initState() {
     super.initState();
+    _path.addAll(widget.initialPath);
     _load();
   }
 
@@ -2380,6 +2396,7 @@ class _PhoneSharingBoxState extends State<_PhoneSharingBox> with WidgetsBindingO
   bool _control = false;
   bool _sound = false;
   bool _battery = true;
+  bool _files = false;
   bool _busy = false;
   Timer? _poll;
 
@@ -2415,12 +2432,15 @@ class _PhoneSharingBoxState extends State<_PhoneSharingBox> with WidgetsBindingO
     final control = await widget.node.controlEnabled();
     final sound = await widget.node.soundAllowed();
     final battery = await widget.node.batteryFree();
-    if (mounted && (sharing != _sharing || control != _control || sound != _sound || battery != _battery)) {
+    final files = await widget.node.allFilesShared();
+    if (mounted &&
+        (sharing != _sharing || control != _control || sound != _sound || battery != _battery || files != _files)) {
       setState(() {
         _sharing = sharing;
         _control = control;
         _sound = sound;
         _battery = battery;
+        _files = files;
       });
     }
   }
@@ -2520,6 +2540,25 @@ class _PhoneSharingBoxState extends State<_PhoneSharingBox> with WidgetsBindingO
               label: 'Allow',
               onPressed: () => widget.node.askBatteryFree(),
             ),
+        ]),
+        const SizedBox(height: 10),
+        Row(children: [
+          Expanded(
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              const Text("Let paired devices browse this phone's files",
+                  style: TextStyle(fontWeight: FontWeight.w700, fontSize: 15)),
+              Text(
+                _files
+                    ? 'On — your PCs can browse, search and download your photos, downloads and folders.'
+                    : 'Off — PCs only see the Nexus folder. Tap Allow, then turn on Nexus.',
+                style: TextStyle(fontSize: 12, color: _files ? online : off),
+              ),
+            ]),
+          ),
+          _SecondaryButton(
+            label: _files ? 'Settings' : 'Allow',
+            onPressed: () => widget.node.askAllFiles(),
+          ),
         ]),
       ]),
     );
@@ -3922,6 +3961,142 @@ class _UpdateCenterPageState extends State<UpdateCenterPage> {
           ]);
         },
       ),
+    );
+  }
+}
+
+/* ------------------------------------------------------------ find a file */
+
+/// One search over this phone and every online device.
+class FindPage extends StatefulWidget {
+  const FindPage({super.key, required this.node});
+  final NexusNode node;
+
+  @override
+  State<FindPage> createState() => _FindPageState();
+}
+
+class _FindResult {
+  _FindResult(this.device, this.found, this.partial, this.error);
+  final PairedPeer? device; // null = this phone
+  final List<Map<String, dynamic>> found;
+  final bool partial;
+  final String? error;
+}
+
+class _FindPageState extends State<FindPage> {
+  final _q = TextEditingController();
+  final _results = <_FindResult>[];
+  int _asked = 0;
+  String _searched = '';
+  int _run = 0;
+
+  @override
+  void dispose() {
+    _q.dispose();
+    super.dispose();
+  }
+
+  Future<void> _search() async {
+    final q = _q.text.trim();
+    if (q.isEmpty) return;
+    FocusScope.of(context).unfocus();
+    final run = ++_run;
+    setState(() {
+      _results.clear();
+      _searched = q;
+      _asked = -1;
+    });
+    final asked = await widget.node.findEverywhere(q, (d, found, partial, err) {
+      if (!mounted || run != _run) return;
+      setState(() => _results.add(_FindResult(d, found, partial, err)));
+    });
+    if (mounted && run == _run) setState(() => _asked = asked);
+  }
+
+  static String _size(int b) {
+    if (b >= 1 << 30) return '${(b / (1 << 30)).toStringAsFixed(1)} GB';
+    if (b >= 1 << 20) return '${(b / (1 << 20)).toStringAsFixed(1)} MB';
+    if (b >= 1 << 10) return '${(b / (1 << 10)).toStringAsFixed(0)} KB';
+    return '$b B';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final done = _asked >= 0 && _results.length >= _asked;
+    final total = _results.fold<int>(0, (n, r) => n + r.found.length);
+    return Scaffold(
+      backgroundColor: bg,
+      appBar: AppBar(backgroundColor: bg, foregroundColor: white, title: const Text('Find a file')),
+      body: ListView(padding: const EdgeInsets.all(16), children: [
+        Row(children: [
+          Expanded(
+            child: TextField(
+              controller: _q,
+              autofocus: true,
+              style: const TextStyle(color: white),
+              textInputAction: TextInputAction.search,
+              onSubmitted: (_) => _search(),
+              decoration: InputDecoration(
+                hintText: 'Part of the name, like holiday or .pdf',
+                filled: true,
+                fillColor: box,
+                isDense: true,
+                enabledBorder:
+                    OutlineInputBorder(borderSide: const BorderSide(color: line), borderRadius: BorderRadius.circular(10)),
+                focusedBorder:
+                    OutlineInputBorder(borderSide: const BorderSide(color: accent), borderRadius: BorderRadius.circular(10)),
+              ),
+            ),
+          ),
+          const SizedBox(width: 8),
+          _SecondaryButton(label: 'Search', onPressed: _search),
+        ]),
+        const SizedBox(height: 6),
+        const Text('Searches your PCs and, if allowed, this phone.', style: TextStyle(fontSize: 12)),
+        if (_searched.isNotEmpty && !done) ...[
+          const SizedBox(height: 12),
+          Row(children: [
+            const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2, color: accent)),
+            const SizedBox(width: 10),
+            Text(_asked < 0 ? 'Searching…' : 'Searching… ${_results.length} of $_asked devices answered'),
+          ]),
+        ],
+        if (done && total == 0) ...[
+          const SizedBox(height: 12),
+          Text(_asked == 0 ? 'No device is online to search.' : 'No file called “$_searched” on your devices.'),
+        ],
+        for (final r in _results) ...[
+          const SizedBox(height: 14),
+          Text(r.device?.name ?? '${widget.node.myLabel} (this phone)',
+              style: const TextStyle(color: online, fontWeight: FontWeight.w800, fontSize: 15)),
+          if (r.error != null) Text(r.error!, style: const TextStyle(color: bad)),
+          if (r.error == null && r.found.isEmpty) const Text('Nothing found'),
+          for (final h in r.found.take(100))
+            ListTile(
+              contentPadding: EdgeInsets.zero,
+              dense: true,
+              leading: Icon(h['dir'] == true ? Icons.folder : Icons.insert_drive_file, color: white),
+              title: Text('${h['name']}', style: const TextStyle(color: white, fontWeight: FontWeight.w600)),
+              subtitle: Text(
+                h['dir'] == true ? '${h['path']}' : '${h['path']} · ${_size((h['size'] as num?)?.toInt() ?? 0)}',
+                style: const TextStyle(color: white, fontSize: 12),
+              ),
+              trailing: r.device == null ? null : const Icon(Icons.chevron_right, color: white),
+              onTap: r.device == null
+                  ? null
+                  : () {
+                      final parts = '${h['path']}'.split('/');
+                      if (h['dir'] != true) parts.removeLast();
+                      Navigator.of(context).push(MaterialPageRoute<void>(
+                        builder: (_) => FileBrowserPage(node: widget.node, peer: r.device!, initialPath: parts),
+                      ));
+                    },
+            ),
+          if (r.partial || r.found.length > 100)
+            const Text('More may exist — type more of the name to narrow it down.', style: TextStyle(fontSize: 12)),
+        ],
+      ]),
     );
   }
 }
