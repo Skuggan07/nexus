@@ -198,6 +198,8 @@ pub struct NexusApp {
     upd: Option<UpdCenter>,
     /// The "Find a file" window, while it's open.
     find: Option<FindFiles>,
+    /// The "Download on a PC" window, while it's open.
+    dl: Option<DlWindow>,
     browser: Option<Browser>,
     screens: Vec<ScreenView>,
     fullscreen_on: bool,
@@ -262,6 +264,14 @@ enum Action {
     CloseMonitor(String),
     EndApp(String, String),
     OpenAutomation,
+    /// Open (true) or close "Download on a PC".
+    DlOpen(bool),
+    /// Download a link on a PC (this one or another): (device id, link).
+    DlStart(String, String),
+    /// Stop a download on a PC: (device id, download number).
+    DlCancel(String, u64),
+    /// Open this PC's Downloads folder.
+    OpenDownloads,
     /// Open (true) or close "Find a file".
     FindOpen(bool),
     /// Search every online device for this name.
@@ -305,6 +315,7 @@ impl NexusApp {
             confirm_group: None,
             upd: None,
             find: None,
+            dl: None,
             browser: None,
             screens: Vec::new(),
             fullscreen_on: false,
@@ -575,6 +586,57 @@ impl NexusApp {
             Action::ShowInExplorer(rel) => {
                 let full = net::fs_root().join(rel.replace('/', "\\"));
                 let _ = std::process::Command::new("explorer.exe").arg(format!("/select,{}", full.display())).spawn();
+            }
+            Action::DlOpen(true) => {
+                if self.dl.is_none() {
+                    let w = DlWindow { target: self.me.id.clone(), ..Default::default() };
+                    start_dl_poll(self.me.clone(), self.shared.clone(), w.lists.clone(), w.alive.clone());
+                    self.dl = Some(w);
+                }
+            }
+            Action::DlOpen(false) => {
+                if let Some(w) = self.dl.take() {
+                    w.alive.store(false, Ordering::Relaxed);
+                }
+            }
+            Action::OpenDownloads => {
+                let _ = std::process::Command::new("explorer.exe").arg(crate::downloads::folder()).spawn();
+            }
+            Action::DlStart(id, url) => {
+                let (me, shared) = (self.me.clone(), self.shared.clone());
+                let note = self.dl.as_ref().map(|w| w.note.clone());
+                if let Some(w) = self.dl.as_mut() {
+                    w.url.clear();
+                }
+                std::thread::spawn(move || {
+                    let msg = if id == me.id {
+                        crate::downloads::start(&url, "this PC", shared.clone()).map(|j| format!("Downloading {}…", j.name))
+                    } else {
+                        match peer_addr(&shared, &id) {
+                            Some((peer, addr)) => net::ask(&me, &peer, addr, serde_json::json!({ "op": "download", "url": url }))
+                                .map(|r| format!("{} is downloading {}…", peer.name, r["job"]["name"].as_str().unwrap_or("the file"))),
+                            None => Err("That PC is not reachable right now".into()),
+                        }
+                    };
+                    if let Some(note) = note {
+                        if let Ok(mut n) = note.lock() {
+                            *n = match msg {
+                                Ok(m) => m,
+                                Err(e) => format!("Could not start: {e}"),
+                            };
+                        }
+                    }
+                });
+            }
+            Action::DlCancel(id, n) => {
+                let (me, shared) = (self.me.clone(), self.shared.clone());
+                std::thread::spawn(move || {
+                    if id == me.id {
+                        crate::downloads::cancel(n);
+                    } else if let Some((peer, addr)) = peer_addr(&shared, &id) {
+                        let _ = net::ask(&me, &peer, addr, serde_json::json!({ "op": "dlcancel", "id": n }));
+                    }
+                });
             }
             Action::FindOpen(true) => {
                 if self.find.is_none() {
@@ -1333,6 +1395,9 @@ impl eframe::App for NexusApp {
         if self.find.is_some() {
             self.find_window(ctx, &mut actions);
         }
+        if self.dl.is_some() {
+            self.dl_window(ctx, &rows, &mut actions);
+        }
         // Keep this PC's display awake while any screen is being watched.
         if !self.screens.is_empty() {
             crate::screen::keep_display_awake(true);
@@ -1446,6 +1511,9 @@ impl NexusApp {
                         }
                         if ui.add(secondary("Find a file")).clicked() {
                             actions.push(Action::FindOpen(true));
+                        }
+                        if ui.add(secondary("Download on a PC")).clicked() {
+                            actions.push(Action::DlOpen(true));
                         }
                         if online > 0 && ui.add(secondary("Watch all screens")).clicked() {
                             actions.push(Action::ViewAllScreens);
@@ -1566,6 +1634,10 @@ impl NexusApp {
                 ui.add_space(6.0);
                 if ui.add(secondary("Find a file").min_size(Vec2::new(ui.available_width(), 32.0))).clicked() {
                     actions.push(Action::FindOpen(true));
+                }
+                ui.add_space(6.0);
+                if ui.add(secondary("Download on a PC").min_size(Vec2::new(ui.available_width(), 32.0))).clicked() {
+                    actions.push(Action::DlOpen(true));
                 }
                 ui.add_space(6.0);
                 ui.label(RichText::new("Coming next: Floating screen · Better wake").size(12.0));
@@ -1951,6 +2023,106 @@ impl NexusApp {
             });
         if !open {
             actions.push(Action::ShowDetails(None));
+        }
+    }
+
+    /// "Download on a PC": paste a link, pick a PC, watch it download there.
+    fn dl_window(&mut self, ctx: &egui::Context, rows: &[Row], actions: &mut Vec<Action>) {
+        let my_id = self.me.id.clone();
+        let my_label = self.my_label();
+        let Some(w) = self.dl.as_mut() else { return };
+        let lists = w.lists.lock().map(|m| m.clone()).unwrap_or_default();
+        let note = w.note.lock().map(|n| n.clone()).unwrap_or_default();
+        // This PC first, then every online PC.
+        let mut pcs: Vec<(String, String)> = vec![(my_id.clone(), format!("{my_label} (this PC)"))];
+        for r in rows {
+            if is_online(&r.status) && !matches!(r.peer.os.as_str(), "Android" | "iOS") {
+                pcs.push((r.peer.id.clone(), r.peer.name.clone()));
+            }
+        }
+        if !pcs.iter().any(|(id, _)| *id == w.target) {
+            w.target = my_id.clone();
+        }
+        let mut open = true;
+        egui::Window::new(RichText::new("Download on a PC").size(18.0).strong())
+            .collapsible(false)
+            .resizable(true)
+            .default_width(600.0)
+            .open(&mut open)
+            .frame(box_frame().inner_margin(Margin::same(20.0)))
+            .show(ctx, |ui| {
+                ui.label("Paste a download link, pick the PC, and it downloads into that PC's Downloads folder.");
+                ui.add_space(6.0);
+                ui.add(egui::TextEdit::singleline(&mut w.url).hint_text("https://…").desired_width(f32::INFINITY));
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("On:");
+                    for (id, name) in &pcs {
+                        ui.radio_value(&mut w.target, id.clone(), name.as_str());
+                    }
+                });
+                ui.horizontal(|ui| {
+                    let ok = w.url.trim().starts_with("http");
+                    if ui.add_enabled(ok, primary("Download")).clicked() {
+                        actions.push(Action::DlStart(w.target.clone(), w.url.trim().to_string()));
+                    }
+                    if ui.add(secondary("Open this PC's Downloads")).clicked() {
+                        actions.push(Action::OpenDownloads);
+                    }
+                });
+                if !note.is_empty() {
+                    ui.label(RichText::new(&note).size(12.5));
+                }
+                ui.separator();
+                egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
+                    let mut any = false;
+                    for (id, name) in &pcs {
+                        let Some(r) = lists.get(id) else { continue };
+                        let jobs = match r {
+                            Ok(j) if !j.is_empty() => j,
+                            _ => continue,
+                        };
+                        any = true;
+                        ui.label(RichText::new(name).size(15.0).strong().color(ONLINE));
+                        for j in jobs {
+                            ui.horizontal(|ui| {
+                                ui.vertical(|ui| {
+                                    ui.label(RichText::new(&j.name).strong());
+                                    let size = |b: u64| human_size(b);
+                                    let line = match j.state.as_str() {
+                                        "downloading" if j.total > 0 => format!(
+                                            "{} of {} · {}%",
+                                            size(j.done),
+                                            size(j.total),
+                                            j.done * 100 / j.total.max(1)
+                                        ),
+                                        "downloading" => format!("{} so far", size(j.done)),
+                                        "done" => format!("Done · {} · in Downloads", size(j.done)),
+                                        "cancelled" => "Cancelled".to_string(),
+                                        _ => format!("Failed: {}", j.error),
+                                    };
+                                    ui.label(RichText::new(line).size(12.5));
+                                    if j.state == "downloading" && j.total > 0 {
+                                        ui.add(egui::ProgressBar::new(j.done as f32 / j.total as f32).desired_width(380.0));
+                                    }
+                                });
+                                if j.state == "downloading" {
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        if ui.add(secondary("Stop")).clicked() {
+                                            actions.push(Action::DlCancel(id.clone(), j.id));
+                                        }
+                                    });
+                                }
+                            });
+                        }
+                        ui.add_space(8.0);
+                    }
+                    if !any {
+                        ui.label("No downloads yet.");
+                    }
+                });
+            });
+        if !open {
+            actions.push(Action::DlOpen(false));
         }
     }
 
@@ -3428,6 +3600,48 @@ fn activity_lines(r: &Row) -> Vec<String> {
         out.push("Not seen online yet".into());
     }
     out
+}
+
+/// The "Download on a PC" window's state.
+#[derive(Default)]
+struct DlWindow {
+    url: String,
+    /// Which PC downloads it (device id; this PC's own id for here).
+    target: String,
+    /// The answer to the last "Download" press.
+    note: Arc<Mutex<String>>,
+    /// Each PC's downloads, by device id (refreshed every 2 seconds).
+    lists: Arc<Mutex<std::collections::HashMap<String, Result<Vec<crate::downloads::Job>, String>>>>,
+    alive: Arc<AtomicBool>,
+}
+
+/// Keeps the download lists of this PC and every online PC fresh while the window is open.
+fn start_dl_poll(
+    me: Arc<Identity>,
+    shared: SharedState,
+    lists: Arc<Mutex<std::collections::HashMap<String, Result<Vec<crate::downloads::Job>, String>>>>,
+    alive: Arc<AtomicBool>,
+) {
+    alive.store(true, Ordering::Relaxed);
+    std::thread::spawn(move || {
+        while alive.load(Ordering::Relaxed) {
+            if let Ok(mut m) = lists.lock() {
+                m.insert(me.id.clone(), Ok(crate::downloads::list()));
+            }
+            for (peer, addr) in crate::clipboard::online_targets(&shared) {
+                if matches!(peer.os.as_str(), "Android" | "iOS") {
+                    continue;
+                }
+                let r = net::ask(&me, &peer, addr, serde_json::json!({ "op": "downloads" })).and_then(|v| {
+                    serde_json::from_value::<Vec<crate::downloads::Job>>(v["jobs"].clone()).map_err(|e| e.to_string())
+                });
+                if let Ok(mut m) = lists.lock() {
+                    m.insert(peer.id.clone(), r);
+                }
+            }
+            std::thread::sleep(Duration::from_secs(2));
+        }
+    });
 }
 
 /// The "Find a file" window's state.

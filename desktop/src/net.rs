@@ -561,6 +561,34 @@ fn screen_serve(mut c: Conn, me: &Arc<Identity>, shared: &SharedState, dir: &Pat
         Some("clip") => return clip_serve(c, shared, &id, &start),
         Some("clipfiles") => return clipfiles_serve(c, shared, dir, &id, &start),
         Some("audio") => return audio_serve(c, shared, &id),
+        Some("download") => {
+            let url = start.get("url").and_then(|u| u.as_str()).unwrap_or("");
+            let who = peer_name(shared, &id);
+            let reply = match crate::downloads::start(url, &who, shared.clone()) {
+                Ok(job) => {
+                    lock(shared).log(format!("{who} started downloading {} on this PC", job.name));
+                    serde_json::json!({ "op": "ok", "job": job })
+                }
+                Err(e) => serde_json::json!({ "error": e }),
+            };
+            let _ = c.send_val(&reply);
+            return;
+        }
+        Some("downloads") => {
+            let _ = c.send_val(&serde_json::json!({
+                "op": "downloads",
+                "jobs": crate::downloads::list(),
+                "folder": crate::downloads::folder().display().to_string(),
+            }));
+            return;
+        }
+        Some("dlcancel") => {
+            if let Some(n) = start.get("id").and_then(|x| x.as_u64()) {
+                crate::downloads::cancel(n);
+            }
+            let _ = c.send_val(&serde_json::json!({ "op": "ok" }));
+            return;
+        }
         Some("update") => {
             let who = peer_name(shared, &id);
             let reply = match crate::update::update_remote() {
@@ -758,6 +786,17 @@ const CLIP_CHUNK: usize = 256 * 1024;
 
 /// Sends files copied on this PC to a paired device, which puts them on its clipboard
 /// (a phone also saves them to its Gallery or Downloads).
+/// One request/answer on a screen link (download requests and the like).
+pub fn ask(me: &Identity, peer: &PairedPeer, addr: SocketAddr, req: serde_json::Value) -> Result<serde_json::Value, String> {
+    let mut c = screen_open(me, peer, addr)?;
+    c.send_val(&req)?;
+    let r = c.recv_val()?;
+    match fs_err(&r) {
+        Some(e) => Err(e),
+        None => Ok(r),
+    }
+}
+
 /// Asks a paired device to update Nexus to the newest build. Returns that build.
 pub fn update_send(me: &Identity, peer: &PairedPeer, addr: SocketAddr) -> Result<u32, String> {
     let mut c = screen_open(me, peer, addr)?;

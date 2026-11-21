@@ -6,6 +6,7 @@ mod audio;
 mod automation;
 mod clipboard;
 mod discovery;
+mod downloads;
 mod identity;
 mod input;
 mod labels;
