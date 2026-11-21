@@ -41,6 +41,29 @@ pub enum State {
 
 pub type Shared = Arc<Mutex<State>>;
 
+/// The one update state of this app (the Settings screen and requests from other
+/// devices share it).
+pub fn global() -> &'static Shared {
+    static S: std::sync::OnceLock<Shared> = std::sync::OnceLock::new();
+    S.get_or_init(Shared::default)
+}
+
+/// Asked by another device: if there is a newer Nexus, download it and restart into
+/// it. Returns the build it is updating to.
+pub fn update_remote() -> Result<u32, String> {
+    if matches!(*lock(global()), State::Downloading { .. }) {
+        return Err("Already updating".into());
+    }
+    match latest()? {
+        Some((b, url, size)) if b > build() => {
+            set(global(), State::Available { build: b, url, size });
+            install(global());
+            Ok(b)
+        }
+        _ => Err(format!("Already the newest version (build {})", build())),
+    }
+}
+
 pub fn lock(s: &Shared) -> MutexGuard<'_, State> {
     s.lock().unwrap_or_else(|e| e.into_inner())
 }

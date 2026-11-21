@@ -17,6 +17,7 @@ mod store;
 mod sysstats;
 mod update;
 mod wakeup;
+mod winupdate;
 
 use eframe::egui;
 use std::sync::{Arc, Mutex};

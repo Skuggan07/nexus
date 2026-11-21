@@ -39,6 +39,9 @@ pub struct Stats {
     pub today: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total: Option<u64>,
+    /// Which Nexus build it runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build: Option<u32>,
 }
 
 /// How long this PC has been used.
@@ -123,6 +126,7 @@ pub fn start_sampler(dir: PathBuf) {
                 uptime: Some(sysinfo::System::uptime()),
                 today: Some(usage.today),
                 total: Some(usage.total),
+                build: Some(crate::update::build()),
             };
             if let (Ok(json), Ok(mut g)) = (serde_json::to_string(&s), slot().lock()) {
                 *g = Some(json);

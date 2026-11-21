@@ -10,7 +10,7 @@ use crate::{
     state::{lock, PairSession, Phase, Role, SharedState, Status},
     store::{self, PairedPeer},
     sysstats::Stats,
-    update,
+    update, winupdate,
 };
 use eframe::egui::{self, Color32, FontId, Margin, Pos2, RichText, Rounding, Sense, Stroke, TextStyle, Vec2};
 use std::{
@@ -194,6 +194,8 @@ pub struct NexusApp {
     mine: crate::labels::Labels,
     /// A group waiting for "Yes, delete" to be pressed.
     confirm_group: Option<String>,
+    /// The Update center window, while it's open.
+    upd: Option<UpdCenter>,
     browser: Option<Browser>,
     screens: Vec<ScreenView>,
     fullscreen_on: bool,
@@ -258,6 +260,15 @@ enum Action {
     CloseMonitor(String),
     EndApp(String, String),
     OpenAutomation,
+    /// Open (true) or close the Update center.
+    UpdateCenter(bool),
+    /// Tick or untick a device for "Update selected".
+    PickUpdate(String),
+    /// Update Nexus on these devices (this PC last, since it restarts).
+    UpdateNexus(Vec<String>),
+    /// Windows Update on a PC (this one or another): "check" or "install".
+    Wu(String, &'static str),
+    WuSetUp,
 }
 
 impl NexusApp {
@@ -282,6 +293,7 @@ impl NexusApp {
             edit_dev: None,
             mine: crate::labels::Labels::default(),
             confirm_group: None,
+            upd: None,
             browser: None,
             screens: Vec::new(),
             fullscreen_on: false,
@@ -290,7 +302,7 @@ impl NexusApp {
             auto_open: false,
             auto_draft: None,
             updates: {
-                let u = update::Shared::default();
+                let u = update::global().clone();
                 update::check(&u);
                 u
             },
@@ -648,6 +660,80 @@ impl NexusApp {
                 }
             }
             Action::OpenMonitor(id) => self.open_monitor(id),
+            Action::UpdateCenter(true) => {
+                if self.upd.is_none() {
+                    let c = UpdCenter::default();
+                    start_wu_poll(self.me.clone(), self.shared.clone(), c.wu.clone(), c.alive.clone());
+                    self.upd = Some(c);
+                }
+            }
+            Action::UpdateCenter(false) => {
+                if let Some(c) = self.upd.take() {
+                    c.alive.store(false, Ordering::Relaxed);
+                }
+            }
+            Action::PickUpdate(id) => {
+                if let Some(c) = self.upd.as_mut() {
+                    if !c.picked.remove(&id) {
+                        c.picked.insert(id);
+                    }
+                }
+            }
+            Action::UpdateNexus(ids) => {
+                let (me, shared) = (self.me.clone(), self.shared.clone());
+                std::thread::spawn(move || {
+                    let mut self_too = false;
+                    for id in ids {
+                        if id == me.id {
+                            self_too = true;
+                            continue;
+                        }
+                        let Some((peer, addr)) = peer_addr(&shared, &id) else {
+                            lock(&shared).log("A device to update is not reachable right now".to_string());
+                            continue;
+                        };
+                        let msg = match net::update_send(&me, &peer, addr) {
+                            Ok(_) if matches!(peer.os.as_str(), "Android" | "iOS") => {
+                                format!("{}: a new Nexus is ready — tap the notification on the phone to install it", peer.name)
+                            }
+                            Ok(b) => format!("{} is updating to build {b} and will restart", peer.name),
+                            Err(e) => format!("Could not update {}: {e}", peer.name),
+                        };
+                        lock(&shared).log(msg);
+                    }
+                    if self_too {
+                        if let Err(e) = update::update_remote() {
+                            lock(&shared).log(format!("This PC: {e}"));
+                        }
+                    }
+                });
+            }
+            Action::Wu(id, what) => {
+                let (me, shared) = (self.me.clone(), self.shared.clone());
+                let wu = self.upd.as_ref().map(|c| c.wu.clone());
+                std::thread::spawn(move || {
+                    let result = if id == me.id {
+                        match what {
+                            "install" => winupdate::install().map(|()| winupdate::status()),
+                            _ => {
+                                winupdate::check();
+                                Ok(winupdate::status())
+                            }
+                        }
+                    } else {
+                        match peer_addr(&shared, &id) {
+                            Some((peer, addr)) => net::wu_send(&me, &peer, addr, what),
+                            None => Err("Not reachable right now".to_string()),
+                        }
+                    };
+                    if let Some(wu) = wu {
+                        if let Ok(mut m) = wu.lock() {
+                            m.insert(id, result);
+                        }
+                    }
+                });
+            }
+            Action::WuSetUp => winupdate::set_up_in_background(),
             Action::OpenAutomation => {
                 self.auto_open = true;
                 self.details = None;
@@ -1171,6 +1257,9 @@ impl eframe::App for NexusApp {
         if self.auto_open {
             self.automation_window(ctx);
         }
+        if self.upd.is_some() {
+            self.update_center(ctx, &rows, &mut actions);
+        }
         // Keep this PC's display awake while any screen is being watched.
         if !self.screens.is_empty() {
             crate::screen::keep_display_awake(true);
@@ -1278,6 +1367,9 @@ impl NexusApp {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.add(secondary("Automation")).clicked() {
                             actions.push(Action::OpenAutomation);
+                        }
+                        if ui.add(secondary("Updates")).clicked() {
+                            actions.push(Action::UpdateCenter(true));
                         }
                         if online > 0 && ui.add(secondary("Watch all screens")).clicked() {
                             actions.push(Action::ViewAllScreens);
@@ -1390,6 +1482,10 @@ impl NexusApp {
                 ui.add_space(6.0);
                 if ui.add(secondary("Automation").min_size(Vec2::new(ui.available_width(), 32.0))).clicked() {
                     actions.push(Action::OpenAutomation);
+                }
+                ui.add_space(6.0);
+                if ui.add(secondary("Update center").min_size(Vec2::new(ui.available_width(), 32.0))).clicked() {
+                    actions.push(Action::UpdateCenter(true));
                 }
                 ui.add_space(6.0);
                 ui.label(RichText::new("Coming next: Floating screen · Better wake").size(12.0));
@@ -1775,6 +1871,173 @@ impl NexusApp {
             });
         if !open {
             actions.push(Action::ShowDetails(None));
+        }
+    }
+
+    /// Update center: Nexus versions on every device, and Windows Update on every PC.
+    fn update_center(&mut self, ctx: &egui::Context, rows: &[Row], actions: &mut Vec<Action>) {
+        let Some(c) = self.upd.as_ref() else { return };
+        let mine = update::build();
+        let newest = match &*update::lock(&self.updates) {
+            update::State::Available { build, .. } | update::State::Downloading { build, .. } => Some(*build),
+            update::State::UpToDate => Some(mine),
+            _ => None,
+        };
+        let wu = c.wu.lock().map(|m| m.clone()).unwrap_or_default();
+        let picked = c.picked.clone();
+        let my_label = self.my_label();
+        let mut open = true;
+        egui::Window::new(RichText::new("Update center").size(18.0).strong())
+            .collapsible(false)
+            .resizable(true)
+            .default_width(560.0)
+            .open(&mut open)
+            .frame(box_frame().inner_margin(Margin::same(20.0)))
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical().max_height(600.0).show(ui, |ui| {
+                    /* ------------------------------------------ Nexus versions */
+                    ui.label(RichText::new("NEXUS ON YOUR DEVICES").size(13.0).strong().color(ONLINE));
+                    ui.label(match newest {
+                        Some(n) => format!("The newest Nexus is build {n}."),
+                        None => "Checking which Nexus is the newest…".to_string(),
+                    });
+                    ui.add_space(4.0);
+                    // (id, name, build, online, phone)
+                    let mut devs: Vec<(String, String, Option<u32>, bool, bool)> =
+                        vec![(self.me.id.clone(), format!("{my_label} (this PC)"), Some(mine), true, false)];
+                    for r in rows {
+                        let online = is_online(&r.status);
+                        let b = stats_of(&r.status).and_then(|s| s.build);
+                        devs.push((r.peer.id.clone(), r.peer.name.clone(), b, online, matches!(r.peer.os.as_str(), "Android" | "iOS")));
+                    }
+                    let outdated = |b: Option<u32>, online: bool| online && newest.is_some_and(|n| b.map_or(true, |b| b < n));
+                    let mut all = Vec::new();
+                    for (id, name, b, online, phone) in &devs {
+                        let old = outdated(*b, *online);
+                        if old {
+                            all.push(id.clone());
+                        }
+                        ui.horizontal(|ui| {
+                            let mut tick = picked.contains(id);
+                            if ui.add_enabled(old, egui::Checkbox::without_text(&mut tick)).changed() {
+                                actions.push(Action::PickUpdate(id.clone()));
+                            }
+                            ui.label(RichText::new(name).strong());
+                            let (text, color) = match (online, b) {
+                                (false, _) => ("offline".to_string(), OFF),
+                                (true, Some(b)) if !old => (format!("build {b} · up to date"), ONLINE),
+                                (true, Some(b)) => (format!("build {b} · update available"), RING),
+                                (true, None) => ("an older build · update available".to_string(), RING),
+                            };
+                            ui.label(RichText::new(text).color(color));
+                            if *phone && old {
+                                ui.label(RichText::new("(asks on the phone)").size(12.0));
+                            }
+                        });
+                    }
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        let sel: Vec<String> = all.iter().filter(|id| picked.contains(*id)).cloned().collect();
+                        if ui.add_enabled(!all.is_empty(), primary("Update all")).clicked() {
+                            actions.push(Action::UpdateNexus(all.clone()));
+                        }
+                        if ui.add_enabled(!sel.is_empty(), secondary("Update selected")).clicked() {
+                            actions.push(Action::UpdateNexus(sel));
+                        }
+                        if all.is_empty() && newest.is_some() {
+                            ui.label("Everything online is up to date.");
+                        }
+                    });
+
+                    /* ------------------------------------------ Windows Update */
+                    ui.add_space(14.0);
+                    ui.label(RichText::new("WINDOWS UPDATE").size(13.0).strong().color(ONLINE));
+                    let mut pcs: Vec<(String, String)> = vec![(self.me.id.clone(), format!("{my_label} (this PC)"))];
+                    for r in rows {
+                        if is_online(&r.status) && !matches!(r.peer.os.as_str(), "Android" | "iOS") {
+                            pcs.push((r.peer.id.clone(), r.peer.name.clone()));
+                        }
+                    }
+                    for (id, name) in &pcs {
+                        box_frame().inner_margin(Margin::symmetric(14.0, 10.0)).show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(name).strong());
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    let st = wu.get(id).and_then(|r| r.as_ref().ok());
+                                    let busy = st.is_some_and(|s| !s.busy.is_empty() && s.busy != "idle");
+                                    let can_install = st.is_some_and(|s| s.waiting.unwrap_or(0) > 0);
+                                    if ui.add_enabled(!busy && can_install, primary("Install")).clicked() {
+                                        actions.push(Action::Wu(id.clone(), "install"));
+                                    }
+                                    if ui.add_enabled(!busy, secondary("Check")).clicked() {
+                                        actions.push(Action::Wu(id.clone(), "check"));
+                                    }
+                                });
+                            });
+                            match wu.get(id) {
+                                None => {
+                                    ui.label("Asking…");
+                                }
+                                Some(Err(e)) => {
+                                    ui.label(RichText::new(e).color(BAD));
+                                }
+                                Some(Ok(s)) => {
+                                    let line = match (s.busy.as_str(), s.waiting) {
+                                        ("checking", _) => "Checking for updates… (can take a few minutes)".to_string(),
+                                        ("installing", _) => "Installing updates…".to_string(),
+                                        (_, None) => "Not checked yet — press Check".to_string(),
+                                        (_, Some(0)) => "Up to date".to_string(),
+                                        (_, Some(n)) => format!("{n} update{} waiting", if n == 1 { "" } else { "s" }),
+                                    };
+                                    ui.label(RichText::new(line).strong());
+                                    for t in s.titles.iter().take(6) {
+                                        ui.label(RichText::new(format!("• {t}")).size(12.0));
+                                    }
+                                    if s.restart {
+                                        ui.label(RichText::new("Restart needed to finish installing").color(RING));
+                                    }
+                                    if !s.note.is_empty() {
+                                        ui.label(RichText::new(&s.note).size(12.5));
+                                    }
+                                    ui.label(
+                                        RichText::new(if s.no_surprise {
+                                            "No surprise restarts: on — Windows waits until you're signed out"
+                                        } else {
+                                            "No surprise restarts: off"
+                                        })
+                                        .size(12.0),
+                                    );
+                                    if !s.ready {
+                                        if *id == self.me.id {
+                                            ui.horizontal(|ui| {
+                                                if ui
+                                                    .add_enabled(!winupdate::setting_up(), primary("Set up"))
+                                                    .on_hover_text("Windows asks once. Lets your devices install updates here and stops surprise restarts.")
+                                                    .clicked()
+                                                {
+                                                    actions.push(Action::WuSetUp);
+                                                }
+                                                ui.label(
+                                                    RichText::new("Needed once so updates can be installed from any device, and to stop surprise restarts.")
+                                                        .size(12.0),
+                                                );
+                                            });
+                                        } else {
+                                            ui.label(
+                                                RichText::new("To install from here, press Set up in the Update center on that PC once.")
+                                                    .size(12.0),
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        });
+                    }
+                });
+            });
+        if !open {
+            actions.push(Action::UpdateCenter(false));
         }
     }
 
@@ -2987,6 +3250,64 @@ fn activity_lines(r: &Row) -> Vec<String> {
         out.push("Not seen online yet".into());
     }
     out
+}
+
+/// The Update center's state while it's open.
+#[derive(Default)]
+struct UpdCenter {
+    /// Devices ticked for "Update selected".
+    picked: std::collections::HashSet<String>,
+    /// Windows Update status of each PC, by device id (this PC too).
+    wu: Arc<Mutex<std::collections::HashMap<String, Result<winupdate::Status, String>>>>,
+    /// Cleared when the window closes, which stops the background refresh.
+    alive: Arc<AtomicBool>,
+}
+
+/// A paired device and where to reach it right now.
+fn peer_addr(shared: &SharedState, id: &str) -> Option<(PairedPeer, SocketAddr)> {
+    let s = lock(shared);
+    let p = s.paired.iter().find(|p| p.id == id)?.clone();
+    let addr = s
+        .seen
+        .get(&p.id)
+        .filter(|x| x.fresh())
+        .map(|x| SocketAddr::new(x.addr, x.tcp_port))
+        .or_else(|| p.last_addr.as_deref().and_then(|a| a.parse().ok()))?;
+    Some((p, addr))
+}
+
+/// Keeps the Windows Update status of this PC and every online PC fresh while the
+/// Update center is open.
+fn start_wu_poll(
+    me: Arc<Identity>,
+    shared: SharedState,
+    wu: Arc<Mutex<std::collections::HashMap<String, Result<winupdate::Status, String>>>>,
+    alive: Arc<AtomicBool>,
+) {
+    alive.store(true, Ordering::Relaxed);
+    std::thread::spawn(move || {
+        while alive.load(Ordering::Relaxed) {
+            let mine = winupdate::status();
+            if let Ok(mut m) = wu.lock() {
+                m.insert(me.id.clone(), Ok(mine));
+            }
+            for (peer, addr) in crate::clipboard::online_targets(&shared) {
+                if matches!(peer.os.as_str(), "Android" | "iOS") {
+                    continue;
+                }
+                let r = net::wu_send(&me, &peer, addr, "status");
+                if let Ok(mut m) = wu.lock() {
+                    m.insert(peer.id.clone(), r);
+                }
+            }
+            for _ in 0..12 {
+                if !alive.load(Ordering::Relaxed) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(500));
+            }
+        }
+    });
 }
 
 /// The icons you can give a device.

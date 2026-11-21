@@ -556,6 +556,37 @@ fn screen_serve(mut c: Conn, me: &Arc<Identity>, shared: &SharedState, dir: &Pat
         Some("clip") => return clip_serve(c, shared, &id, &start),
         Some("clipfiles") => return clipfiles_serve(c, shared, dir, &id, &start),
         Some("audio") => return audio_serve(c, shared, &id),
+        Some("update") => {
+            let who = peer_name(shared, &id);
+            let reply = match crate::update::update_remote() {
+                Ok(b) => {
+                    lock(shared).log(format!("{who} asked this PC to update to build {b} — restarting when done"));
+                    serde_json::json!({ "op": "ok", "build": b })
+                }
+                Err(e) => serde_json::json!({ "error": e }),
+            };
+            let _ = c.send_val(&reply);
+            return;
+        }
+        Some("wu") => {
+            let action = start.get("action").and_then(|a| a.as_str()).unwrap_or("status");
+            let who = peer_name(shared, &id);
+            let reply = match action {
+                "check" => {
+                    crate::winupdate::check();
+                    Ok(())
+                }
+                "install" => crate::winupdate::install().map(|()| {
+                    lock(shared).log(format!("{who} started installing Windows updates on this PC"));
+                }),
+                _ => Ok(()),
+            };
+            let _ = c.send_val(&match reply {
+                Ok(()) => serde_json::json!({ "op": "wu", "status": crate::winupdate::status() }),
+                Err(e) => serde_json::json!({ "error": e }),
+            });
+            return;
+        }
         Some("labels") => {
             let entries = start.get("labels").and_then(|l| l.as_array()).cloned().unwrap_or_default();
             if crate::labels::merge(me, shared, dir, &entries) {
@@ -722,6 +753,33 @@ const CLIP_CHUNK: usize = 256 * 1024;
 
 /// Sends files copied on this PC to a paired device, which puts them on its clipboard
 /// (a phone also saves them to its Gallery or Downloads).
+/// Asks a paired device to update Nexus to the newest build. Returns that build.
+pub fn update_send(me: &Identity, peer: &PairedPeer, addr: SocketAddr) -> Result<u32, String> {
+    let mut c = screen_open(me, peer, addr)?;
+    c.send_val(&serde_json::json!({ "op": "update" }))?;
+    let r = c.recv_val()?;
+    if let Some(e) = fs_err(&r) {
+        return Err(e);
+    }
+    Ok(r.get("build").and_then(|b| b.as_u64()).unwrap_or(0) as u32)
+}
+
+/// Windows Update on a paired PC: "status", "check" or "install". Returns its status.
+pub fn wu_send(
+    me: &Identity,
+    peer: &PairedPeer,
+    addr: SocketAddr,
+    action: &str,
+) -> Result<crate::winupdate::Status, String> {
+    let mut c = screen_open(me, peer, addr)?;
+    c.send_val(&serde_json::json!({ "op": "wu", "action": action }))?;
+    let r = c.recv_val()?;
+    if let Some(e) = fs_err(&r) {
+        return Err(e);
+    }
+    serde_json::from_value(r.get("status").cloned().unwrap_or_default()).map_err(|_| "Unexpected answer".to_string())
+}
+
 /// Sends nicknames, icons and groups to a paired device (see labels.rs).
 pub fn labels_send(me: &Identity, peer: &PairedPeer, addr: SocketAddr, entries: &[serde_json::Value]) -> Result<(), String> {
     let mut c = screen_open(me, peer, addr)?;
