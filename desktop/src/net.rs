@@ -644,39 +644,78 @@ fn screen_serve(mut c: Conn, me: &Arc<Identity>, shared: &SharedState, dir: &Pat
     // behind. Pictures are only sent when the screen changed (and once a second anyway).
     let q_now = Arc::new(std::sync::atomic::AtomicU8::new(quality));
     let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    type Packed = (u32, u32, Vec<u8>, usize, usize);
+    // Viewers that understand real video (H.264) ask for it; others get JPEG pictures.
+    let want_video = start.get("codec").and_then(|x| x.as_str()) == Some("h264");
+    // (width, height, data, monitor, monitors, is video)
+    type Packed = (u32, u32, Vec<u8>, usize, usize, bool);
     let (tx, rx) = mpsc::sync_channel::<Result<Packed, String>>(1);
     {
         let (q_now, done) = (q_now.clone(), done.clone());
         thread::spawn(move || {
             use std::sync::atomic::Ordering;
             let mut g = crate::screen::Grabber::new(monitor);
-            let mut last: Option<Packed> = None;
+            let mut video: Option<crate::screen::VideoEncoder> = None;
+            let mut video_q = quality;
+            let mut video_failed = !want_video;
+            let mut sent_any = false;
             let mut last_at = Instant::now();
             while !done.load(Ordering::Relaxed) {
                 let started = Instant::now();
-                let msg = match g.grab(gap) {
-                    Ok(f) if !f.changed && last.is_some() && last_at.elapsed() < Duration::from_secs(1) => {
-                        if let Some(rest) = gap.checked_sub(started.elapsed()) {
-                            thread::sleep(rest);
+                let f = match g.grab(gap) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        if tx.send(Err(e)).is_err() {
+                            break;
                         }
+                        thread::sleep(Duration::from_millis(300));
                         continue;
                     }
-                    Ok(f) if !f.changed && last.is_some() => Ok(last.clone().unwrap_or_default()),
-                    Ok(f) => match crate::screen::encode(f.w, f.h, &g.buf, max_w, q_now.load(Ordering::Relaxed)) {
-                        Ok((w, h, jpeg)) => {
-                            let p = (w, h, jpeg, f.mon, f.mons);
-                            last = Some(p.clone());
-                            Ok(p)
-                        }
-                        Err(e) => Err(e),
-                    },
-                    Err(e) => Err(e),
                 };
+                // Nothing changed: send nothing (but something once a second, so the
+                // viewer knows the link is alive).
+                if !f.changed && sent_any && last_at.elapsed() < Duration::from_secs(1) {
+                    if let Some(rest) = gap.checked_sub(started.elapsed()) {
+                        thread::sleep(rest);
+                    }
+                    continue;
+                }
+                let q = q_now.load(Ordering::Relaxed);
+                // The network got much slower or faster: start the video again at a
+                // bitrate that fits (this also sends a fresh full picture).
+                if video.is_some() && q.abs_diff(video_q) >= 10 {
+                    video = None;
+                }
+                if !video_failed && video.is_none() {
+                    let tw = f.w.min(max_w).max(2);
+                    let th = ((tw as u64 * f.h as u64) / f.w.max(1) as u64).max(2) as u32;
+                    match crate::screen::VideoEncoder::new(fps, crate::screen::video_bitrate(tw, th, fps, q)) {
+                        Ok(v) => {
+                            video = Some(v);
+                            video_q = q;
+                        }
+                        Err(_) => video_failed = true,
+                    }
+                }
+                let msg = match video.as_mut() {
+                    Some(v) => match v.encode(f.w, f.h, &g.buf, max_w) {
+                        Ok((w, h, data)) => Ok((w, h, data, f.mon, f.mons, true)),
+                        Err(_) => {
+                            // Fall back to JPEG pictures for the rest of this session.
+                            video = None;
+                            video_failed = true;
+                            crate::screen::encode(f.w, f.h, &g.buf, max_w, q).map(|(w, h, d)| (w, h, d, f.mon, f.mons, false))
+                        }
+                    },
+                    None => crate::screen::encode(f.w, f.h, &g.buf, max_w, q).map(|(w, h, d)| (w, h, d, f.mon, f.mons, false)),
+                };
+                if matches!(&msg, Ok(p) if p.2.is_empty()) {
+                    continue; // the video encoder skipped this one
+                }
                 let failed = msg.is_err();
                 if tx.send(msg).is_err() {
                     break; // the viewer left
                 }
+                sent_any = true;
                 last_at = Instant::now();
                 if failed {
                     thread::sleep(Duration::from_millis(300));
@@ -691,12 +730,15 @@ fn screen_serve(mut c: Conn, me: &Arc<Identity>, shared: &SharedState, dir: &Pat
     let mut quick = 0u64;
     while let Ok(msg) = rx.recv() {
         match msg {
-            Ok((w, h, jpeg, mon, mons)) => {
+            Ok((w, h, bytes, mon, mons, is_video)) => {
                 let sent_at = Instant::now();
-                let data = base64::engine::general_purpose::STANDARD.encode(&jpeg);
-                let frame = serde_json::json!({
+                let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                let mut frame = serde_json::json!({
                     "op": "frame", "w": w, "h": h, "seq": seq, "data": data, "mon": mon, "mons": mons,
                 });
+                if is_video {
+                    frame["codec"] = "h264".into();
+                }
                 if c.send_val(&frame).is_err() {
                     break; // viewer closed the window
                 }
@@ -1264,7 +1306,9 @@ pub struct Frame {
     pub w: u32,
     pub h: u32,
     pub seq: u64,
+    /// A JPEG picture, or a piece of H.264 video when `video` is true.
     pub jpeg: Vec<u8>,
+    pub video: bool,
     /// Which monitor this is (0 = main) and how many the other PC has.
     pub mon: usize,
     pub mons: usize,
@@ -1289,7 +1333,7 @@ where
 {
     let mut c = screen_open(me, peer, addr)?;
     c.send_val(&serde_json::json!({
-        "op": "start", "fps": fps, "maxw": max_w, "quality": quality, "monitor": monitor,
+        "op": "start", "fps": fps, "maxw": max_w, "quality": quality, "monitor": monitor, "codec": "h264",
     }))?;
     while keep_going() {
         let v = c.recv_val()?;
@@ -1308,7 +1352,8 @@ where
             base64::engine::general_purpose::STANDARD.decode(data).map_err(|_| "Garbled screen frame".to_string())?;
         let mon = v.get("mon").and_then(|x| x.as_u64()).unwrap_or(0) as usize;
         let mons = v.get("mons").and_then(|x| x.as_u64()).unwrap_or(1).max(1) as usize;
-        on_frame(Frame { w: w as u32, h: h as u32, seq, jpeg, mon, mons });
+        let video = v.get("codec").and_then(|x| x.as_str()) == Some("h264");
+        on_frame(Frame { w: w as u32, h: h as u32, seq, jpeg, video, mon, mons });
     }
     let _ = c.send_val(&serde_json::json!({ "op": "bye" }));
     Ok(())

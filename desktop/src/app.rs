@@ -3050,6 +3050,8 @@ fn spawn_stream(
         while !stop.load(Ordering::Relaxed) {
             let frames = inner.clone();
             let keep = stop.clone();
+            // Each connection starts its video afresh, so it gets its own decoder.
+            let mut video: Option<crate::screen::VideoDecoder> = None;
             let res = net::screen_stream(
                 &me,
                 &peer,
@@ -3060,10 +3062,19 @@ fn spawn_stream(
                 q,
                 move |f| {
                     // Unpack the picture here, not in the window, so the window stays quick.
-                    let Ok(decoded) = image::load_from_memory(&f.jpeg) else { return };
-                    let rgba = decoded.to_rgba8();
-                    let size = [rgba.width() as usize, rgba.height() as usize];
-                    let color = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
+                    let color = if f.video {
+                        if video.is_none() {
+                            video = crate::screen::VideoDecoder::new().ok();
+                        }
+                        let Some(d) = video.as_mut() else { return };
+                        let Some((w, h, rgba)) = d.decode(&f.jpeg) else { return };
+                        egui::ColorImage::from_rgba_unmultiplied([w, h], rgba)
+                    } else {
+                        let Ok(decoded) = image::load_from_memory(&f.jpeg) else { return };
+                        let rgba = decoded.to_rgba8();
+                        let size = [rgba.width() as usize, rgba.height() as usize];
+                        egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw())
+                    };
                     {
                         let mut g = frames.lock().unwrap_or_else(|e| e.into_inner());
                         g.mons = f.mons;
