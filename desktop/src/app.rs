@@ -43,6 +43,9 @@ struct Browser {
     inner: Arc<Mutex<BrowserInner>>,
 }
 
+/// Lets background threads (new screen pictures) ask the window to redraw now.
+static REPAINT: std::sync::OnceLock<egui::Context> = std::sync::OnceLock::new();
+
 /// Picture presets for screen viewing: (frames per second, max width, JPEG quality).
 #[derive(Clone, Copy, PartialEq)]
 enum Quality {
@@ -56,17 +59,17 @@ impl Quality {
 
     fn label(self) -> &'static str {
         match self {
-            Quality::Smooth => "Smooth",
-            Quality::Balanced => "Balanced",
-            Quality::Sharp => "Sharp",
+            Quality::Smooth => "Smooth · 60 fps",
+            Quality::Balanced => "Balanced · 30 fps",
+            Quality::Sharp => "Sharp · 30 fps",
         }
     }
 
     fn params(self) -> (u64, u32, u8) {
         match self {
-            Quality::Smooth => (15, 1280, 60),
-            Quality::Balanced => (12, 1920, 75),
-            Quality::Sharp => (8, 2560, 88),
+            Quality::Smooth => (60, 1600, 65),
+            Quality::Balanced => (30, 1920, 75),
+            Quality::Sharp => (30, 2560, 85),
         }
     }
 }
@@ -74,7 +77,8 @@ impl Quality {
 /// Live state of a screen-view session, shared with its streaming threads.
 #[derive(Default)]
 struct ScreenInner {
-    jpeg: Option<Vec<u8>>,
+    /// The newest picture, already unpacked (taken by the window when it shows it).
+    image: Option<egui::ColorImage>,
     seq: u64,
     dims: (u32, u32),
     frames: u64,
@@ -1281,6 +1285,7 @@ fn is_online(s: &Status) -> bool {
 
 impl eframe::App for NexusApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let _ = REPAINT.set(ctx.clone());
         if !self.styled {
             apply_style(ctx);
             self.styled = true;
@@ -2683,12 +2688,12 @@ impl NexusApp {
     /// and forwards mouse/keyboard input to the other device while "Control" is on.
     fn screen_view(&mut self, ctx: &egui::Context, i: usize, actions: &mut Vec<Action>) {
         let sv = &mut self.screens[i];
-        let (new_jpeg, dims, error, frames, cur_seq, ctl_ready, ctl_error) = {
-            let g = sv.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let (new_image, dims, error, frames, cur_seq, ctl_ready, ctl_error) = {
+            let mut g = sv.inner.lock().unwrap_or_else(|e| e.into_inner());
             if g.mons > 0 {
                 sv.mons = g.mons;
             }
-            let nj = if g.jpeg.is_some() && g.seq != sv.shown_seq { g.jpeg.clone() } else { None };
+            let nj = if g.seq != sv.shown_seq { g.image.take() } else { None };
             (nj, g.dims, g.error.clone(), g.frames, g.seq, g.control_ready, g.control_error.clone())
         };
         // Sound that failed turns itself off, so the box unticks and the reason stays shown.
@@ -2704,21 +2709,15 @@ impl NexusApp {
                 actions.push(Action::ViewMonitor(sv.peer_id.clone(), m));
             }
         }
-        if let Some(bytes) = new_jpeg {
-            if let Ok(decoded) = image::load_from_memory(&bytes) {
-                let rgba = decoded.to_rgba8();
-                let size = [rgba.width() as usize, rgba.height() as usize];
-                let color = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
-                match &mut sv.tex {
-                    Some(t) => t.set(color, egui::TextureOptions::LINEAR),
-                    None => {
-                        sv.tex =
-                            Some(ctx.load_texture(format!("screen-{}", sv.key), color, egui::TextureOptions::LINEAR))
-                    }
+        if let Some(color) = new_image {
+            match &mut sv.tex {
+                Some(t) => t.set(color, egui::TextureOptions::LINEAR),
+                None => {
+                    sv.tex = Some(ctx.load_texture(format!("screen-{}", sv.key), color, egui::TextureOptions::LINEAR))
                 }
-                sv.shown_seq = cur_seq;
-                sv.last_frame_at = Some(Instant::now());
             }
+            sv.shown_seq = cur_seq;
+            sv.last_frame_at = Some(Instant::now());
         }
         let since = sv.fps_at.elapsed().as_secs_f32();
         if since >= 1.0 {
@@ -3060,13 +3059,24 @@ fn spawn_stream(
                 max_w,
                 q,
                 move |f| {
-                    let mut g = frames.lock().unwrap_or_else(|e| e.into_inner());
-                    g.mons = f.mons;
-                    g.jpeg = Some(f.jpeg);
-                    g.seq = f.seq;
-                    g.dims = (f.w, f.h);
-                    g.frames += 1;
-                    g.error = None;
+                    // Unpack the picture here, not in the window, so the window stays quick.
+                    let Ok(decoded) = image::load_from_memory(&f.jpeg) else { return };
+                    let rgba = decoded.to_rgba8();
+                    let size = [rgba.width() as usize, rgba.height() as usize];
+                    let color = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
+                    {
+                        let mut g = frames.lock().unwrap_or_else(|e| e.into_inner());
+                        g.mons = f.mons;
+                        g.image = Some(color);
+                        g.seq = f.seq;
+                        g.dims = (f.w, f.h);
+                        g.frames += 1;
+                        g.error = None;
+                    }
+                    // Show it right away instead of at the next timed redraw.
+                    if let Some(c) = REPAINT.get() {
+                        c.request_repaint();
+                    }
                 },
                 move || !keep.load(Ordering::Relaxed),
             );

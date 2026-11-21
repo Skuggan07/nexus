@@ -630,21 +630,69 @@ fn screen_serve(mut c: Conn, me: &Arc<Identity>, shared: &SharedState, dir: &Pat
         }
         _ => {}
     }
-    let fps = start.get("fps").and_then(|x| x.as_u64()).unwrap_or(8).clamp(1, 30);
+    let fps = start.get("fps").and_then(|x| x.as_u64()).unwrap_or(8).clamp(1, 60);
     let max_w = start.get("maxw").and_then(|x| x.as_u64()).unwrap_or(1280).clamp(320, 3840) as u32;
-    let quality = start.get("quality").and_then(|x| x.as_u64()).unwrap_or(55).clamp(20, 90) as u8;
+    let quality = start.get("quality").and_then(|x| x.as_u64()).unwrap_or(55).clamp(20, 95) as u8;
     let monitor = start.get("monitor").and_then(|x| x.as_u64()).unwrap_or(0).min(16) as usize;
     let who = peer_name(shared, &id);
     lock(shared).log(format!("{who} is viewing this screen"));
     // Don't let this PC go to sleep (or its screen turn off) while someone is watching it.
     crate::screen::keep_display_awake(true);
     let gap = Duration::from_millis(1000 / fps);
+    // One thread captures and packs pictures while this one sends them, so both happen
+    // at the same time. At most one packed picture waits, so the viewer never falls
+    // behind. Pictures are only sent when the screen changed (and once a second anyway).
+    let q_now = Arc::new(std::sync::atomic::AtomicU8::new(quality));
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    type Packed = (u32, u32, Vec<u8>, usize, usize);
+    let (tx, rx) = mpsc::sync_channel::<Result<Packed, String>>(1);
+    {
+        let (q_now, done) = (q_now.clone(), done.clone());
+        thread::spawn(move || {
+            use std::sync::atomic::Ordering;
+            let mut g = crate::screen::Grabber::new(monitor);
+            let mut last: Option<Packed> = None;
+            let mut last_at = Instant::now();
+            while !done.load(Ordering::Relaxed) {
+                let started = Instant::now();
+                let msg = match g.grab(gap) {
+                    Ok(f) if !f.changed && last.is_some() && last_at.elapsed() < Duration::from_secs(1) => {
+                        if let Some(rest) = gap.checked_sub(started.elapsed()) {
+                            thread::sleep(rest);
+                        }
+                        continue;
+                    }
+                    Ok(f) if !f.changed && last.is_some() => Ok(last.clone().unwrap_or_default()),
+                    Ok(f) => match crate::screen::encode(f.w, f.h, &g.buf, max_w, q_now.load(Ordering::Relaxed)) {
+                        Ok((w, h, jpeg)) => {
+                            let p = (w, h, jpeg, f.mon, f.mons);
+                            last = Some(p.clone());
+                            Ok(p)
+                        }
+                        Err(e) => Err(e),
+                    },
+                    Err(e) => Err(e),
+                };
+                let failed = msg.is_err();
+                if tx.send(msg).is_err() {
+                    break; // the viewer left
+                }
+                last_at = Instant::now();
+                if failed {
+                    thread::sleep(Duration::from_millis(300));
+                } else if let Some(rest) = gap.checked_sub(started.elapsed()) {
+                    thread::sleep(rest);
+                }
+            }
+        });
+    }
     let mut seq: u64 = 0;
     let mut waiting_since: Option<Instant> = None;
-    loop {
-        let started = Instant::now();
-        match crate::screen::capture_jpeg(monitor, max_w, quality) {
+    let mut quick = 0u64;
+    while let Ok(msg) = rx.recv() {
+        match msg {
             Ok((w, h, jpeg, mon, mons)) => {
+                let sent_at = Instant::now();
                 let data = base64::engine::general_purpose::STANDARD.encode(&jpeg);
                 let frame = serde_json::json!({
                     "op": "frame", "w": w, "h": h, "seq": seq, "data": data, "mon": mon, "mons": mons,
@@ -654,6 +702,22 @@ fn screen_serve(mut c: Conn, me: &Arc<Identity>, shared: &SharedState, dir: &Pat
                 }
                 seq += 1;
                 waiting_since = None;
+                // Fit the network: when sending takes too long, pack pictures a bit
+                // smaller; when it's quick for a while, go back up to the chosen quality.
+                let took = sent_at.elapsed();
+                let q = q_now.load(std::sync::atomic::Ordering::Relaxed);
+                if took > gap + gap / 2 && q > 35 {
+                    q_now.store(q.saturating_sub(5).max(35), std::sync::atomic::Ordering::Relaxed);
+                    quick = 0;
+                } else if took < gap / 2 {
+                    quick += 1;
+                    if quick >= fps * 2 && q < quality {
+                        q_now.store((q + 3).min(quality), std::sync::atomic::Ordering::Relaxed);
+                        quick = 0;
+                    }
+                } else {
+                    quick = 0;
+                }
             }
             Err(e) => {
                 // The screen can't be read for a moment (the lock screen, a UAC prompt, a
@@ -664,14 +728,11 @@ fn screen_serve(mut c: Conn, me: &Arc<Identity>, shared: &SharedState, dir: &Pat
                     }
                     waiting_since = Some(Instant::now());
                 }
-                thread::sleep(Duration::from_millis(300));
             }
         }
-        let spent = started.elapsed();
-        if spent < gap {
-            thread::sleep(gap - spent);
-        }
     }
+    done.store(true, std::sync::atomic::Ordering::Relaxed);
+    drop(rx);
     crate::screen::keep_display_awake(false);
     lock(shared).log(format!("{who} stopped viewing this screen"));
 }
