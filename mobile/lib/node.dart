@@ -14,6 +14,7 @@ import 'package:flutter/widgets.dart' show AppLifecycleState, WidgetsBinding, Wi
 import 'package:path_provider/path_provider.dart';
 
 import 'protocol.dart';
+import 'update.dart' show appBuild;
 
 const onlineWindow = Duration(seconds: 7);
 const checkValid = Duration(seconds: 15);
@@ -125,7 +126,11 @@ class Stats {
     this.uptime,
     this.today,
     this.total,
+    this.build,
   });
+
+  /// Which Nexus build it runs (null: older than build 43).
+  final int? build;
 
   /// For PCs: who is signed in.
   final String? user;
@@ -161,6 +166,7 @@ class Stats {
         uptime: (m['uptime'] as num?)?.toInt(),
         today: (m['today'] as num?)?.toInt(),
         total: (m['total'] as num?)?.toInt(),
+        build: (m['build'] as num?)?.toInt(),
       );
     } catch (_) {
       return null;
@@ -810,6 +816,47 @@ class NexusNode extends ChangeNotifier {
     c.close();
   }
 
+  /* ------------------------------------------------- update center */
+
+  /// Goes up by one when another device asks this phone to update (the screen then
+  /// looks for the new version).
+  final updateNudge = ValueNotifier<int>(0);
+
+  /// Asks a paired device to update Nexus. Returns a line to show.
+  Future<String> updateDevice(PairedPeer p) async {
+    Conn? c;
+    try {
+      c = await _screenOpen(p);
+      c.send({'op': 'update'});
+      final r = await c.recv(const Duration(seconds: 30));
+      if (r['error'] != null) return '${p.name}: ${r['error']}';
+      return p.controllable
+          ? '${p.name} is updating${r['build'] != null ? ' to build ${r['build']}' : ''} and will restart'
+          : '${p.name}: tap the notification there to install';
+    } catch (e) {
+      return 'Could not update ${p.name}: $e';
+    } finally {
+      c?.close();
+    }
+  }
+
+  /// Windows Update on a PC: 'status', 'check' or 'install'. Returns its status
+  /// (busy, waiting, titles, restart, ready, no_surprise, note).
+  Future<Map<String, dynamic>> windowsUpdate(PairedPeer p, String action) async {
+    Conn? c;
+    try {
+      c = await _screenOpen(p);
+      c.send({'op': 'wu', 'action': action});
+      final r = await c.recv(const Duration(seconds: 30));
+      if (r['error'] != null) throw NexusError('${r['error']}');
+      final st = r['status'];
+      if (st is! Map) throw NexusError('Unexpected answer');
+      return st.cast<String, dynamic>();
+    } finally {
+      c?.close();
+    }
+  }
+
   /// Deletes a group: every device in it (this phone too) is taken out of it, on all devices.
   Future<void> deleteGroup(String g) async {
     final now = _nowSecs();
@@ -1281,6 +1328,7 @@ class NexusNode extends ChangeNotifier {
       'ram': ram,
       'battery': battery,
       if (uptime != null) 'uptime': uptime,
+      'build': appBuild,
       if (resting) 'idle': true,
     });
   }
@@ -1933,6 +1981,20 @@ class NexusNode extends ChangeNotifier {
       await _ringServe(c, first, peer.name);
     } else if (first['op'] == 'labels') {
       await _labelsServe(c, first, peer.name);
+    } else if (first['op'] == 'update') {
+      // Android always asks before installing, so the phone gets the update ready and
+      // shows a notification; tapping it opens Nexus with its Update button.
+      updateNudge.value++;
+      await _bg('notify', {
+        'title': 'A new Nexus is ready',
+        'text': '${peer.name} asked this phone to update. Tap, then tap Update.',
+      });
+      addLog('${peer.name} asked this phone to update Nexus');
+      c.send({'op': 'ok'});
+      c.close();
+    } else if (first['op'] == 'wu') {
+      c.send({'error': 'Phones have no Windows Update'});
+      c.close();
     } else if (first['op'] == 'auto') {
       c.send({'error': 'Automations run on computers, not on phones'});
       c.close();

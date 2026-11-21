@@ -72,14 +72,27 @@ class _HomePageState extends State<HomePage> {
   void initState() {
     super.initState();
     _updater.check();
+    // Another device asked this phone to update: look for the new version now.
+    node.updateNudge.addListener(_updater.check);
   }
 
   @override
   void dispose() {
+    node.updateNudge.removeListener(_updater.check);
     _ipField.dispose();
     _updater.dispose();
     super.dispose();
   }
+
+  Widget _updateCenterButton(BuildContext context) => SizedBox(
+        width: double.infinity,
+        child: _SecondaryButton(
+          label: 'Update center',
+          onPressed: () => Navigator.of(context).push(
+            MaterialPageRoute<void>(builder: (_) => UpdateCenterPage(node: node, updater: _updater)),
+          ),
+        ),
+      );
 
   /// Grouped devices first (by group), then the rest; by name inside each.
   List<PairedPeer> get _sorted => [...node.paired]..sort((a, b) {
@@ -473,6 +486,8 @@ class _HomePageState extends State<HomePage> {
         _watchAllButton(context),
         const SizedBox(height: 10),
       ],
+      _updateCenterButton(context),
+      const SizedBox(height: 10),
       for (final s in node.nearby) ...[
         const SizedBox(height: 6),
         _NearbyBox(name: s.name, sub: '${s.os} · ${s.addr.address}', onPair: node.pair == null ? () => _pair(s) : null),
@@ -539,6 +554,8 @@ class _HomePageState extends State<HomePage> {
         _watchAllButton(context),
         const SizedBox(height: 12),
       ],
+      _updateCenterButton(context),
+      const SizedBox(height: 12),
       _activity(),
       const SizedBox(height: 12),
       _PhoneSharingBox(node: node),
@@ -3688,6 +3705,223 @@ class _AutomationEditorState extends State<AutomationEditor> {
           ),
         ),
       ]),
+    );
+  }
+}
+
+/* ------------------------------------------------------------ update center */
+
+/// Update center: the Nexus build on every device (update them from here), and
+/// Windows Update on every PC that is online.
+class UpdateCenterPage extends StatefulWidget {
+  const UpdateCenterPage({super.key, required this.node, required this.updater});
+  final NexusNode node;
+  final Updater updater;
+
+  @override
+  State<UpdateCenterPage> createState() => _UpdateCenterPageState();
+}
+
+class _UpdateCenterPageState extends State<UpdateCenterPage> {
+  NexusNode get node => widget.node;
+  final _wu = <String, Map<String, dynamic>>{};
+  final _wuError = <String, String>{};
+  final _note = <String, String>{};
+  Timer? _poll;
+
+  @override
+  void initState() {
+    super.initState();
+    widget.updater.check();
+    _refresh();
+    _poll = Timer.periodic(const Duration(seconds: 6), (_) => _refresh());
+  }
+
+  @override
+  void dispose() {
+    _poll?.cancel();
+    super.dispose();
+  }
+
+  bool _online(PairedPeer p) {
+    final k = node.statusOf(p).kind;
+    return k == StatusKind.verified || k == StatusKind.checking;
+  }
+
+  List<PairedPeer> get _pcs => node.paired.where((p) => p.controllable && _online(p)).toList();
+
+  Future<void> _refresh() async {
+    for (final p in _pcs) {
+      try {
+        final st = await node.windowsUpdate(p, 'status');
+        _wu[p.id] = st;
+        _wuError.remove(p.id);
+      } catch (e) {
+        _wuError[p.id] = '$e';
+      }
+      if (mounted) setState(() {});
+    }
+  }
+
+  Future<void> _wuDo(PairedPeer p, String action) async {
+    try {
+      final st = await node.windowsUpdate(p, action);
+      _wu[p.id] = st;
+      _wuError.remove(p.id);
+    } catch (e) {
+      _wuError[p.id] = '$e';
+    }
+    if (mounted) setState(() {});
+  }
+
+  Future<void> _update(List<PairedPeer> list) async {
+    for (final p in list) {
+      setState(() => _note[p.id] = 'Asking…');
+      final msg = await node.updateDevice(p);
+      if (mounted) setState(() => _note[p.id] = msg);
+    }
+  }
+
+  int? get _newest => switch (widget.updater.phase) {
+        UpdatePhase.available || UpdatePhase.downloading || UpdatePhase.installing => widget.updater.newBuild,
+        UpdatePhase.upToDate => appBuild,
+        _ => null,
+      };
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: bg,
+      appBar: AppBar(backgroundColor: bg, foregroundColor: white, title: const Text('Update center')),
+      body: ListenableBuilder(
+        listenable: Listenable.merge([node, widget.updater]),
+        builder: (context, _) {
+          final newest = _newest;
+          bool outdated(int? b) => newest != null && (b == null || b < newest);
+          final pcs = node.paired.where((p) => _online(p) && p.controllable).toList();
+          final oldPcs = pcs.where((p) => outdated(node.statusOf(p).stats?.build)).toList();
+          return ListView(padding: const EdgeInsets.all(16), children: [
+            const Text('NEXUS ON YOUR DEVICES', style: TextStyle(color: online, fontSize: 12, letterSpacing: 1.4)),
+            const SizedBox(height: 4),
+            Text(newest == null ? 'Checking which Nexus is the newest…' : 'The newest Nexus is build $newest.'),
+            const SizedBox(height: 10),
+            _Box(
+              child: Row(children: [
+                Expanded(
+                  child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                    Text('${node.myLabel} (this phone)', style: const TextStyle(fontWeight: FontWeight.w700)),
+                    Text(outdated(appBuild) ? 'build $appBuild · update available' : 'build $appBuild · up to date',
+                        style: TextStyle(color: outdated(appBuild) ? ring : online)),
+                  ]),
+                ),
+                if (outdated(appBuild))
+                  _SecondaryButton(label: 'Update', onPressed: widget.updater.install),
+              ]),
+            ),
+            if (widget.updater.message != null) ...[
+              const SizedBox(height: 4),
+              Text(widget.updater.message!, style: const TextStyle(fontSize: 12)),
+            ],
+            for (final p in node.paired) ...[
+              const SizedBox(height: 8),
+              _Box(
+                child: Row(children: [
+                  Expanded(
+                    child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                      Text(p.name, style: const TextStyle(fontWeight: FontWeight.w700)),
+                      Builder(builder: (_) {
+                        if (!_online(p)) return const Text('offline', style: TextStyle(color: off));
+                        final b = node.statusOf(p).stats?.build;
+                        final old = outdated(b);
+                        return Text(
+                          b == null
+                              ? 'an older build · update available'
+                              : old
+                                  ? 'build $b · update available'
+                                  : 'build $b · up to date',
+                          style: TextStyle(color: old ? ring : online),
+                        );
+                      }),
+                      if (_note[p.id] != null) Text(_note[p.id]!, style: const TextStyle(fontSize: 12)),
+                    ]),
+                  ),
+                  if (_online(p) && p.controllable && outdated(node.statusOf(p).stats?.build))
+                    _SecondaryButton(label: 'Update', onPressed: () => _update([p])),
+                ]),
+              ),
+            ],
+            if (oldPcs.isNotEmpty) ...[
+              const SizedBox(height: 10),
+              SizedBox(
+                width: double.infinity,
+                child: FilledButton(
+                  style: FilledButton.styleFrom(backgroundColor: accent, minimumSize: const Size(0, 48)),
+                  onPressed: () => _update(oldPcs),
+                  child: Text('Update all PCs (${oldPcs.length})'),
+                ),
+              ),
+            ],
+            const SizedBox(height: 22),
+            const Text('WINDOWS UPDATE', style: TextStyle(color: online, fontSize: 12, letterSpacing: 1.4)),
+            const SizedBox(height: 6),
+            if (pcs.isEmpty) const Text('No PC is online right now.'),
+            for (final p in pcs) ...[
+              _Box(
+                child: Builder(builder: (_) {
+                  final st = _wu[p.id];
+                  final err = _wuError[p.id];
+                  final busy = st != null && '${st['busy'] ?? ''}' != '' && st['busy'] != 'idle';
+                  final waiting = (st?['waiting'] as num?)?.toInt();
+                  final titles = (st?['titles'] as List?)?.map((e) => '$e').toList() ?? const <String>[];
+                  final line = st == null
+                      ? (err ?? 'Asking…')
+                      : st['busy'] == 'checking'
+                          ? 'Checking for updates… (can take a few minutes)'
+                          : st['busy'] == 'installing'
+                              ? 'Installing updates…'
+                              : waiting == null
+                                  ? 'Not checked yet — tap Check'
+                                  : waiting == 0
+                                      ? 'Up to date'
+                                      : '$waiting update${waiting == 1 ? '' : 's'} waiting';
+                  return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                    Text(p.name, style: const TextStyle(fontWeight: FontWeight.w700)),
+                    Text(line, style: TextStyle(color: err != null && st == null ? bad : white)),
+                    for (final t in titles.take(5)) Text('• $t', style: const TextStyle(fontSize: 12)),
+                    if (st?['restart'] == true)
+                      const Text('Restart needed to finish installing', style: TextStyle(color: ring)),
+                    if ('${st?['note'] ?? ''}'.isNotEmpty) Text('${st!['note']}', style: const TextStyle(fontSize: 12)),
+                    if (st != null)
+                      Text(
+                        st['no_surprise'] == true
+                            ? 'No surprise restarts: on — Windows waits until you sign out'
+                            : 'No surprise restarts: off',
+                        style: const TextStyle(fontSize: 12),
+                      ),
+                    if (st != null && st['ready'] != true)
+                      const Text('To install from here, press Set up in the Update center on that PC once.',
+                          style: TextStyle(fontSize: 12)),
+                    const SizedBox(height: 8),
+                    Row(children: [
+                      Expanded(
+                        child: _SecondaryButton(label: 'Check', onPressed: busy ? null : () => _wuDo(p, 'check')),
+                      ),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: _SecondaryButton(
+                          label: 'Install',
+                          onPressed: busy || (waiting ?? 0) == 0 ? null : () => _wuDo(p, 'install'),
+                        ),
+                      ),
+                    ]),
+                  ]);
+                }),
+              ),
+              const SizedBox(height: 8),
+            ],
+          ]);
+        },
+      ),
     );
   }
 }
