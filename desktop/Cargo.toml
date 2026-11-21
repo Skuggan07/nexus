@@ -26,6 +26,7 @@ base64 = "0.22"                                            # frames travel as ba
 cpal = "0.15"                                              # sound sharing (record what a PC plays, play it here)
 ureq = "2"                                                 # in-app updates (asks GitHub for the newest release)
 jpeg-encoder = { version = "0.6", features = ["simd"] }     # fast JPEG packing for screen sharing
+openh264 = "0.9"                                           # real video (H.264) for smooth screen sharing
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [                  # fast screen capture (Desktop Duplication)
